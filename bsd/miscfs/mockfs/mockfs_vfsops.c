@@ -2,7 +2,7 @@
  * Copyright (c) 2012 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
- * 
+ *
  * This file contains Original Code and/or Modifications of Original Code
  * as defined in and that are subject to the Apple Public Source License
  * Version 2.0 (the 'License'). You may not use this file except in
@@ -11,10 +11,10 @@
  * unlawful or unlicensed copies of an Apple operating system, or to
  * circumvent, violate, or enable the circumvention or violation of, any
  * terms of an Apple operating system software license agreement.
- * 
+ *
  * Please obtain a copy of the License at
  * http://www.opensource.apple.com/apsl/ and read it before using this file.
- * 
+ *
  * The Original Code and all software distributed under the License are
  * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
@@ -22,7 +22,7 @@
  * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
  * Please see the License for the specific language governing rights and
  * limitations under the License.
- * 
+ *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
 
@@ -39,9 +39,7 @@
 #include <sys/mount_internal.h>
 #include <sys/vnode_internal.h>
 
-lck_attr_t * mockfs_mtx_attr = (lck_attr_t *) 0;
-lck_grp_attr_t * mockfs_grp_attr = (lck_grp_attr_t *) 0;
-lck_grp_t * mockfs_mtx_grp = (lck_grp_t *) 0;
+static LCK_GRP_DECLARE(mockfs_mtx_grp, "mockfs-mutex");
 
 int mockfs_mountroot(mount_t mp, vnode_t rvp, __unused vfs_context_t ctx);
 
@@ -63,7 +61,8 @@ int mockfs_init(__unused struct vfsconf * vfsc);
  *
  * Returns 0 on success, or an error.
  */
-int mockfs_mountroot(mount_t mp, vnode_t rvp, __unused vfs_context_t ctx)
+int
+mockfs_mountroot(mount_t mp, vnode_t rvp, __unused vfs_context_t ctx)
 {
 	int rvalue = 0;
 	mockfs_fsnode_t root_fsnode = NULL;
@@ -81,12 +80,12 @@ int mockfs_mountroot(mount_t mp, vnode_t rvp, __unused vfs_context_t ctx)
 	 * There are no M_MOCKFS* definitions at the moment, just use M_TEMP.
 	 */
 
-	MALLOC(mockfs_mount_data, mockfs_mount_t, sizeof(*mockfs_mount_data), M_TEMP, M_WAITOK | M_ZERO);
+	mockfs_mount_data = kalloc_type(struct mockfs_mount, Z_WAITOK | Z_ZERO);
 	mockfs_fsnode_create(mp, MOCKFS_ROOT, &root_fsnode);
 	mockfs_fsnode_create(mp, MOCKFS_DEV, &dev_fsnode);
 	mockfs_fsnode_create(mp, MOCKFS_FILE, &file_fsnode);
 
-	if (!mockfs_mount_data || !root_fsnode || !dev_fsnode || !file_fsnode) {
+	if (!root_fsnode || !dev_fsnode || !file_fsnode) {
 		rvalue = ENOMEM;
 		goto done;
 	}
@@ -110,32 +109,37 @@ int mockfs_mountroot(mount_t mp, vnode_t rvp, __unused vfs_context_t ctx)
 		}
 	}
 
-	lck_mtx_init(&mockfs_mount_data->mockfs_mnt_mtx, mockfs_mtx_grp, mockfs_mtx_attr);
+	lck_mtx_init(&mockfs_mount_data->mockfs_mnt_mtx, &mockfs_mtx_grp, LCK_ATTR_NULL);
 
 	/*
 	 * All of the needed nodes/structures have been set up; now we just need to establish the relationships
 	 *   between the various mockfs nodes.
 	 */
-	if ((rvalue = mockfs_fsnode_adopt(root_fsnode, dev_fsnode)))
+	if ((rvalue = mockfs_fsnode_adopt(root_fsnode, dev_fsnode))) {
 		goto done;
+	}
 
-	if ((rvalue = mockfs_fsnode_adopt(root_fsnode, file_fsnode)))
+	if ((rvalue = mockfs_fsnode_adopt(root_fsnode, file_fsnode))) {
 		goto done;
+	}
 
 	mockfs_mount_data->mockfs_root = root_fsnode;
-	mp->mnt_data = (typeof(mp->mnt_data)) mockfs_mount_data;
+	mp->mnt_data = (typeof(mp->mnt_data))mockfs_mount_data;
 
 done:
 	if (rvalue) {
-		if (file_fsnode)
+		if (file_fsnode) {
 			mockfs_fsnode_destroy(file_fsnode);
-		if (dev_fsnode)
+		}
+		if (dev_fsnode) {
 			mockfs_fsnode_destroy(dev_fsnode);
-		if (root_fsnode)
+		}
+		if (root_fsnode) {
 			mockfs_fsnode_destroy(root_fsnode);
+		}
 		if (mockfs_mount_data) {
-			lck_mtx_destroy(&mockfs_mount_data->mockfs_mnt_mtx, mockfs_mtx_grp);
-			FREE(mockfs_mount_data, M_TEMP);
+			lck_mtx_destroy(&mockfs_mount_data->mockfs_mnt_mtx, &mockfs_mtx_grp);
+			kfree_type(struct mockfs_mount, mockfs_mount_data);
 		}
 	}
 
@@ -148,7 +152,8 @@ done:
  *
  * Returns 0 on success, or an error.
  */
-int mockfs_unmount(struct mount *mp, int mntflags, __unused vfs_context_t ctx)
+int
+mockfs_unmount(struct mount *mp, int mntflags, __unused vfs_context_t ctx)
 {
 	int rvalue;
 	int vflush_flags;
@@ -160,7 +165,7 @@ int mockfs_unmount(struct mount *mp, int mntflags, __unused vfs_context_t ctx)
 
 	/*
 	 * Reclaim the vnodes for the mount (forcibly, if requested; given that mockfs only support mountroot
-	 *   at the moment, this should ALWAYS be forced), 
+	 *   at the moment, this should ALWAYS be forced),
 	 */
 	if (mntflags & MNT_FORCE) {
 		vflush_flags |= FORCECLOSE;
@@ -168,8 +173,9 @@ int mockfs_unmount(struct mount *mp, int mntflags, __unused vfs_context_t ctx)
 
 	rvalue = vflush(mp, NULL, vflush_flags);
 
-	if (rvalue)
+	if (rvalue) {
 		return rvalue;
+	}
 
 	/*
 	 * Past this point, errors are likely to be unrecoverable, so panic if we're given any excuse; we
@@ -181,11 +187,12 @@ int mockfs_unmount(struct mount *mp, int mntflags, __unused vfs_context_t ctx)
 	mockfs_mnt->mockfs_root = NULL;
 	rvalue = mockfs_fsnode_destroy(root_fsnode);
 
-	if (rvalue)
+	if (rvalue) {
 		panic("mockfs_unmount: Failed to destroy the fsnode tree");
+	}
 
-	lck_mtx_destroy(&mockfs_mnt->mockfs_mnt_mtx, mockfs_mtx_grp);
-	FREE(mockfs_mnt, M_TEMP);
+	lck_mtx_destroy(&mockfs_mnt->mockfs_mnt_mtx, &mockfs_mtx_grp);
+	kfree_type(struct mockfs_mount, mockfs_mnt);
 	mp->mnt_data = NULL;
 
 	return rvalue;
@@ -197,7 +204,8 @@ int mockfs_unmount(struct mount *mp, int mntflags, __unused vfs_context_t ctx)
  *
  * Returns 0 on success, or an error.
  */
-int mockfs_root(mount_t mp, vnode_t * vpp, __unused vfs_context_t ctx)
+int
+mockfs_root(mount_t mp, vnode_t * vpp, __unused vfs_context_t ctx)
 {
 	int rvalue;
 
@@ -211,49 +219,21 @@ int mockfs_root(mount_t mp, vnode_t * vpp, __unused vfs_context_t ctx)
  *
  * Returns 0.
  */
-int mockfs_sync(__unused struct mount *mp, __unused int waitfor, __unused vfs_context_t ctx)
+int
+mockfs_sync(__unused struct mount *mp, __unused int waitfor, __unused vfs_context_t ctx)
 {
-	return (0);
+	return 0;
 }
 
-/*
- * mockfs_init:
- *   Run once (during VFS initialization); takes care of generic mockfs initialization (which for now, means
- *   global lock information).
- *
- * Returns 0 on success, or an error.
- */
-int mockfs_init(__unused struct vfsconf * vfsc)
+int
+mockfs_init(__unused struct vfsconf * vfsc)
 {
-	mockfs_mtx_attr = lck_attr_alloc_init();
-	mockfs_grp_attr = lck_grp_attr_alloc_init();
-	mockfs_mtx_grp = lck_grp_alloc_init("mockfs-mutex", mockfs_grp_attr);
-
-	/*
-	 * If we've failed to allocate this early in boot, something is horrendously wrong; it should be fine to
-	 *   panic (for now).
-	 */
-	if (!mockfs_mtx_attr || !mockfs_grp_attr || !mockfs_mtx_grp) {
-		panic("mockfs_init failed to allocate lock information");
-	}
-
-	return (0);
+	return 0;
 }
 
 struct vfsops mockfs_vfsops = {
-	NULL, /* mount */
-	NULL, /* start */
-	mockfs_unmount, /* unmount */
-	mockfs_root, /* root */
-	NULL, /* quotactl */
-	NULL, /* getattr */
-	mockfs_sync, /* sync */
-	NULL, /* vget */
-	NULL, /* fhtovp */
-	NULL, /* vptofh */
-	mockfs_init, /* init */
-	NULL, /* sysctl */
-	NULL, /* setattr */
-	{NULL}
+	.vfs_unmount = mockfs_unmount,
+	.vfs_root = mockfs_root,
+	.vfs_sync = mockfs_sync,
+	.vfs_init = mockfs_init,
 };
-

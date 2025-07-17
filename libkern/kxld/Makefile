@@ -18,12 +18,10 @@ ifndef SYMROOT
 SYMROOT=./BUILD/sym
 endif
 ifdef SRCROOT
-EXTHDRSRC=$(SRCROOT)/EXTERNAL_HEADERS
 HDRSRC=$(SRCROOT)/libkern/libkern
 OBJSRC=$(SRCROOT)/libkern/kxld
 else
 SRCROOT=.
-EXTHDRSRC=$(SRCROOT)/../../EXTERNAL_HEADERS
 HDRSRC=$(SRCROOT)/../libkern
 OBJSRC=$(SRCROOT)
 ROOT=BUILD
@@ -38,25 +36,38 @@ ifdef INSTALL_LOCATION
 override DSTROOT := $(DSTROOT)/$(INSTALL_LOCATION)
 endif
 
-PRODUCT_TYPE ?= DYLIB
+PRODUCT_TYPE ?= ALL
 
 HDRDST=$(DSTROOT)/usr/local/include
 DYLIBDST=$(DSTROOT)/usr/lib/system
 ARCHIVEDST=$(DSTROOT)/usr/local/lib
 LIBKXLD_DYLIB=libkxld.dylib
 LIBKXLD_ARCHIVE=libkxld.a
+LIBKXLD_DSYM=$(LIBKXLD_DYLIB).dSYM
 LIBKXLD_INSTALLNAME=/usr/lib/system/$(LIBKXLD_DYLIB)
 LIBKXLDOBJ_DYLIB=$(OBJROOT)/$(LIBKXLD_DYLIB)
 LIBKXLDOBJ_ARCHIVE=$(OBJROOT)/$(LIBKXLD_ARCHIVE)
 LIBKXLDSYM_DYLIB=$(SYMROOT)/$(LIBKXLD_DYLIB)
+LIBKXLDSYM_DYLIB_DSYM=$(SYMROOT)/$(LIBKXLD_DSYM)
 LIBKXLDSYM_ARCHIVE=$(SYMROOT)/$(LIBKXLD_ARCHIVE)
 LIBKXLDDST_DYLIB=$(DYLIBDST)/$(LIBKXLD_DYLIB)
 LIBKXLDDST_ARCHIVE=$(ARCHIVEDST)/$(LIBKXLD_ARCHIVE)
 TESTSRC=$(SRCROOT)/tests
 TESTDST=./BUILD/tests
 
+# Build both the dylib and archive
+LIBKXLDDST_ALL=$(LIBKXLDDST_DYLIB) $(LIBKXLDDST_ARCHIVE)
+
 # Flags
-SDKROOT ?= /
+ifdef SDKROOT
+	SDK_DIR := $(shell xcodebuild -version -sdk $(SDKROOT) Path)
+endif
+
+ifeq ($(strip $(SDK_DIR)),)
+	SDK_DIR := /
+endif
+
+
 DEFINES = -DPRIVATE
 CFLAGS=-std=c99 -Wall -Wextra -Werror -pedantic -Wformat=2 -Wcast-align \
 	-Wwrite-strings -Wshorten-64-to-32 -Wshadow -Winit-self -Wpointer-arith \
@@ -66,24 +77,24 @@ CFLAGS=-std=c99 -Wall -Wextra -Werror -pedantic -Wformat=2 -Wcast-align \
 LDFLAGS=$(ARCHS) -dynamiclib -install_name $(LIBKXLD_INSTALLNAME) \
 	-compatibility_version $(COMPATIBILITY_VERSION) \
 	-current_version $(CURRENT_VERSION) -lstdc++
-INCLUDES=-I$(HDRSRC) -isystem $(EXTHDRSRC)
+INCLUDES=-I$(HDRSRC)
 
-ifneq ($(SDKROOT),/)
-	CFLAGS += -isysroot $(SDKROOT)
-	LDFLAGS += -isysroot $(SDKROOT)
+ifneq ($(SDK_DIR),/)
+	CFLAGS += -isysroot $(SDK_DIR)
+	LDFLAGS += -isysroot $(SDK_DIR)
 endif
 
 # Tools
-CC = xcrun -sdk $(SDKROOT) clang
-CLANG_ANALYZER = clang --analyze
-LIBTOOL = xcrun -sdk $(SDKROOT) libtool
-STRIP = xcrun -sdk $(SDKROOT) strip
+CC = xcrun -sdk $(SDK_DIR) clang
+LIBTOOL = xcrun -sdk $(SDK_DIR) libtool
+STRIP = xcrun -sdk $(SDK_DIR) strip
+DSYMUTIL = xcrun -sdk $(SDK_DIR) dsymutil
 
 # Files
-HDR_NAMES=kxld.h kxld_types.h
+HDR_NAMES=kxld.h kxld_types.h prelink.h
 OBJ_NAMES=kxld.o kxld_array.o kxld_copyright.o kxld_demangle.o kxld_dict.o \
 	kxld_kext.o kxld_object.o kxld_reloc.o kxld_sect.o kxld_seg.o	   \
-	kxld_srcversion.o kxld_sym.o kxld_symtab.o kxld_util.o kxld_uuid.o \
+	kxld_srcversion.o kxld_splitinfolc.o kxld_sym.o kxld_symtab.o kxld_util.o kxld_uuid.o \
     kxld_vtable.o kxld_versionmin.o
 
 HDRS=$(addprefix $(HDRSRC)/, $(HDR_NAMES))
@@ -96,7 +107,7 @@ $(shell [ -d $(OBJROOT) ] || mkdir -p $(OBJROOT))
 $(OBJROOT)/%.o : $(OBJSRC)/%.c
 	$(CC) $(RC_CFLAGS) $(CFLAGS) $(DEFINES) $(OPTIM) $(INCLUDES) -c $< -o $@
 $(OBJROOT)/%.o : $(TESTSRC)/%.c
-	$(CC) $(RC_CFLAGS) $(CFLAGS) $(DEFINES) -O0 -DDEBUG $(INCLUDES) -I $(SRCROOT) -c $< -o $@
+	$(CC) $(RC_CFLAGS) $(CFLAGS) $(DEFINES) -O0 -DDEBUG $(INCLUDES) -I$(SRCROOT) -c $< -o $@
 
 SRCROOTESC=$(subst /,\/,$(SRCROOT))
 OBJROOTESC=$(subst /,\/,$(OBJROOT))
@@ -104,7 +115,7 @@ SEDOBJS=sed -E 's/(^[a-z_]+)\.o/$(OBJROOTESC)\/\1\.o $(OBJROOTESC)\/\1\.d/'
 SEDSRCS=sed -E 's/ ([a-z_]+\.[ch])/ $(SRCROOTESC)\/\1/g'
 $(OBJROOT)/%.d: $(OBJSRC)/%.c
 	@set -e; rm -f $@; \
-	$(CC) $(INCLUDES) -MM $< | $(SEDOBJS) | $(SEDSRCS) > $@;
+	$(CC) $(CFLAGS) $(DEFINES) $(INCLUDES) -MM $< | $(SEDOBJS) | $(SEDSRCS) > $@;
 
 # Rules
 release: OPTIM=-Os -dynamic
@@ -124,10 +135,12 @@ build: $(LIBKXLDSYM_$(PRODUCT_TYPE))
 $(LIBKXLDSYM_DYLIB): $(LIBKXLDOBJ_DYLIB)
 	@mkdir -p $(SYMROOT)
 	install -c -m 644 $< $@
+	$(DSYMUTIL) $@ -o $(LIBKXLDSYM_DYLIB_DSYM)
 
 $(LIBKXLDSYM_ARCHIVE): $(LIBKXLDOBJ_ARCHIVE)
 	@mkdir -p $(SYMROOT)
 	install -c -m 644 $< $@
+
 
 $(LIBKXLDOBJ_DYLIB): $(OBJS)
 	$(CC) $(LDFLAGS) -o $@ $^
@@ -150,8 +163,7 @@ $(LIBKXLDDST_ARCHIVE): $(LIBKXLDSYM_ARCHIVE)
 	@mkdir -p $(ARCHIVEDST)
 	install -o 0 -g 0 -c -m 555 $< $@
 
-
-KEXTCOPYOBJS=$(OBJROOT)/kextcopyright.o $(OBJROOT)/kxld_copyright.o $(OBJROOT)/kxld_util.o 
+KEXTCOPYOBJS=$(OBJROOT)/kextcopyright.o $(OBJROOT)/kxld_copyright.o $(OBJROOT)/kxld_util.o
 kextcopyright: $(TESTDST)/kextcopyright
 $(TESTDST)/kextcopyright: $(KEXTCOPYOBJS)
 	@mkdir -p $(TESTDST)
@@ -182,12 +194,7 @@ $(TESTDST)/copyrighttest: $(COPYTESTOBJS)
 	$(CC) $(ARCHS) $(COPYTESTOBJS) -framework CoreFoundation -framework IOKit -o $(OBJROOT)/copyrighttest
 	install -c -m 755 $(OBJROOT)/copyrighttest $@
 
-analyze:
-	@$(CLANG_ANALYZER) *.c
-	@$(CLANG_ANALYZER) -I. tests/*.c
-	@rm -f *.plist
-
-clean: 
+clean:
 	@rm -rf $(OBJROOT)/*
 
 fullclean:
@@ -200,4 +207,3 @@ endif
 # Automatically build dependency information when .c or .h files change based
 # on implicit rule for .d:.c
 -include $(OBJS:.o=.d)
-

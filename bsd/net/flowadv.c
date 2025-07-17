@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012 Apple Inc. All rights reserved.
+ * Copyright (c) 2012-2021 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -82,7 +82,7 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/kernel.h>
-#include <sys/mcache.h>
+#include <sys/mcache.h> /* for VERIFY() */
 #include <sys/mbuf.h>
 #include <sys/proc_internal.h>
 #include <sys/socketvar.h>
@@ -94,22 +94,21 @@
 
 #include <netinet/in_pcb.h>
 #include <net/flowadv.h>
+#if SKYWALK
+#include <skywalk/os_channel.h>
+#endif /* SKYWALK */
 
 /* Lock group and attribute for fadv_lock */
-static lck_grp_t	*fadv_lock_grp;
-static lck_grp_attr_t	*fadv_lock_grp_attr;
-decl_lck_mtx_data(static, fadv_lock);
+static LCK_GRP_DECLARE(fadv_lock_grp, "fadv_lock");
+static LCK_MTX_DECLARE(fadv_lock, &fadv_lock_grp);
 
 /* protected by fadv_lock */
-static STAILQ_HEAD(fadv_head, flowadv_fcentry) fadv_list;
+static STAILQ_HEAD(fadv_head, flowadv_fcentry) fadv_list =
+    STAILQ_HEAD_INITIALIZER(fadv_list);
 static thread_t fadv_thread = THREAD_NULL;
 static uint32_t fadv_active;
 
-static unsigned int fadv_zone_size;		/* size of flowadv_fcentry */
-static struct zone *fadv_zone;			/* zone for flowadv_fcentry */
-
-#define	FADV_ZONE_MAX	32			/* maximum elements in zone */
-#define	FADV_ZONE_NAME	"fadv_zone"		/* zone name */
+#define FADV_CACHE_NAME  "flowadv"              /* cache name */
 
 static int flowadv_thread_cont(int);
 static void flowadv_thread_func(void *, wait_result_t);
@@ -117,24 +116,6 @@ static void flowadv_thread_func(void *, wait_result_t);
 void
 flowadv_init(void)
 {
-	STAILQ_INIT(&fadv_list);
-
-	/* Setup lock group and attribute for fadv_lock */
-	fadv_lock_grp_attr = lck_grp_attr_alloc_init();
-	fadv_lock_grp = lck_grp_alloc_init("fadv_lock", fadv_lock_grp_attr);
-	lck_mtx_init(&fadv_lock, fadv_lock_grp, NULL);
-
-	fadv_zone_size = P2ROUNDUP(sizeof (struct flowadv_fcentry),
-	    sizeof (u_int64_t));
-	fadv_zone = zinit(fadv_zone_size,
-	    FADV_ZONE_MAX * fadv_zone_size, 0, FADV_ZONE_NAME);
-	if (fadv_zone == NULL) {
-		panic("%s: failed allocating %s", __func__, FADV_ZONE_NAME);
-		/* NOTREACHED */
-	}
-	zone_change(fadv_zone, Z_EXPAND, TRUE);
-	zone_change(fadv_zone, Z_CALLERACCT, FALSE);
-
 	if (kernel_thread_start(flowadv_thread_func, NULL, &fadv_thread) !=
 	    KERN_SUCCESS) {
 		panic("%s: couldn't create flow event advisory thread",
@@ -147,34 +128,44 @@ flowadv_init(void)
 struct flowadv_fcentry *
 flowadv_alloc_entry(int how)
 {
-	struct flowadv_fcentry *fce;
-
-	fce = (how == M_WAITOK) ? zalloc(fadv_zone) : zalloc_noblock(fadv_zone);
-	if (fce != NULL)
-		bzero(fce, fadv_zone_size);
-
-	return (fce);
+	return kalloc_type(struct flowadv_fcentry, how | Z_ZERO);
 }
 
 void
 flowadv_free_entry(struct flowadv_fcentry *fce)
 {
-	zfree(fadv_zone, fce);
+	kfree_type(struct flowadv_fcentry, fce);
 }
 
 void
 flowadv_add(struct flowadv_fclist *fcl)
 {
-	if (STAILQ_EMPTY(fcl))
+	if (STAILQ_EMPTY(fcl)) {
 		return;
+	}
 
 	lck_mtx_lock_spin(&fadv_lock);
 
 	STAILQ_CONCAT(&fadv_list, fcl);
 	VERIFY(!STAILQ_EMPTY(&fadv_list));
 
-	if (!fadv_active && fadv_thread != THREAD_NULL)
+	if (!fadv_active && fadv_thread != THREAD_NULL) {
 		wakeup_one((caddr_t)&fadv_list);
+	}
+
+	lck_mtx_unlock(&fadv_lock);
+}
+
+void
+flowadv_add_entry(struct flowadv_fcentry *fce)
+{
+	lck_mtx_lock_spin(&fadv_lock);
+	STAILQ_INSERT_HEAD(&fadv_list, fce, fce_link);
+	VERIFY(!STAILQ_EMPTY(&fadv_list));
+
+	if (!fadv_active && fadv_thread != THREAD_NULL) {
+		wakeup_one((caddr_t)&fadv_list);
+	}
 
 	lck_mtx_unlock(&fadv_lock);
 }
@@ -184,7 +175,7 @@ flowadv_thread_cont(int err)
 {
 #pragma unused(err)
 	for (;;) {
-		lck_mtx_assert(&fadv_lock, LCK_MTX_ASSERT_OWNED);
+		LCK_MTX_ASSERT(&fadv_lock, LCK_MTX_ASSERT_OWNED);
 		while (STAILQ_EMPTY(&fadv_list)) {
 			VERIFY(!fadv_active);
 			(void) msleep0(&fadv_list, &fadv_lock, (PSOCK | PSPIN),
@@ -203,30 +194,70 @@ flowadv_thread_cont(int err)
 			STAILQ_NEXT(fce, fce_link) = NULL;
 
 			lck_mtx_unlock(&fadv_lock);
-			switch (fce->fce_flowsrc) {
+
+			if (fce->fce_event_type == FCE_EVENT_TYPE_CONGESTION_EXPERIENCED) {
+				switch (fce->fce_flowsrc_type) {
+				case FLOWSRC_CHANNEL:
+					kern_channel_flowadv_report_ce_event(fce, fce->fce_ce_cnt,
+					    fce->fce_pkts_since_last_report);
+					break;
+				case FLOWSRC_INPCB:
+				case FLOWSRC_IFNET:
+				case FLOWSRC_PF:
+				default:
+					break;
+				}
+
+				goto next;
+			}
+
+			switch (fce->fce_flowsrc_type) {
 			case FLOWSRC_INPCB:
 				inp_flowadv(fce->fce_flowid);
 				break;
 
 			case FLOWSRC_IFNET:
+#if SKYWALK
+				/*
+				 * when using the flowID allocator, IPSec
+				 * driver uses the "pkt_flowid" field in mbuf
+				 * packet header for the globally unique flowID
+				 * and the "pkt_mpriv_srcid" field carries the
+				 * interface flow control id (if_flowhash).
+				 * For IPSec flows, it is the IPSec driver
+				 * network interface which is flow controlled,
+				 * instead of the IPSec SA flow.
+				 */
+				ifnet_flowadv(fce->fce_flowsrc_token);
+#else /* !SKYWALK */
 				ifnet_flowadv(fce->fce_flowid);
+#endif /* !SKYWALK */
 				break;
+
+#if SKYWALK
+			case FLOWSRC_CHANNEL:
+				kern_channel_flowadv_clear(fce);
+				break;
+#endif /* SKYWALK */
 
 			case FLOWSRC_PF:
 			default:
 				break;
 			}
+next:
 			flowadv_free_entry(fce);
 			lck_mtx_lock_spin(&fadv_lock);
 
 			/* if there's no pending request, we're done */
-			if (STAILQ_EMPTY(&fadv_list))
+			if (STAILQ_EMPTY(&fadv_list)) {
 				break;
+			}
 		}
 		fadv_active = 0;
 	}
 }
 
+__dead2
 static void
 flowadv_thread_func(void *v, wait_result_t w)
 {

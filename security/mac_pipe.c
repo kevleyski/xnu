@@ -2,7 +2,7 @@
  * Copyright (c) 2007 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
- * 
+ *
  * This file contains Original Code and/or Modifications of Original Code
  * as defined in and that are subject to the Apple Public Source License
  * Version 2.0 (the 'License'). You may not use this file except in
@@ -11,10 +11,10 @@
  * unlawful or unlicensed copies of an Apple operating system, or to
  * circumvent, violate, or enable the circumvention or violation of, any
  * terms of an Apple operating system software license agreement.
- * 
+ *
  * Please obtain a copy of the License at
  * http://www.opensource.apple.com/apsl/ and read it before using this file.
- * 
+ *
  * The Original Code and all software distributed under the License are
  * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
@@ -22,7 +22,7 @@
  * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
  * Please see the License for the specific language governing rights and
  * limitations under the License.
- * 
+ *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
 /*-
@@ -72,29 +72,40 @@
 #include <security/mac_internal.h>
 
 
-struct label *
+static struct label *
 mac_pipe_label_alloc(void)
 {
 	struct label *label;
 
 	label = mac_labelzone_alloc(MAC_WAITOK);
-	if (label == NULL)
-		return (NULL);
+	if (label == NULL) {
+		return NULL;
+	}
 	MAC_PERFORM(pipe_label_init, label);
-	return (label);
+	return label;
+}
+
+struct label *
+mac_pipe_label(struct pipe *cpipe)
+{
+	return cpipe->pipe_label;
+}
+
+void
+mac_pipe_set_label(struct pipe *cpipe, struct label *label)
+{
+	cpipe->pipe_label = label;
 }
 
 void
 mac_pipe_label_init(struct pipe *cpipe)
 {
-
-	cpipe->pipe_label = mac_pipe_label_alloc();
+	mac_pipe_set_label(cpipe, mac_pipe_label_alloc());
 }
 
 void
 mac_pipe_label_free(struct label *label)
 {
-
 	MAC_PERFORM(pipe_label_destroy, label);
 	mac_labelzone_free(label);
 }
@@ -102,44 +113,15 @@ mac_pipe_label_free(struct label *label)
 void
 mac_pipe_label_destroy(struct pipe *cpipe)
 {
-
-	mac_pipe_label_free(cpipe->pipe_label);
-	cpipe->pipe_label = NULL;
-}
-
-void
-mac_pipe_label_copy(struct label *src, struct label *dest)
-{
-
-	MAC_PERFORM(pipe_label_copy, src, dest);
-}
-
-int
-mac_pipe_label_externalize(struct label *label, char *elements,
-    char *outbuf, size_t outbuflen)
-{
-	int error;
-
-	error = MAC_EXTERNALIZE(pipe, label, elements, outbuf, outbuflen);
-
-	return (error);
-}
-
-int
-mac_pipe_label_internalize(struct label *label, char *string)
-{
-	int error;
-
-	error = MAC_INTERNALIZE(pipe, label, string);
-
-	return (error);
+	struct label *label = mac_pipe_label(cpipe);
+	mac_pipe_set_label(cpipe, NULL);
+	mac_pipe_label_free(label);
 }
 
 void
 mac_pipe_label_associate(kauth_cred_t cred, struct pipe *cpipe)
 {
-
-	MAC_PERFORM(pipe_label_associate, cred, cpipe, cpipe->pipe_label);
+	MAC_PERFORM(pipe_label_associate, cred, cpipe, mac_pipe_label(cpipe));
 }
 
 int
@@ -148,23 +130,30 @@ mac_pipe_check_kqfilter(kauth_cred_t cred, struct knote *kn,
 {
 	int error;
 
-	if (!mac_pipe_enforce)
-		return (0);
-
-	MAC_CHECK(pipe_check_kqfilter, cred, kn, cpipe, cpipe->pipe_label);
-	return (error);
+#if SECURITY_MAC_CHECK_ENFORCE
+	/* 21167099 - only check if we allow write */
+	if (!mac_pipe_enforce) {
+		return 0;
+	}
+#endif
+	MAC_CHECK(pipe_check_kqfilter, cred, kn, cpipe, mac_pipe_label(cpipe));
+	return error;
 }
 int
-mac_pipe_check_ioctl(kauth_cred_t cred, struct pipe *cpipe, u_int cmd)
+mac_pipe_check_ioctl(kauth_cred_t cred, struct pipe *cpipe, u_long cmd)
 {
 	int error;
 
-	if (!mac_pipe_enforce)
-		return (0);
+#if SECURITY_MAC_CHECK_ENFORCE
+	/* 21167099 - only check if we allow write */
+	if (!mac_pipe_enforce) {
+		return 0;
+	}
+#endif
 
-	MAC_CHECK(pipe_check_ioctl, cred, cpipe, cpipe->pipe_label, cmd);
+	MAC_CHECK(pipe_check_ioctl, cred, cpipe, mac_pipe_label(cpipe), cmd);
 
-	return (error);
+	return error;
 }
 
 int
@@ -172,26 +161,16 @@ mac_pipe_check_read(kauth_cred_t cred, struct pipe *cpipe)
 {
 	int error;
 
-	if (!mac_pipe_enforce)
-		return (0);
+#if SECURITY_MAC_CHECK_ENFORCE
+	/* 21167099 - only check if we allow write */
+	if (!mac_pipe_enforce) {
+		return 0;
+	}
+#endif
 
-	MAC_CHECK(pipe_check_read, cred, cpipe, cpipe->pipe_label);
+	MAC_CHECK(pipe_check_read, cred, cpipe, mac_pipe_label(cpipe));
 
-	return (error);
-}
-
-static int
-mac_pipe_check_label_update(kauth_cred_t cred, struct pipe *cpipe,
-    struct label *newlabel)
-{
-	int error;
-
-	if (!mac_pipe_enforce)
-		return (0);
-
-	MAC_CHECK(pipe_check_label_update, cred, cpipe, cpipe->pipe_label, newlabel);
-
-	return (error);
+	return error;
 }
 
 int
@@ -199,12 +178,16 @@ mac_pipe_check_select(kauth_cred_t cred, struct pipe *cpipe, int which)
 {
 	int error;
 
-	if (!mac_pipe_enforce)
-		return (0);
+#if SECURITY_MAC_CHECK_ENFORCE
+	/* 21167099 - only check if we allow write */
+	if (!mac_pipe_enforce) {
+		return 0;
+	}
+#endif
 
-	MAC_CHECK(pipe_check_select, cred, cpipe, cpipe->pipe_label, which);
+	MAC_CHECK(pipe_check_select, cred, cpipe, mac_pipe_label(cpipe), which);
 
-	return (error);
+	return error;
 }
 
 int
@@ -212,12 +195,16 @@ mac_pipe_check_stat(kauth_cred_t cred, struct pipe *cpipe)
 {
 	int error;
 
-	if (!mac_pipe_enforce)
-		return (0);
+#if SECURITY_MAC_CHECK_ENFORCE
+	/* 21167099 - only check if we allow write */
+	if (!mac_pipe_enforce) {
+		return 0;
+	}
+#endif
 
-	MAC_CHECK(pipe_check_stat, cred, cpipe, cpipe->pipe_label);
+	MAC_CHECK(pipe_check_stat, cred, cpipe, mac_pipe_label(cpipe));
 
-	return (error);
+	return error;
 }
 
 int
@@ -225,25 +212,14 @@ mac_pipe_check_write(kauth_cred_t cred, struct pipe *cpipe)
 {
 	int error;
 
-	if (!mac_pipe_enforce)
-		return (0);
+#if SECURITY_MAC_CHECK_ENFORCE
+	/* 21167099 - only check if we allow write */
+	if (!mac_pipe_enforce) {
+		return 0;
+	}
+#endif
 
-	MAC_CHECK(pipe_check_write, cred, cpipe, cpipe->pipe_label);
+	MAC_CHECK(pipe_check_write, cred, cpipe, mac_pipe_label(cpipe));
 
-	return (error);
-}
-
-int
-mac_pipe_label_update(kauth_cred_t cred, struct pipe *cpipe,
-    struct label *label)
-{
-	int error;
-
-	error = mac_pipe_check_label_update(cred, cpipe, label);
-	if (error)
-		return (error);
-
-	MAC_PERFORM(pipe_label_update, cred, cpipe, cpipe->pipe_label, label);
-
-	return (0);
+	return error;
 }

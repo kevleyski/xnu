@@ -2,7 +2,7 @@
  * Copyright (c) 2000-2007 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
- * 
+ *
  * This file contains Original Code and/or Modifications of Original Code
  * as defined in and that are subject to the Apple Public Source License
  * Version 2.0 (the 'License'). You may not use this file except in
@@ -11,10 +11,10 @@
  * unlawful or unlicensed copies of an Apple operating system, or to
  * circumvent, violate, or enable the circumvention or violation of, any
  * terms of an Apple operating system software license agreement.
- * 
+ *
  * Please obtain a copy of the License at
  * http://www.opensource.apple.com/apsl/ and read it before using this file.
- * 
+ *
  * The Original Code and all software distributed under the License are
  * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
@@ -22,7 +22,7 @@
  * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
  * Please see the License for the specific language governing rights and
  * limitations under the License.
- * 
+ *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
 /*
@@ -33,7 +33,7 @@
  * Mach MIG Subsystem Interfaces
  */
 
-#ifndef	_MACH_MIG_H_
+#ifndef _MACH_MIG_H_
 #define _MACH_MIG_H_
 
 #include <stdint.h>
@@ -77,8 +77,8 @@
  * unpack the request message, call the server procedure, and pack the
  * reply message.
  */
-typedef void	(*mig_stub_routine_t) (mach_msg_header_t *InHeadP,
-				       mach_msg_header_t *OutHeadP);
+typedef void    (*mig_stub_routine_t) (mach_msg_header_t *InHeadP,
+    mach_msg_header_t *OutHeadP);
 
 typedef mig_stub_routine_t mig_routine_t;
 
@@ -103,13 +103,13 @@ typedef mach_msg_type_descriptor_t *mig_routine_arg_descriptor_t;
 #define MIG_ROUTINE_ARG_DESCRIPTOR_NULL ((mig_routine_arg_descriptor_t)0)
 
 struct routine_descriptor {
-	mig_impl_routine_t	impl_routine;	/* Server work func pointer   */
-	mig_stub_routine_t	stub_routine;	/* Unmarshalling func pointer */
-	unsigned int		argc;			/* Number of argument words   */
-	unsigned int		descr_count;	/* Number complex descriptors */
+	mig_impl_routine_t      impl_routine;   /* Server work func pointer   */
+	mig_stub_routine_t      stub_routine;   /* Unmarshalling func pointer */
+	unsigned int            argc;                   /* Number of argument words   */
+	unsigned int            descr_count;    /* Number complex descriptors */
 	routine_arg_descriptor_t
-						arg_descr;		/* pointer to descriptor array*/
-	unsigned int		max_reply_msg;	/* Max size for reply msg     */
+	    arg_descr;                                                  /* pointer to descriptor array*/
+	unsigned int            max_reply_msg;  /* Max size for reply msg     */
 };
 typedef struct routine_descriptor *routine_descriptor_t;
 
@@ -119,146 +119,69 @@ typedef mig_routine_descriptor *mig_routine_descriptor_t;
 #define MIG_ROUTINE_DESCRIPTOR_NULL ((mig_routine_descriptor_t)0)
 
 typedef struct mig_subsystem {
-	mig_server_routine_t server;		/* pointer to demux routine	*/
-	mach_msg_id_t		 start;			/* Min routine number	    */
-	mach_msg_id_t		 end;			/* Max routine number + 1   */
-	mach_msg_size_t		 maxsize;		/* Max reply message size   */
-	vm_address_t		 reserved;		/* reserved for MIG use	    */
+	mig_server_routine_t server;            /* pointer to demux routine	*/
+	mach_msg_id_t            start;                 /* Min routine number	    */
+	mach_msg_id_t            end;                   /* Max routine number + 1   */
+	mach_msg_size_t          maxsize;               /* Max reply message size   */
+	vm_address_t             reserved;              /* reserved for MIG use	    */
 	mig_routine_descriptor
-						 routine[1];	/* Routine descriptor array */
+	    routine[1];                                         /* Routine descriptor array */
 } *mig_subsystem_t;
 
-#define MIG_SUBSYSTEM_NULL		((mig_subsystem_t)0)
+#ifdef XNU_KERNEL_PRIVATE
+/* KernelServer MIG routine/subsystem types */
+typedef void    (*mig_stub_kern_routine_t) (mach_msg_header_t *InHeadP, void *InDataP,
+    mach_msg_max_trailer_t *InTrailerP, mach_msg_header_t *OutHeadP, void *OutDataP);
 
-typedef struct mig_symtab {
-	char				*ms_routine_name;
-	int					ms_routine_number;
-	void    			(*ms_routine)(void);	/* Since the functions in the
-					 							 * symbol table have unknown
-												 * signatures, this is the best
-					 							 * we can do...
-					 							 */
-} mig_symtab_t;
+typedef mig_stub_kern_routine_t mig_kern_routine_t;
 
-#ifdef	PRIVATE
+typedef mig_kern_routine_t (*mig_kern_server_routine_t) (mach_msg_header_t *InHeadP);
 
-/* MIG object runtime - not ready for public consumption */
-
-#ifdef  KERNEL_PRIVATE
-
-/*
- * MIG object runtime definitions
- *
- * Conforming MIG subsystems may enable this support to get
- * significant assistance from the base mig_object_t implementation.
- *
- * Support includes:
- *	- Transparency from port manipulation.
- *	- Dymanic port allocation on first "remoting" of an object.
- *	- Reference conversions from object to port and vice versa.
- *	- Automatic port deallocation on no-more-senders.
- *	- Support for multiple server implementations in a single space.
- *	- Messaging bypass for local servers.
- *	- Automatic hookup to base dispatch mechanism.
- *	- General notification support
- * Coming soon:
- *	- User-level support
- */
-typedef unsigned int 			mig_notify_type_t;
-
-typedef struct MIGIID {
-	unsigned long				data1;
-	unsigned short				data2;
-	unsigned short				data3;
-	unsigned char				data4[8];
-} MIGIID;
-
-typedef struct IMIGObjectVtbl			IMIGObjectVtbl;
-typedef struct IMIGNotifyObjectVtbl		IMIGNotifyObjectVtbl;
-
-typedef struct IMIGObject {
-	const IMIGObjectVtbl			*pVtbl;
-} IMIGObject;
-
-typedef struct IMIGNotifyObject {
-	const IMIGNotifyObjectVtbl		*pVtbl;
-} IMIGNotifyObject;
-
-struct IMIGObjectVtbl {
-	kern_return_t (*QueryInterface)(
-			IMIGObject		*object,
-			const MIGIID		*iid,
-			void			**ppv);
-
-	unsigned long (*AddRef)(
-			IMIGObject		*object);
-
-	unsigned long (*Release)(	
-			IMIGObject		*object);
-
-	unsigned long (*GetServer)(
-			IMIGObject		*object,
-			mig_server_routine_t 	*server);
-	    
-	boolean_t (*RaiseNotification)(
-			IMIGObject 		*object,
-			mig_notify_type_t	notify_type);
-
-	boolean_t (*RequestNotification)(
-			IMIGObject		*object,
-			IMIGNotifyObject	*notify,
-			mig_notify_type_t	notify_type);
-};		
-
-/*
- * IMIGNotifyObject
- *
- * A variant of the IMIGObject interface that is a sink for
- * MIG notifications.
- *
- * A reference is held on both the subject MIGObject and the target
- * MIGNotifyObject. Because of this, care must be exercised to avoid
- * reference cycles.  Once a notification is raised, the object
- * reference is returned and the request must be re-requested (if
- * desired).
- *
- * One interesting note:  because this interface is itself a MIG
- * object, one may request notification about state changes in
- * the MIGNotifyObject itself.
- */
-struct IMIGNotifyObjectVtbl {
-	kern_return_t (*QueryInterface)(
-			IMIGNotifyObject	*notify,
-			const MIGIID		*iid,
-			void			**ppv);
-
-	unsigned long (*AddRef)(	
-			IMIGNotifyObject	*notify);
-
-	unsigned long (*Release)(	
-			IMIGNotifyObject	*notify);
-
-	unsigned long (*GetServer)(
-			IMIGNotifyObject	*notify,
-			mig_server_routine_t	*server);
-
-	boolean_t (*RaiseNotification)(
-			IMIGNotifyObject	*notify,
-			mig_notify_type_t	notify_type);
-
-	boolean_t (*RequestNotification)(
-			IMIGNotifyObject	*notify,
-			IMIGNotifyObject	*notify_notify,
-			mig_notify_type_t	notify_type);
-
-	void (*HandleNotification)(
-			IMIGNotifyObject	*notify,
-			IMIGObject		*object,
-			mig_notify_type_t	notify_type);
+struct kern_routine_descriptor {
+	mig_impl_routine_t      impl_routine;      /* Server work func pointer   */
+	mig_stub_kern_routine_t kstub_routine;     /* Unmarshalling func pointer */
+	unsigned int            argc;              /* Number of argument words   */
+	unsigned int            descr_count;       /* Number complex descriptors */
+	unsigned int            reply_descr_count; /* Number descriptors in reply */
+	unsigned int            max_reply_msg;     /* Max size for reply msg */
 };
 
-#endif	/* KERNEL_PRIVATE */
-#endif  /* PRIVATE */
+typedef struct kern_routine_descriptor mig_kern_routine_descriptor;
+typedef struct kern_routine_descriptor *kern_routine_descriptor_t;
+
+typedef struct mig_kern_subsystem {
+	mig_kern_server_routine_t     kserver;     /* pointer to kernel demux routine */
+	mach_msg_id_t            start;            /* Min routine number */
+	mach_msg_id_t            end;              /* Max routine number + 1 */
+	mach_msg_size_t          maxsize;          /* Max reply message size */
+	vm_address_t             reserved;         /* reserved for MIG use */
+	mig_kern_routine_descriptor
+	    kroutine[1];                           /* Kernel routine descriptor array */
+} *mig_kern_subsystem_t;
+#endif /* XNU_KERNEL_PRIVATE */
+
+#define MIG_SUBSYSTEM_NULL              ((mig_subsystem_t)0)
+
+typedef struct mig_symtab {
+	char                            *ms_routine_name;
+	int                                     ms_routine_number;
+	void                            (*ms_routine)(void);    /* Since the functions in the
+	                                                         * symbol table have unknown
+	                                                         * signatures, this is the best
+	                                                         * we can do...
+	                                                         */
+} mig_symtab_t;
+
+/*
+ * A compiler attribute for annotating all MIG server routines and other
+ * functions that should behave similarly.  Allows the compiler to perform
+ * additional static bug-finding over them.
+ */
+#if __has_attribute(mig_server_routine)
+#define MIG_SERVER_ROUTINE __attribute__((mig_server_routine))
+#else
+#define MIG_SERVER_ROUTINE
+#endif
 
 __BEGIN_DECLS
 
@@ -272,12 +195,13 @@ extern void mig_dealloc_reply_port(mach_port_t reply_port);
 extern void mig_put_reply_port(mach_port_t reply_port);
 
 /* Bounded string copy */
-extern int mig_strncpy(char	*dest, const char *src,	int	len);
+extern int mig_strncpy(char     *dest, const char *src, int     len);
+extern int mig_strncpy_zerofill(char    *dest, const char *src, int     len);
 
 #ifdef KERNEL_PRIVATE
 
 /* Allocate memory for out-of-stack mig structures */
-extern char *mig_user_allocate(vm_size_t size);
+extern void *mig_user_allocate(vm_size_t size);
 
 /* Deallocate memory used for out-of-stack mig structures */
 extern void mig_user_deallocate(char *data, vm_size_t size);
@@ -294,4 +218,4 @@ extern void mig_deallocate(vm_address_t, vm_size_t);
 
 __END_DECLS
 
-#endif	/* _MACH_MIG_H_ */
+#endif  /* _MACH_MIG_H_ */

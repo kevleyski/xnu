@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011 Apple Inc.  All rights reserved.
+ * Copyright (c) 2011-2014 Apple Inc.  All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -25,6 +25,10 @@
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
+
+#include <nfs/nfs_conf.h>
+#if CONFIG_NFS_SERVER
+
 #include <stdint.h>
 #include <sys/param.h>
 #include <sys/mount_internal.h>
@@ -54,7 +58,9 @@ struct nfsrv_uc_arg {
 	uint32_t nua_flags;
 	uint32_t nua_qi;
 };
-#define NFS_UC_QUEUED	0x0001
+
+#define NFS_UC_QUEUED   0x0001
+#define NFS_UC_RECEIVE  0x0002
 
 #define NFS_UC_HASH_SZ 7
 #define NFS_UC_HASH(x) ((((uint32_t)(uintptr_t)(x)) >> 3) % nfsrv_uc_thread_count)
@@ -62,15 +68,15 @@ struct nfsrv_uc_arg {
 TAILQ_HEAD(nfsrv_uc_q, nfsrv_uc_arg);
 
 static struct nfsrv_uc_queue {
-	lck_mtx_t		*ucq_lock;
-	struct nfsrv_uc_q	ucq_queue[1];
-	thread_t		ucq_thd;
-	uint32_t		ucq_flags;
+	lck_mtx_t               ucq_lock;
+	struct nfsrv_uc_q       ucq_queue[1];
+	thread_t                ucq_thd;
+	uint32_t                ucq_flags;
 } nfsrv_uc_queue_tbl[NFS_UC_HASH_SZ];
-#define NFS_UC_QUEUE_SLEEPING	0x0001
+#define NFS_UC_QUEUE_SLEEPING   0x0001
 
-static lck_grp_t *nfsrv_uc_group;
-static lck_mtx_t *nfsrv_uc_shutdown_lock;
+static LCK_GRP_DECLARE(nfsrv_uc_group, "nfs_upcall_locks");
+static LCK_MTX_DECLARE(nfsrv_uc_shutdown_lock, &nfsrv_uc_group);
 static volatile int nfsrv_uc_shutdown = 0;
 static int32_t nfsrv_uc_thread_count;
 
@@ -96,18 +102,18 @@ nfsrv_uc_thread(void *arg, wait_result_t wr __unused)
 
 	DPRINT("nfsrv_uc_thread %d started\n", qi);
 	while (!nfsrv_uc_shutdown) {
-		lck_mtx_lock(myqueue->ucq_lock);
+		lck_mtx_lock(&myqueue->ucq_lock);
 
 		while (!nfsrv_uc_shutdown && TAILQ_EMPTY(myqueue->ucq_queue)) {
 			myqueue->ucq_flags |= NFS_UC_QUEUE_SLEEPING;
-			error = msleep(myqueue, myqueue->ucq_lock, PSOCK, "nfsd_upcall_handler", NULL);
+			error = msleep(myqueue, &myqueue->ucq_lock, PSOCK, "nfsd_upcall_handler", NULL);
 			myqueue->ucq_flags &= ~NFS_UC_QUEUE_SLEEPING;
 			if (error) {
 				printf("nfsrv_uc_thread received error %d\n", error);
 			}
 		}
 		if (nfsrv_uc_shutdown) {
-			lck_mtx_unlock(myqueue->ucq_lock);
+			lck_mtx_unlock(&myqueue->ucq_lock);
 			break;
 		}
 
@@ -118,8 +124,9 @@ nfsrv_uc_thread(void *arg, wait_result_t wr __unused)
 		TAILQ_REMOVE(myqueue->ucq_queue, ep, nua_svcq);
 
 		ep->nua_flags &= ~NFS_UC_QUEUED;
+		ep->nua_flags |= NFS_UC_RECEIVE;
 
-		lck_mtx_unlock(myqueue->ucq_lock);
+		lck_mtx_unlock(&myqueue->ucq_lock);
 
 #ifdef NFS_UC_Q_DEBUG
 		OSDecrementAtomic(&nfsrv_uc_queue_count);
@@ -127,12 +134,17 @@ nfsrv_uc_thread(void *arg, wait_result_t wr __unused)
 
 		DPRINT("calling nfsrv_rcv for %p\n", (void *)ep->nua_slp);
 		nfsrv_rcv(ep->nua_so, (void *)ep->nua_slp, ep->nua_waitflag);
+
+		lck_mtx_lock(&myqueue->ucq_lock);
+		ep->nua_flags &= ~NFS_UC_RECEIVE;
+		wakeup(&ep->nua_flags);
+		lck_mtx_unlock(&myqueue->ucq_lock);
 	}
 
-	lck_mtx_lock(nfsrv_uc_shutdown_lock);
+	lck_mtx_lock(&nfsrv_uc_shutdown_lock);
 	nfsrv_uc_thread_count--;
 	wakeup(&nfsrv_uc_thread_count);
-	lck_mtx_unlock(nfsrv_uc_shutdown_lock);
+	lck_mtx_unlock(&nfsrv_uc_shutdown_lock);
 
 	thread_terminate(current_thread());
 }
@@ -150,21 +162,27 @@ nfsrv_uc_dequeue(struct nfsrv_sock *slp)
 	/*
 	 * We assume that the socket up-calls have been stop and the socket
 	 * is shutting down so no need for acquiring the lock to check that
-	 * the flag is cleared.
+	 * the flags are cleared.
 	 */
-	if (ap == NULL || (ap->nua_flags & NFS_UC_QUEUED) == 0)
+	if (ap == NULL || (ap->nua_flags & (NFS_UC_QUEUED | NFS_UC_RECEIVE)) == 0) {
 		return;
+	}
 	/* If we're queued we might race with nfsrv_uc_thread */
-	lck_mtx_lock(myqueue->ucq_lock);
+	lck_mtx_lock(&myqueue->ucq_lock);
+	while (ap->nua_flags & NFS_UC_RECEIVE) {
+		msleep(&ap->nua_flags, &myqueue->ucq_lock, PSOCK, "nfsrv_uc_dequeue_wait", NULL);
+	}
 	if (ap->nua_flags & NFS_UC_QUEUED) {
 		printf("nfsrv_uc_dequeue remove %p\n", ap);
 		TAILQ_REMOVE(myqueue->ucq_queue, ap, nua_svcq);
 		ap->nua_flags &= ~NFS_UC_QUEUED;
 #ifdef NFS_UC_Q_DEBUG
 		OSDecrementAtomic(&nfsrv_uc_queue_count);
-#endif		
+#endif
 	}
-	lck_mtx_unlock(myqueue->ucq_lock);
+	kfree_type(struct nfsrv_uc_arg, slp->ns_ua);
+	slp->ns_ua = NULL;
+	lck_mtx_unlock(&myqueue->ucq_lock);
 }
 
 /*
@@ -173,16 +191,12 @@ nfsrv_uc_dequeue(struct nfsrv_sock *slp)
 void
 nfsrv_uc_init(void)
 {
-	int i;
-
-	nfsrv_uc_group = lck_grp_alloc_init("nfs_upcall_locks", LCK_GRP_ATTR_NULL);
-	for (i = 0; i < NFS_UC_HASH_SZ; i++) {
+	for (int i = 0; i < NFS_UC_HASH_SZ; i++) {
 		TAILQ_INIT(nfsrv_uc_queue_tbl[i].ucq_queue);
-		nfsrv_uc_queue_tbl[i].ucq_lock = lck_mtx_alloc_init(nfsrv_uc_group, LCK_ATTR_NULL);
+		lck_mtx_init(&nfsrv_uc_queue_tbl[i].ucq_lock, &nfsrv_uc_group, LCK_ATTR_NULL);
 		nfsrv_uc_queue_tbl[i].ucq_thd = THREAD_NULL;
 		nfsrv_uc_queue_tbl[i].ucq_flags = 0;
 	}
-	nfsrv_uc_shutdown_lock = lck_mtx_alloc_init(nfsrv_uc_group, LCK_ATTR_NULL);
 }
 
 /*
@@ -196,15 +210,17 @@ nfsrv_uc_start(void)
 	int error;
 
 #ifdef NFS_UC_Q_DEBUG
-	if (!nfsrv_uc_use_proxy)
+	if (!nfsrv_uc_use_proxy) {
 		return;
+	}
 #endif
 	DPRINT("nfsrv_uc_start\n");
 
 	/* Wait until previous shutdown finishes */
-	lck_mtx_lock(nfsrv_uc_shutdown_lock);
-	while (nfsrv_uc_shutdown || nfsrv_uc_thread_count > 0)
-		msleep(&nfsrv_uc_thread_count, nfsrv_uc_shutdown_lock, PSOCK, "nfsd_upcall_shutdown_wait", NULL);
+	lck_mtx_lock(&nfsrv_uc_shutdown_lock);
+	while (nfsrv_uc_shutdown || nfsrv_uc_thread_count > 0) {
+		msleep(&nfsrv_uc_thread_count, &nfsrv_uc_shutdown_lock, PSOCK, "nfsd_upcall_shutdown_wait", NULL);
+	}
 
 	/* Start up-call threads */
 	for (i = 0; i < NFS_UC_HASH_SZ; i++) {
@@ -225,7 +241,7 @@ out:
 	nfsrv_uc_queue_count = 0ULL;
 	nfsrv_uc_queue_max_seen = 0ULL;
 #endif
-	lck_mtx_unlock(nfsrv_uc_shutdown_lock);
+	lck_mtx_unlock(&nfsrv_uc_shutdown_lock);
 }
 
 /*
@@ -243,26 +259,28 @@ nfsrv_uc_stop(void)
 	/* Signal up-call threads to stop */
 	nfsrv_uc_shutdown = 1;
 	for (i = 0; i < thread_count; i++) {
-		lck_mtx_lock(nfsrv_uc_queue_tbl[i].ucq_lock);
+		lck_mtx_lock(&nfsrv_uc_queue_tbl[i].ucq_lock);
 		wakeup(&nfsrv_uc_queue_tbl[i]);
-		lck_mtx_unlock(nfsrv_uc_queue_tbl[i].ucq_lock);
+		lck_mtx_unlock(&nfsrv_uc_queue_tbl[i].ucq_lock);
 	}
 
 	/* Wait until they are done shutting down */
-	lck_mtx_lock(nfsrv_uc_shutdown_lock);
-	while (nfsrv_uc_thread_count > 0)
-		msleep(&nfsrv_uc_thread_count, nfsrv_uc_shutdown_lock, PSOCK, "nfsd_upcall_shutdown_stop", NULL);
+	lck_mtx_lock(&nfsrv_uc_shutdown_lock);
+	while (nfsrv_uc_thread_count > 0) {
+		msleep(&nfsrv_uc_thread_count, &nfsrv_uc_shutdown_lock, PSOCK, "nfsd_upcall_shutdown_stop", NULL);
+	}
 
 	/* Deallocate old threads */
 	for (i = 0; i < nfsrv_uc_thread_count; i++) {
-		if (nfsrv_uc_queue_tbl[i].ucq_thd != THREAD_NULL)
+		if (nfsrv_uc_queue_tbl[i].ucq_thd != THREAD_NULL) {
 			thread_deallocate(nfsrv_uc_queue_tbl[i].ucq_thd);
+		}
 		nfsrv_uc_queue_tbl[i].ucq_thd = THREAD_NULL;
 	}
 
 	/* Enable restarting */
 	nfsrv_uc_shutdown = 0;
-	lck_mtx_unlock(nfsrv_uc_shutdown_lock);
+	lck_mtx_unlock(&nfsrv_uc_shutdown_lock);
 }
 
 /*
@@ -285,13 +303,13 @@ nfsrv_uc_cleanup(void)
 	for (i = 0; i < NFS_UC_HASH_SZ; i++) {
 		struct nfsrv_uc_queue *queue = &nfsrv_uc_queue_tbl[i];
 
-		lck_mtx_lock(queue->ucq_lock);
+		lck_mtx_lock(&queue->ucq_lock);
 		while (!TAILQ_EMPTY(queue->ucq_queue)) {
 			struct nfsrv_uc_arg *ep = TAILQ_FIRST(queue->ucq_queue);
 			TAILQ_REMOVE(queue->ucq_queue, ep, nua_svcq);
 			ep->nua_flags &= ~NFS_UC_QUEUED;
 		}
-		lck_mtx_unlock(queue->ucq_lock);
+		lck_mtx_unlock(&queue->ucq_lock);
 	}
 
 	nfsrv_uc_stop();
@@ -312,12 +330,12 @@ nfsrv_uc_proxy(socket_t so, void *arg, int waitflag)
 	int qi = uap->nua_qi;
 	struct nfsrv_uc_queue *myqueue = &nfsrv_uc_queue_tbl[qi];
 
-	lck_mtx_lock(myqueue->ucq_lock);
+	lck_mtx_lock(&myqueue->ucq_lock);
 	DPRINT("nfsrv_uc_proxy called for %p (%p)\n", uap, uap->nua_slp);
 	DPRINT("\tUp-call queued on %d for wakeup of %p\n", qi, myqueue);
-	if (uap->nua_flags & NFS_UC_QUEUED) {
-		lck_mtx_unlock(myqueue->ucq_lock);
-		return;  /* Already queued */
+	if (uap == NULL || uap->nua_flags & NFS_UC_QUEUED) {
+		lck_mtx_unlock(&myqueue->ucq_lock);
+		return;  /* Already queued or freed */
 	}
 
 	uap->nua_so = so;
@@ -326,23 +344,25 @@ nfsrv_uc_proxy(socket_t so, void *arg, int waitflag)
 	TAILQ_INSERT_TAIL(myqueue->ucq_queue, uap, nua_svcq);
 
 	uap->nua_flags |= NFS_UC_QUEUED;
-	if (myqueue->ucq_flags | NFS_UC_QUEUE_SLEEPING)
+	if (myqueue->ucq_flags & NFS_UC_QUEUE_SLEEPING) {
 		wakeup(myqueue);
+	}
 
 #ifdef NFS_UC_Q_DEBUG
 	{
 		uint32_t count = OSIncrementAtomic(&nfsrv_uc_queue_count);
-	
+
 		/* This is a bit racey but just for debug */
-		if (count > nfsrv_uc_queue_max_seen)
+		if (count > nfsrv_uc_queue_max_seen) {
 			nfsrv_uc_queue_max_seen = count;
+		}
 
 		if (nfsrv_uc_queue_limit && count > nfsrv_uc_queue_limit) {
-			panic("nfsd up-call queue limit exceeded\n");
+			panic("nfsd up-call queue limit exceeded");
 		}
 	}
 #endif
-	lck_mtx_unlock(myqueue->ucq_lock);
+	lck_mtx_unlock(&myqueue->ucq_lock);
 }
 
 
@@ -357,8 +377,9 @@ nfsrv_uc_addsock(struct nfsrv_sock *slp, int start)
 	int on = 1;
 	struct nfsrv_uc_arg *arg;
 
-	if (start && nfsrv_uc_thread_count == 0)
+	if (start && nfsrv_uc_thread_count == 0) {
 		nfsrv_uc_start();
+	}
 
 	/*
 	 * We don't take a lock since once we're up nfsrv_uc_thread_count does
@@ -366,9 +387,8 @@ nfsrv_uc_addsock(struct nfsrv_sock *slp, int start)
 	 * generate up-calls.
 	 */
 	if (nfsrv_uc_thread_count) {
-		MALLOC(arg, struct nfsrv_uc_arg *, sizeof (struct nfsrv_uc_arg), M_NFSSVC, M_WAITOK | M_ZERO);
-		if (arg == NULL)
-			goto direct;
+		arg = kalloc_type(struct nfsrv_uc_arg,
+		    Z_WAITOK | Z_ZERO | Z_NOFAIL);
 
 		slp->ns_ua = arg;
 		arg->nua_slp = slp;
@@ -376,7 +396,6 @@ nfsrv_uc_addsock(struct nfsrv_sock *slp, int start)
 
 		sock_setupcall(slp->ns_so, nfsrv_uc_proxy, arg);
 	} else {
-direct:
 		slp->ns_ua = NULL;
 		DPRINT("setting nfsrv_rcv up-call\n");
 		sock_setupcall(slp->ns_so, nfsrv_rcv, slp);
@@ -388,3 +407,4 @@ direct:
 	return;
 }
 
+#endif /* CONFIG_NFS_SERVER */

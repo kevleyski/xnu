@@ -1,8 +1,8 @@
 /*
- * Copyright (c) 2008-2011 Apple Inc. All rights reserved.
+ * Copyright (c) 2008-2023 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
- * 
+ *
  * This file contains Original Code and/or Modifications of Original Code
  * as defined in and that are subject to the Apple Public Source License
  * Version 2.0 (the 'License'). You may not use this file except in
@@ -11,10 +11,10 @@
  * unlawful or unlicensed copies of an Apple operating system, or to
  * circumvent, violate, or enable the circumvention or violation of, any
  * terms of an Apple operating system software license agreement.
- * 
+ *
  * Please obtain a copy of the License at
  * http://www.opensource.apple.com/apsl/ and read it before using this file.
- * 
+ *
  * The Original Code and all software distributed under the License are
  * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
@@ -22,7 +22,7 @@
  * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
  * Please see the License for the specific language governing rights and
  * limitations under the License.
- * 
+ *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
 
@@ -86,20 +86,14 @@
 #include <netinet/ip.h>
 #include <netinet/in_var.h>
 
-#if INET6
 #include <netinet/ip6.h>
 #include <netinet6/ip6_var.h>
 #include <netinet/icmp6.h>
-#endif
 
 #include <netinet6/ipsec.h>
-#if INET6
 #include <netinet6/ipsec6.h>
-#endif
 #include <netinet6/ah.h>
-#if INET6
 #include <netinet6/ah6.h>
-#endif
 #include <netkey/key.h>
 #include <netkey/keydb.h>
 
@@ -107,9 +101,10 @@
 
 #if INET
 static struct in_addr *ah4_finaldst(struct mbuf *);
-#endif
 
-extern lck_mtx_t *sadb_mutex;
+static LCK_GRP_DECLARE(sadb_stat_mutex_grp, "sadb_stat");
+static LCK_MTX_DECLARE(sadb_stat_mutex, &sadb_stat_mutex_grp);
+#endif
 
 /*
  * compute AH header size.
@@ -117,36 +112,38 @@ extern lck_mtx_t *sadb_mutex;
  * virtual interface, and control MTU/MSS by the interface MTU.
  */
 size_t
-ah_hdrsiz(isr)
-	struct ipsecrequest *isr;
+ah_hdrsiz(struct ipsecrequest *isr)
 {
-
 	/* sanity check */
-	if (isr == NULL)
-		panic("ah_hdrsiz: NULL was passed.\n");
+	if (isr == NULL) {
+		panic("ah_hdrsiz: NULL was passed.");
+	}
 
-	if (isr->saidx.proto != IPPROTO_AH)
+	if (isr->saidx.proto != IPPROTO_AH) {
 		panic("unsupported mode passed to ah_hdrsiz");
+	}
 
 #if 0
 	{
-
 		lck_mtx_lock(sadb_mutex);
 		const struct ah_algorithm *algo;
 		size_t hdrsiz;
 
 		/*%%%%% this needs to change - no sav in ipsecrequest any more */
-		if (isr->sav == NULL)
+		if (isr->sav == NULL) {
 			goto estimate;
+		}
 		if (isr->sav->state != SADB_SASTATE_MATURE
-		 && isr->sav->state != SADB_SASTATE_DYING)
+		    && isr->sav->state != SADB_SASTATE_DYING) {
 			goto estimate;
-	
+		}
+
 		/* we need transport mode AH. */
 		algo = ah_algorithm_lookup(isr->sav->alg_auth);
-		if (!algo)
+		if (!algo) {
 			goto estimate;
-	
+		}
+
 		/*
 		 * XXX
 		 * right now we don't calcurate the padding size.  simply
@@ -155,11 +152,12 @@ ah_hdrsiz(isr)
 		 * XXX variable size padding support
 		 */
 		hdrsiz = (((*algo->sumsiz)(isr->sav) + 3) & ~(4 - 1));
-		if (isr->sav->flags & SADB_X_EXT_OLD)
+		if (isr->sav->flags & SADB_X_EXT_OLD) {
 			hdrsiz += sizeof(struct ah);
-		else
+		} else {
 			hdrsiz += sizeof(struct newah);
-	
+		}
+
 		lck_mtx_unlock(sadb_mutex);
 		return hdrsiz;
 	}
@@ -167,7 +165,7 @@ ah_hdrsiz(isr)
 estimate:
 #endif
 
-    //lck_mtx_unlock(sadb_mutex);
+	//lck_mtx_unlock(sadb_mutex);
 	/* ASSUMING:
 	 *	sizeof(struct newah) > sizeof(struct ah).
 	 *	16 = (16 + 3) & ~(4 - 1).
@@ -184,30 +182,28 @@ estimate:
  * the function does not modify m.
  */
 int
-ah4_output(m, sav)
-	struct mbuf *m;
-	struct secasvar *sav;
+ah4_output(struct mbuf *m, struct secasvar *sav)
 {
 	const struct ah_algorithm *algo;
 	u_int32_t spi;
 	u_char *ahdrpos;
 	u_char *ahsumpos = NULL;
-	size_t hlen = 0;	/*IP header+option in bytes*/
-	size_t plen = 0;	/*AH payload size in bytes*/
-	size_t ahlen = 0;	/*plen + sizeof(ah)*/
+	size_t hlen = 0;        /*IP header+option in bytes*/
+	size_t plen = 0;        /*AH payload size in bytes*/
+	size_t ahlen = 0;       /*plen + sizeof(ah)*/
 	struct ip *ip;
-	struct in_addr dst = { 0 };
+	struct in_addr dst = { .s_addr = 0 };
 	struct in_addr *finaldst;
 	int error;
 
 	/* sanity checks */
-	if ((sav->flags & SADB_X_EXT_OLD) == 0 && !sav->replay) {
+	if ((sav->flags & SADB_X_EXT_OLD) == 0 && sav->replay[0] == NULL) {
 		ip = mtod(m, struct ip *);
 		ipseclog((LOG_DEBUG, "ah4_output: internal error: "
-			"sav->replay is null: %x->%x, SPI=%u\n",
-			(u_int32_t)ntohl(ip->ip_src.s_addr),
-			(u_int32_t)ntohl(ip->ip_dst.s_addr),
-			(u_int32_t)ntohl(sav->spi)));
+		    "sav->replay is null: %x->%x, SPI=%u\n",
+		    (u_int32_t)ntohl(ip->ip_src.s_addr),
+		    (u_int32_t)ntohl(ip->ip_dst.s_addr),
+		    (u_int32_t)ntohl(sav->spi)));
 		IPSEC_STAT_INCREMENT(ipsecstat.out_inval);
 		m_freem(m);
 		return EINVAL;
@@ -236,6 +232,8 @@ ah4_output(m, sav)
 		ahlen = plen + sizeof(struct newah);
 	}
 
+	VERIFY(ahlen <= UINT16_MAX);
+
 	/*
 	 * grow the mbuf to accomodate AH.
 	 */
@@ -246,8 +244,9 @@ ah4_output(m, sav)
 	hlen = ip->ip_hl << 2;
 #endif
 
-	if (m->m_len != hlen)
+	if (m->m_len != hlen) {
 		panic("ah4_output: assumption failed (first mbuf length)");
+	}
 	if (M_LEADINGSPACE(m->m_next) < ahlen) {
 		struct mbuf *n;
 		MGET(n, M_DONTWAIT, MT_DATA);
@@ -257,7 +256,7 @@ ah4_output(m, sav)
 			m_freem(m);
 			return ENOBUFS;
 		}
-		n->m_len = ahlen;
+		n->m_len = (int32_t)ahlen;
 		n->m_next = m->m_next;
 		m->m_next = n;
 		m->m_pkthdr.len += ahlen;
@@ -269,7 +268,7 @@ ah4_output(m, sav)
 		ahdrpos = mtod(m->m_next, u_char *);
 	}
 
-	ip = mtod(m, struct ip *);	/*just to be sure*/
+	ip = mtod(m, struct ip *);      /*just to be sure*/
 
 	/*
 	 * initialize AH.
@@ -277,9 +276,10 @@ ah4_output(m, sav)
 	if (sav->flags & SADB_X_EXT_OLD) {
 		struct ah *ahdr;
 
+		VERIFY((plen >> 2) <= UINT8_MAX);
 		ahdr = (struct ah *)(void *)ahdrpos;
 		ahsumpos = (u_char *)(ahdr + 1);
-		ahdr->ah_len = plen >> 2;
+		ahdr->ah_len = (u_int8_t)(plen >> 2);
 		ahdr->ah_nxt = ip->ip_p;
 		ahdr->ah_reserve = htons(0);
 		ahdr->ah_spi = spi;
@@ -287,13 +287,14 @@ ah4_output(m, sav)
 	} else {
 		struct newah *ahdr;
 
+		VERIFY(((plen >> 2) + 1) <= UINT8_MAX);
 		ahdr = (struct newah *)(void *)ahdrpos;
 		ahsumpos = (u_char *)(ahdr + 1);
-		ahdr->ah_len = (plen >> 2) + 1;	/* plus one for seq# */
+		ahdr->ah_len = (u_int8_t)((plen >> 2) + 1); /* plus one for seq# */
 		ahdr->ah_nxt = ip->ip_p;
 		ahdr->ah_reserve = htons(0);
 		ahdr->ah_spi = spi;
-		if (sav->replay->count == ~0) {
+		if (sav->replay[0]->count == ~0) {
 			if ((sav->flags & SADB_X_EXT_CYCSEQ) == 0) {
 				/* XXX Is it noisy ? */
 				ipseclog((LOG_WARNING,
@@ -305,13 +306,13 @@ ah4_output(m, sav)
 			}
 		}
 		lck_mtx_lock(sadb_mutex);
-		sav->replay->count++;
+		sav->replay[0]->count++;
 		lck_mtx_unlock(sadb_mutex);
 		/*
 		 * XXX sequence number must not be cycled, if the SA is
 		 * installed by IKE daemon.
 		 */
-		ahdr->ah_seq = htonl(sav->replay->count);
+		ahdr->ah_seq = htonl(sav->replay[0]->count);
 		bzero(ahdr + 1, plen);
 	}
 
@@ -319,9 +320,9 @@ ah4_output(m, sav)
 	 * modify IPv4 header.
 	 */
 	ip->ip_p = IPPROTO_AH;
-	if (ahlen < (IP_MAXPACKET - ntohs(ip->ip_len)))
-		ip->ip_len = htons(ntohs(ip->ip_len) + ahlen);
-	else {
+	if (ahlen < (IP_MAXPACKET - ntohs(ip->ip_len))) {
+		ip->ip_len = htons(ntohs(ip->ip_len) + (u_int16_t)ahlen);
+	} else {
 		ipseclog((LOG_ERR, "IPv4 AH output: size exceeds limit\n"));
 		IPSEC_STAT_INCREMENT(ipsecstat.out_inval);
 		m_freem(m);
@@ -356,62 +357,58 @@ ah4_output(m, sav)
 	}
 
 	if (finaldst) {
-		ip = mtod(m, struct ip *);	/*just to make sure*/
+		ip = mtod(m, struct ip *);      /*just to make sure*/
 		ip->ip_dst.s_addr = dst.s_addr;
 	}
-	lck_mtx_lock(sadb_stat_mutex);
+	lck_mtx_lock(&sadb_stat_mutex);
 	ipsecstat.out_success++;
 	ipsecstat.out_ahhist[sav->alg_auth]++;
-	lck_mtx_unlock(sadb_stat_mutex);
-	key_sa_recordxfer(sav, m);
+	lck_mtx_unlock(&sadb_stat_mutex);
+	key_sa_recordxfer(sav, m->m_pkthdr.len);
 
 	return 0;
 }
 #endif
 
 /* Calculate AH length */
-int
-ah_hdrlen(sav)
-	struct secasvar *sav;
+size_t
+ah_hdrlen(struct secasvar *sav)
 {
 	const struct ah_algorithm *algo;
-	int plen, ahlen;
-	
+	size_t plen, ahlen;
+
 	algo = ah_algorithm_lookup(sav->alg_auth);
-	if (!algo)
+	if (!algo) {
 		return 0;
+	}
 	if (sav->flags & SADB_X_EXT_OLD) {
 		/* RFC 1826 */
-		plen = ((*algo->sumsiz)(sav) + 3) & ~(4 - 1);	/*XXX pad to 8byte?*/
+		plen = ((*algo->sumsiz)(sav) + 3) & ~(4 - 1);   /*XXX pad to 8byte?*/
 		ahlen = plen + sizeof(struct ah);
 	} else {
 		/* RFC 2402 */
-		plen = ((*algo->sumsiz)(sav) + 3) & ~(4 - 1);	/*XXX pad to 8byte?*/
+		plen = ((*algo->sumsiz)(sav) + 3) & ~(4 - 1);   /*XXX pad to 8byte?*/
 		ahlen = plen + sizeof(struct newah);
 	}
 
-	return(ahlen);
+	return ahlen;
 }
 
-#if INET6
 /*
  * Fill in the Authentication Header and calculate checksum.
  */
 int
-ah6_output(m, nexthdrp, md, sav)
-	struct mbuf *m;
-	u_char *nexthdrp;
-	struct mbuf *md;
-	struct secasvar *sav;
+ah6_output(struct mbuf *m, u_char *nexthdrp, struct mbuf *md,
+    struct secasvar *sav)
 {
 	struct mbuf *mprev;
 	struct mbuf *mah;
 	const struct ah_algorithm *algo;
 	u_int32_t spi;
 	u_char *ahsumpos = NULL;
-	size_t plen;	/*AH payload size in bytes*/
+	size_t plen;    /*AH payload size in bytes*/
 	int error = 0;
-	int ahlen;
+	size_t ahlen;
 	struct ip6_hdr *ip6;
 
 	if (m->m_len < sizeof(struct ip6_hdr)) {
@@ -421,11 +418,15 @@ ah6_output(m, nexthdrp, md, sav)
 	}
 
 	ahlen = ah_hdrlen(sav);
-	if (ahlen == 0)
+	if (ahlen == 0) {
 		return 0;
+	}
 
-	for (mprev = m; mprev && mprev->m_next != md; mprev = mprev->m_next)
+	VERIFY(ahlen <= UINT16_MAX);
+
+	for (mprev = m; mprev && mprev->m_next != md; mprev = mprev->m_next) {
 		;
+	}
 	if (!mprev || mprev->m_next != md) {
 		ipseclog((LOG_DEBUG, "ah6_output: md is not in chain\n"));
 		m_freem(m);
@@ -445,7 +446,7 @@ ah6_output(m, nexthdrp, md, sav)
 			return ENOBUFS;
 		}
 	}
-	mah->m_len = ahlen;
+	mah->m_len = (int32_t)ahlen;
 	mah->m_next = md;
 	mprev->m_next = mah;
 	m->m_pkthdr.len += ahlen;
@@ -457,13 +458,14 @@ ah6_output(m, nexthdrp, md, sav)
 		m_freem(m);
 		return EINVAL;
 	}
-	ip6 = mtod(m, struct ip6_hdr *);
-	ip6->ip6_plen = htons(m->m_pkthdr.len - sizeof(struct ip6_hdr));
 
-	if ((sav->flags & SADB_X_EXT_OLD) == 0 && !sav->replay) {
+	ip6 = mtod(m, struct ip6_hdr *);
+	ip6->ip6_plen = htons((u_int16_t)(m->m_pkthdr.len - sizeof(struct ip6_hdr)));
+
+	if ((sav->flags & SADB_X_EXT_OLD) == 0 && sav->replay[0] == NULL) {
 		ipseclog((LOG_DEBUG, "ah6_output: internal error: "
-			  "sav->replay is null: SPI=%u\n",
-			  (u_int32_t)ntohl(sav->spi)));
+		    "sav->replay is null: SPI=%u\n",
+		    (u_int32_t)ntohl(sav->spi)));
 		IPSEC_STAT_INCREMENT(ipsec6stat.out_inval);
 		m_freem(m);
 		return EINVAL;
@@ -486,10 +488,11 @@ ah6_output(m, nexthdrp, md, sav)
 		struct ah *ahdr = mtod(mah, struct ah *);
 
 		plen = mah->m_len - sizeof(struct ah);
+		VERIFY((plen >> 2) <= UINT8_MAX);
 		ahsumpos = (u_char *)(ahdr + 1);
 		ahdr->ah_nxt = *nexthdrp;
 		*nexthdrp = IPPROTO_AH;
-		ahdr->ah_len = plen >> 2;
+		ahdr->ah_len = (u_int8_t)(plen >> 2);
 		ahdr->ah_reserve = htons(0);
 		ahdr->ah_spi = spi;
 		bzero(ahdr + 1, plen);
@@ -497,17 +500,18 @@ ah6_output(m, nexthdrp, md, sav)
 		struct newah *ahdr = mtod(mah, struct newah *);
 
 		plen = mah->m_len - sizeof(struct newah);
+		VERIFY(((plen >> 2) + 1) <= UINT8_MAX);
 		ahsumpos = (u_char *)(ahdr + 1);
 		ahdr->ah_nxt = *nexthdrp;
 		*nexthdrp = IPPROTO_AH;
-		ahdr->ah_len = (plen >> 2) + 1;	/* plus one for seq# */
+		ahdr->ah_len = (u_int8_t)((plen >> 2) + 1); /* plus one for seq# */
 		ahdr->ah_reserve = htons(0);
 		ahdr->ah_spi = spi;
-		if (sav->replay->count == ~0) {
+		if (sav->replay[0]->count == ~0) {
 			if ((sav->flags & SADB_X_EXT_CYCSEQ) == 0) {
 				/* XXX Is it noisy ? */
 				ipseclog((LOG_WARNING,
-				     "replay counter overflowed. %s\n",
+				    "replay counter overflowed. %s\n",
 				    ipsec_logsastr(sav)));
 				IPSEC_STAT_INCREMENT(ipsec6stat.out_inval);
 				m_freem(m);
@@ -515,13 +519,13 @@ ah6_output(m, nexthdrp, md, sav)
 			}
 		}
 		lck_mtx_lock(sadb_mutex);
-		sav->replay->count++;
+		sav->replay[0]->count++;
 		lck_mtx_unlock(sadb_mutex);
 		/*
 		 * XXX sequence number must not be cycled, if the SA is
 		 * installed by IKE daemon.
 		 */
-		ahdr->ah_seq = htonl(sav->replay->count);
+		ahdr->ah_seq = htonl(sav->replay[0]->count);
 		bzero(ahdr + 1, plen);
 	}
 
@@ -535,15 +539,13 @@ ah6_output(m, nexthdrp, md, sav)
 		m_freem(m);
 	} else {
 		IPSEC_STAT_INCREMENT(ipsec6stat.out_success);
-		key_sa_recordxfer(sav, m);
+		key_sa_recordxfer(sav, m->m_pkthdr.len);
 	}
 	IPSEC_STAT_INCREMENT(ipsec6stat.out_ahhist[sav->alg_auth]);
 
-	return(error);
+	return error;
 }
-#endif
 
-#if INET
 /*
  * Find the final destination if there is loose/strict source routing option.
  * Returns NULL if there's no source routing options.
@@ -553,8 +555,7 @@ ah6_output(m, nexthdrp, md, sav)
  * The mbuf must be pulled up toward, at least, ip option part.
  */
 static struct in_addr *
-ah4_finaldst(m)
-	struct mbuf *m;
+ah4_finaldst(struct mbuf *m)
 {
 	struct ip *ip;
 	int optlen;
@@ -562,8 +563,9 @@ ah4_finaldst(m)
 	int i;
 	int hlen;
 
-	if (!m)
+	if (!m) {
 		panic("ah4_finaldst: m == NULL");
+	}
 	ip = mtod(m, struct ip *);
 #ifdef _IP_VHL
 	hlen = IP_VHL_HL(ip->ip_vhl) << 2;
@@ -577,8 +579,9 @@ ah4_finaldst(m)
 		return NULL;
 	}
 
-	if (hlen == sizeof(struct ip))
+	if (hlen == sizeof(struct ip)) {
 		return NULL;
+	}
 
 	optlen = hlen - sizeof(struct ip);
 	if (optlen < 0) {
@@ -590,18 +593,20 @@ ah4_finaldst(m)
 	q = (u_char *)(ip + 1);
 	i = 0;
 	while (i < optlen) {
-		if (i + IPOPT_OPTVAL >= optlen)
+		if (i + IPOPT_OPTVAL >= optlen) {
 			return NULL;
+		}
 		if (q[i + IPOPT_OPTVAL] == IPOPT_EOL ||
 		    q[i + IPOPT_OPTVAL] == IPOPT_NOP ||
-		    i + IPOPT_OLEN < optlen)
+		    i + IPOPT_OLEN < optlen) {
 			;
-		else
+		} else {
 			return NULL;
+		}
 
 		switch (q[i + IPOPT_OPTVAL]) {
 		case IPOPT_EOL:
-			i = optlen;	/* bye */
+			i = optlen;     /* bye */
 			break;
 		case IPOPT_NOP:
 			i++;
@@ -633,4 +638,3 @@ ah4_finaldst(m)
 	}
 	return NULL;
 }
-#endif

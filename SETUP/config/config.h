@@ -2,7 +2,7 @@
  * Copyright (c) 1999-2009 Apple Inc. All rights reserved.
  *
  * @APPLE_LICENSE_HEADER_START@
- * 
+ *
  * "Portions Copyright (c) 1999 Apple Computer, Inc.  All Rights
  * Reserved.  This file contains Original Code and/or Modifications of
  * Original Code as defined in and that are subject to the Apple Public
@@ -10,7 +10,7 @@
  * except in compliance with the License.  Please obtain a copy of the
  * License at http://www.apple.com/publicsource and read it before using
  * this file.
- * 
+ *
  * The Original Code and all software distributed under the License are
  * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
@@ -18,10 +18,10 @@
  * FITNESS FOR A PARTICULAR PURPOSE OR NON-INFRINGEMENT.  Please see the
  * License for the specific language governing rights and limitations
  * under the License."
- * 
+ *
  * @APPLE_LICENSE_HEADER_END@
  */
-/* 
+/*
  * Mach Operating System
  * Copyright (c) 1990 Carnegie-Mellon University
  * Copyright (c) 1989 Carnegie-Mellon University
@@ -61,93 +61,48 @@
 #include <string.h>
 
 struct file_list {
-	struct	file_list *f_next;	
-	char	*f_fn;			/* the name */
-	u_char	f_type;			/* see below */
-	u_char	f_flags;		/* see below */
-	short	f_special;		/* requires special make rule */
-	char	*f_needs;
-	char	*f_extra;		/* stuff to add to make line */
-	/*
-	 * Random values:
-	 *	swap space parameters for swap areas
-	 *	root device, etc. for system specifications
-	 */
-	union {
-		struct {		/* when swap specification */
-			dev_t	fuw_swapdev;
-			int	fuw_swapsize;
-		} fuw;
-		struct {		/* when system specification */
-			dev_t	fus_rootdev;
-			dev_t	fus_argdev;
-			dev_t	fus_dumpdev;
-		} fus;
-	} fun;
-#define	f_swapdev	fun.fuw.fuw_swapdev
-#define	f_swapsize	fun.fuw.fuw_swapsize
-#define	f_rootdev	fun.fus.fus_rootdev
-#define	f_argdev	fun.fus.fus_argdev
-#define	f_dumpdev	fun.fus.fus_dumpdev
+	struct  file_list *f_next;
+	char    *f_fn;                  /* the name */
+	u_char  f_type;                 /* see below */
+	u_char  f_flags;                /* see below */
+	short   f_special;              /* requires special make rule */
+	char    *f_needs;
+	char    *f_extra;               /* stuff to add to make line */
 };
 
 /*
  * Types.
  */
-#define DRIVER		1
-#define NORMAL		2
-#define	INVISIBLE	3
-#define	PROFILING	4
-#define	SYSTEMSPEC	5
-#define	SWAPSPEC	6
+#define DRIVER          1
+#define NORMAL          2
+#define INVISIBLE       3
+#define PROFILING       4
 
 /*
  * Attributes (flags).
  */
-#define	CONFIGDEP	0x01	/* obsolete? */
-#define	OPTIONSDEF	0x02	/* options definition entry */
-#define ORDERED		0x04	/* don't list in OBJ's, keep "files" order */
-#define SEDIT		0x08	/* run sed filter (SQT) */
+#define CONFIGDEP            0x01    /* obsolete? */
+#define OPTIONSDEF           0x02    /* options definition entry */
+#define LIBRARYDEP           0x04    /* include file in library build */
+#define BOUND_CHECKS_MASK        0x78    /* options for -fbounds-safety */
 
-/*
- * Maximum number of fields for variable device fields (SQT).
- */
-#define	NFIELDS		10
-
-struct	idlst {
-	char	*id;
-	struct	idlst *id_next;
-	int	id_vec;		/* Sun interrupt vector number */
-};
+#define BOUND_CHECKS_NONE        0x00    /* do not use -fbounds-safety */
+#define BOUND_CHECKS_PENDING 0x08        /* do not use -fbounds-safety but disable associated warnings */
+#define BOUND_CHECKS         0x10    /* build with -fbounds-safety */
+#define BOUND_CHECKS_SOFT    0x18    /* emit non-panicking traps for bound-checked source */
+#define BOUND_CHECKS_DEBUG   0x20    /* emit one panicking trap per bounds check */
+#define BOUND_CHECKS_SEED    0x40    /* emit panicking traps on !RELEASE builds */
+#define BOUND_CHECKS_NEW_CHECKS 0x80 /* build with -fbounds-safety-bringup-missing-checks if building with -fbounds-safety*/
 
 struct device {
-	int	d_type;			/* CONTROLLER, DEVICE, bus adaptor */
-	struct	device *d_conn;		/* what it is connected to */
-	const char	*d_name;	/* name of device (e.g. rk11) */
-	struct	idlst *d_vec;		/* interrupt vectors */
-	int	d_pri;			/* interrupt priority */
-	int	d_addr;			/* address of csr */
-	int	d_unit;			/* unit number */
-	int	d_drive;		/* drive number */
-	int	d_slave;		/* slave number */
-#define QUES	-1	/* -1 means '?' */
-#define	UNKNOWN -2	/* -2 means not set yet */
-	int	d_dk;			/* if init 1 set to number for iostat */
-	int	d_flags;		/* nlags for device init */
-	struct	device *d_next;		/* Next one in list */
-        u_short d_mach;                 /* Sun - machine type (0 = all)*/
-        u_short d_bus;                  /* Sun - bus type (0 = unknown) */
-	u_long	d_fields[NFIELDS];	/* fields values (SQT) */
-	int	d_bin;			/* interrupt bin (SQT) */
-	int	d_addrmod;		/* address modifier (MIPS) */
-	char	*d_init;		/* pseudo device init routine name */
-};
-#define TO_NEXUS	(struct device *)-1
-#define TO_SLOT		(struct device *)-1
-
-struct config {
-	char	*c_dev;
-	char	*s_sysname;
+	int     d_type;                 /* CONTROLLER, DEVICE, bus adaptor */
+	const char      *d_name;        /* name of device (e.g. rk11) */
+	int     d_slave;                /* slave number */
+#define QUES    -1      /* -1 means '?' */
+#define UNKNOWN -2      /* -2 means not set yet */
+	int     d_flags;                /* nlags for device init */
+	struct  device *d_next;         /* Next one in list */
+	char    *d_init;                /* pseudo device init routine name */
 };
 
 /*
@@ -157,40 +112,7 @@ struct config {
  * it will build from ``Makefile.vax'' and use ``../vax/inline''
  * in the makerules, etc.
  */
-extern int	machine;
-extern const char	*machinename;
-#define	MACHINE_VAX	1
-#define	MACHINE_SUN	2
-#define	MACHINE_ROMP	3
-#define	MACHINE_SUN2	4
-#define	MACHINE_SUN3	5
-#define	MACHINE_MMAX	6
-#define	MACHINE_SQT	7
-#define MACHINE_SUN4	8
-#define	MACHINE_I386	9
-#define	MACHINE_IX	10
-#define MACHINE_MIPSY	11
-#define	MACHINE_MIPS	12
-#define	MACHINE_I860	13
-#define	MACHINE_M68K	14
-#define	MACHINE_M88K	15
-#define	MACHINE_M98K	16
-#define MACHINE_HPPA	17
-#define MACHINE_SPARC	18
-#define MACHINE_PPC	19
-#define MACHINE_ARM	20
-#define MACHINE_X86_64	21
-
-/*
- * For each machine, a set of CPU's may be specified as supported.
- * These and the options (below) are put in the C flags in the makefile.
- */
-struct cputype {
-	char	*cpu_name;
-	struct	cputype *cpu_next;
-};
-
-extern struct cputype  *cputype;
+extern const char       *machinename;
 
 /*
  * In order to configure and build outside the kernel source tree,
@@ -202,7 +124,7 @@ extern char *config_directory;
 
 FILE *fopenp(const char *fpath, char *file, char *complete, const char *ftype);
 const char *get_VPATH(void);
-#define VPATH	get_VPATH()
+#define VPATH   get_VPATH()
 
 /*
  * A set of options may also be specified which are like CPU types,
@@ -210,50 +132,36 @@ const char *get_VPATH(void);
  * A separate set of options may be defined for make-style options.
  */
 struct opt {
-	char	*op_name;
-	char	*op_value;
-	struct	opt *op_next;
+	char    *op_name;
+	char    *op_value;
+	struct  opt *op_next;
 };
 
 extern struct opt *opt, *mkopt, *opt_tail, *mkopt_tail;
 
-extern char	*ident;
-const char	*get_word(FILE *fp);
-char	*ns(const char *str);
-char	*qu(int num);
-char	*path(const char *file);
+const char      *get_word(FILE *fp);
+char    *ns(const char *str);
+char    *qu(int num);
+char    *path(const char *file);
 
-extern int	do_trace;
+extern int      do_trace;
 
-#if	MACHINE_VAX
-extern int	seen_mba, seen_uba;
-#endif
+extern struct   device *dtab;
+dev_t   nametodev(char *name, int defunit, char defpartition);
+char    *devtoname(dev_t dev);
 
-extern int	seen_vme, seen_mbii;
+extern char     errbuf[80];
+extern int      yyline;
 
-extern struct	device *dtab;
-dev_t	nametodev(char *name, int defunit, char defpartition);
-char	*devtoname(dev_t dev);
+extern struct   file_list *ftab, *conf_list, **confp;
+extern char     *build_directory;
 
-extern char	errbuf[80];
-extern int	yyline;
+extern int      profiling;
 
-extern struct	file_list *ftab, *conf_list, **confp;
-extern char	*build_directory;
+#define eq(a, b) (!strcmp(a,b))
 
-extern int	profiling;
-
-extern int	maxusers;
-
-#define eq(a,b)	(!strcmp(a,b))
-
-#ifdef	mips
-#define DEV_MASK 0xf
-#define	DEV_SHIFT  4
-#else	/* mips */
 #define DEV_MASK 0x7
-#define	DEV_SHIFT  3
-#endif	/* mips */
+#define DEV_SHIFT  3
 
 /* External function references */
 char *get_rest(FILE *fp);
@@ -261,26 +169,7 @@ char *get_rest(FILE *fp);
 int yyparse(void);
 void yyerror(const char *s);
 
-void vax_ioconf(void);
-void sun_ioconf(void);
-void romp_ioconf(void);
-void mmax_ioconf(void);
-void sqt_ioconf(void);
-void i386_ioconf(void);
-void mips_ioconf(void);
-void m68k_ioconf(void);
-void m88k_ioconf(void);
-void m98k_ioconf(void);
-void hppa_ioconf(void);
-void sparc_ioconf(void);
-void ppc_ioconf(void);
-void arm_ioconf(void);
-void x86_64_ioconf(void);
-
-void swapconf(void);
-
-void ubglue(void);
-void mbglue(void);
+void mkioconf(void);
 
 void makefile(void);
 void headers(void);

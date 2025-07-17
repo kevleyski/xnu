@@ -2,7 +2,7 @@
  * Copyright (c) 2010 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
- * 
+ *
  * This file contains Original Code and/or Modifications of Original Code
  * as defined in and that are subject to the Apple Public Source License
  * Version 2.0 (the 'License'). You may not use this file except in
@@ -11,10 +11,10 @@
  * unlawful or unlicensed copies of an Apple operating system, or to
  * circumvent, violate, or enable the circumvention or violation of, any
  * terms of an Apple operating system software license agreement.
- * 
+ *
  * Please obtain a copy of the License at
  * http://www.opensource.apple.com/apsl/ and read it before using this file.
- * 
+ *
  * The Original Code and all software distributed under the License are
  * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
@@ -22,7 +22,7 @@
  * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
  * Please see the License for the specific language governing rights and
  * limitations under the License.
- * 
+ *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
 
@@ -77,22 +77,3 @@ cerror(int err)
 	_pthread_exit_if_canceled(err);
 	return cerror_nocancel(err);
 }
-
-#if !TARGET_OS_EMBEDDED
-
-// Internal symbol no longer used by anybody in Libsystem but required for
-// backwards compatibility with 3rd parties <rdar://problem/14380572>
-
-void
-cthread_set_errno_self(int err, int nocancel)
-{
-	asm(".global $ld$hide$os10.9$_cthread_set_errno_self\n\t"
-		".set $ld$hide$os10.9$_cthread_set_errno_self, _cthread_set_errno_self");
-	if (nocancel) {
-		cerror_nocancel(err);
-	} else {
-		cerror(err);
-	}
-}
-
-#endif

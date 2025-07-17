@@ -7,6 +7,11 @@ include $(MakeInc_cmd)
 include $(MakeInc_def)
 
 DATAFILES = \
+	backtrace.9 \
+	backtrace_packed.9 \
+	backtrace_pack.9 \
+	backtrace_unpack.9 \
+	backtrace_user.9 \
 	copy.9		\
 	copyin.9	\
 	copyinstr.9	\
@@ -35,4 +40,3 @@ INSTALL_MAN_DIR = man9
 
 include $(MakeInc_rule)
 include $(MakeInc_dir)
-

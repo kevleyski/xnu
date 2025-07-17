@@ -2,7 +2,7 @@
  * Copyright (c) 1998-2000, 2009 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
- * 
+ *
  * This file contains Original Code and/or Modifications of Original Code
  * as defined in and that are subject to the Apple Public Source License
  * Version 2.0 (the 'License'). You may not use this file except in
@@ -11,10 +11,10 @@
  * unlawful or unlicensed copies of an Apple operating system, or to
  * circumvent, violate, or enable the circumvention or violation of, any
  * terms of an Apple operating system software license agreement.
- * 
+ *
  * Please obtain a copy of the License at
  * http://www.opensource.apple.com/apsl/ and read it before using this file.
- * 
+ *
  * The Original Code and all software distributed under the License are
  * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
@@ -22,20 +22,24 @@
  * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
  * Please see the License for the specific language governing rights and
  * limitations under the License.
- * 
+ *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
 /*
-Copyright (c) 1998 Apple Computer, Inc.  All rights reserved.
+ *  Copyright (c) 1998 Apple Computer, Inc.  All rights reserved.
+ *
+ *  HISTORY
+ *   1998-7-13	Godfrey van der Linden(gvdl)
+ *       Created.
+ *  ]*/
 
-HISTORY
-    1998-7-13	Godfrey van der Linden(gvdl)
-        Created.
-]*/
+#define IOKIT_ENABLE_SHARED_PTR
+
 #include <IOKit/IOLib.h>
 
 #include <IOKit/IOEventSource.h>
 #include <IOKit/IOWorkLoop.h>
+#include <libkern/Block.h>
 
 #define super OSObject
 
@@ -50,7 +54,11 @@ OSMetaClassDefineReservedUnused(IOEventSource, 5);
 OSMetaClassDefineReservedUnused(IOEventSource, 6);
 OSMetaClassDefineReservedUnused(IOEventSource, 7);
 
-bool IOEventSource::checkForWork() { return false; }
+bool
+IOEventSource::checkForWork()
+{
+	return false;
+}
 
 /* inline function implementations */
 
@@ -64,7 +72,7 @@ do { \
 #define IOStatisticsUnregisterCounter() \
 do { \
 	if (reserved) \
-		IOStatistics::unregisterEventSource(reserved->counter); \
+	        IOStatistics::unregisterEventSource(reserved->counter); \
 } while (0)
 
 #define IOStatisticsOpenGate() \
@@ -86,133 +94,205 @@ do { \
 
 #endif /* IOKITSTATS */
 
-void IOEventSource::signalWorkAvailable() 
-{ 
-	workLoop->signalWorkAvailable(); 
+void
+IOEventSource::signalWorkAvailable()
+{
+	workLoop->signalWorkAvailable();
 }
 
-void IOEventSource::openGate() 
-{ 
+void
+IOEventSource::openGate()
+{
 	IOStatisticsOpenGate();
-	workLoop->openGate(); 
+	workLoop->openGate();
 }
 
-void IOEventSource::closeGate()	
-{ 
-	workLoop->closeGate(); 
-	IOStatisticsCloseGate(); 
+void
+IOEventSource::closeGate()
+{
+	workLoop->closeGate();
+	IOStatisticsCloseGate();
 }
 
-bool IOEventSource::tryCloseGate() 
-{ 
-	bool res; 
+bool
+IOEventSource::tryCloseGate()
+{
+	bool res;
 	if ((res = workLoop->tryCloseGate())) {
-		IOStatisticsCloseGate(); 
+		IOStatisticsCloseGate();
 	}
-	return res; 
+	return res;
 }
 
-int IOEventSource::sleepGate(void *event, UInt32 type)
-{ 
-	bool res; 
-	IOStatisticsOpenGate(); 
-	res = workLoop->sleepGate(event, type); 
-	IOStatisticsCloseGate(); 
-	return res; 
+int
+IOEventSource::sleepGate(void *event, UInt32 type)
+{
+	int res;
+	IOStatisticsOpenGate();
+	res = workLoop->sleepGate(event, type);
+	IOStatisticsCloseGate();
+	return res;
 }
 
-int IOEventSource::sleepGate(void *event, AbsoluteTime deadline, UInt32 type)
-{ 
-	bool res; 
-	IOStatisticsOpenGate(); 
+int
+IOEventSource::sleepGate(void *event, AbsoluteTime deadline, UInt32 type)
+{
+	int res;
+	IOStatisticsOpenGate();
 	res = workLoop->sleepGate(event, deadline, type);
-	IOStatisticsCloseGate(); 
-	return res; 
-}
-  
-void IOEventSource::wakeupGate(void *event, bool oneThread) { workLoop->wakeupGate(event, oneThread); }
-
-
-bool IOEventSource::init(OSObject *inOwner,
-                         Action inAction)
-{
-    if (!inOwner)
-        return false;
-
-    owner = inOwner;
-
-    if ( !super::init() )
-        return false;
-
-    (void) setAction(inAction);
-    enabled = true;
-
-    if(!reserved) {
-        reserved = IONew(ExpansionData, 1);
-        if (!reserved) {
-            return false;
-        }
-    }
-
-    IOStatisticsRegisterCounter();
-		
-    return true;
+	IOStatisticsCloseGate();
+	return res;
 }
 
-void IOEventSource::free( void )
+void
+IOEventSource::wakeupGate(void *event, bool oneThread)
 {
-    IOStatisticsUnregisterCounter();
-	
-    if (reserved)
-		IODelete(reserved, ExpansionData, 1);
-
-    super::free();
+	workLoop->wakeupGate(event, oneThread);
 }
 
-IOEventSource::Action IOEventSource::getAction () const { return action; };
 
-void IOEventSource::setAction(Action inAction)
+bool
+IOEventSource::init(OSObject *inOwner,
+    Action inAction)
 {
-    action = inAction;
+	if (!inOwner) {
+		return false;
+	}
+
+	owner = inOwner;
+
+	if (!super::init()) {
+		return false;
+	}
+
+	(void) setAction(inAction);
+	enabled = true;
+
+	if (!reserved) {
+		reserved = IOMallocType(ExpansionData);
+	}
+
+	IOStatisticsRegisterCounter();
+
+	return true;
 }
 
-IOEventSource *IOEventSource::getNext() const { return eventChainNext; };
-
-void IOEventSource::setNext(IOEventSource *inNext)
+void
+IOEventSource::free( void )
 {
-    eventChainNext = inNext;
+	IOStatisticsUnregisterCounter();
+
+	if ((kActionBlock & flags) && actionBlock) {
+		Block_release(actionBlock);
+	}
+
+	if (reserved) {
+		IOFreeType(reserved, ExpansionData);
+	}
+
+	super::free();
 }
 
-void IOEventSource::enable()
+void
+IOEventSource::setRefcon(void *newrefcon)
 {
-    enabled = true;
-    if (workLoop)
-        return signalWorkAvailable();
+	refcon = newrefcon;
 }
 
-void IOEventSource::disable()
+void *
+IOEventSource::getRefcon() const
 {
-    enabled = false;
+	return refcon;
 }
 
-bool IOEventSource::isEnabled() const
+IOEventSource::Action
+IOEventSource::getAction() const
 {
-    return enabled;
+	if (kActionBlock & flags) {
+		return NULL;
+	}
+	return action;
 }
 
-void IOEventSource::setWorkLoop(IOWorkLoop *inWorkLoop)
+IOEventSource::ActionBlock
+IOEventSource::getActionBlock(ActionBlock) const
 {
-    if ( !inWorkLoop )
-        disable();
-    workLoop = inWorkLoop;
+	if (kActionBlock & flags) {
+		return actionBlock;
+	}
+	return NULL;
 }
 
-IOWorkLoop *IOEventSource::getWorkLoop() const
+void
+IOEventSource::setAction(Action inAction)
 {
-    return workLoop;
+	if ((kActionBlock & flags) && actionBlock) {
+		Block_release(actionBlock);
+	}
+	action = inAction;
+	flags &= ~kActionBlock;
 }
 
-bool IOEventSource::onThread() const
+void
+IOEventSource::setActionBlock(ActionBlock block)
 {
-    return (workLoop != 0) && workLoop->onThread();
+	if ((kActionBlock & flags) && actionBlock) {
+		Block_release(actionBlock);
+	}
+	actionBlock = Block_copy(block);
+	flags |= kActionBlock;
+}
+
+IOEventSource *
+IOEventSource::getNext() const
+{
+	return eventChainNext;
+};
+
+void
+IOEventSource::setNext(IOEventSource *inNext)
+{
+	eventChainNext = inNext;
+}
+
+void
+IOEventSource::enable()
+{
+	enabled = true;
+	if (workLoop) {
+		return signalWorkAvailable();
+	}
+}
+
+void
+IOEventSource::disable()
+{
+	enabled = false;
+}
+
+bool
+IOEventSource::isEnabled() const
+{
+	return enabled;
+}
+
+void
+IOEventSource::setWorkLoop(IOWorkLoop *inWorkLoop)
+{
+	if (!inWorkLoop) {
+		disable();
+	}
+	workLoop = inWorkLoop;
+}
+
+IOWorkLoop *
+IOEventSource::getWorkLoop() const
+{
+	return workLoop;
+}
+
+bool
+IOEventSource::onThread() const
+{
+	return (workLoop != NULL) && workLoop->onThread();
 }

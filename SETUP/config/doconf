@@ -69,14 +69,23 @@ set prog=$0
 set prog=$prog:t
 set nonomatch
 set OBJDIR=../BUILD
+set SOURCEDIR=.
 set CONFIG_DIR=$OBJROOT/SETUP/config
+set MASTER_CONF_DIR=.
 
-unset domake
+set DEF_SEED=""
+set DEF_EXCLAVES="-UMASTER_CONFIG_ENABLE_EXCLAVES"
+set DEF_SPTM="-UMASTER_CONFIG_ENABLE_SPTM"
+set DEF_BUILD=""
+set DEF_TAG=""
+
+
 unset doconfig
 unset beverbose
 unset MACHINE
 unset profile
 unset SOC_CONFIG
+unset PLATFORM
 
 while ($#argv >= 1)
     if ("$argv[1]" =~ -*) then
@@ -84,10 +93,6 @@ while ($#argv >= 1)
 	case "-c":
 	case "-config":
 	    set doconfig
-	    breaksw
-	case "-m":
-	case "-make":
-	    set domake
 	    breaksw
 	case "-cpu":
 	    if ($#argv < 2) then
@@ -103,6 +108,19 @@ while ($#argv >= 1)
 		exit 1
 	    endif
 	    set SOC_CONFIG="$argv[2]"
+	    if (`echo $SOC_CONFIG | awk '{print substr($0,0,2)}'` == "vm") then
+	        set DEF_AVP="-DSOC_IS_VIRTUALIZED"
+	    else
+	        set DEF_AVP="-USOC_IS_VIRTUALIZED"
+	    endif
+	    shift
+	    breaksw
+	case "-platform":
+	    if ($#argv < 2) then
+		echo "${prog}: missing argument to ${argv[1]}"
+		exit 1
+	    endif
+	    set PLATFORM="$argv[2]"
 	    shift
 	    breaksw
 	case "-d":
@@ -113,12 +131,31 @@ while ($#argv >= 1)
 	    set OBJDIR="$argv[2]"
 	    shift
 	    breaksw
+	case "-m":
+	    if ($#argv < 2) then
+		echo "${prog}: missing argument to ${argv[1]}"
+		exit 1
+	    endif
+	    set MASTER_CONF_DIR="$argv[2]"
+	    shift
+	    breaksw
+	case "-s":
+	    if ($#argv < 2) then
+		echo "${prog}: missing argument to ${argv[1]}"
+		exit 1
+	    endif
+	    set SOURCEDIR="$argv[2]"
+	    shift
+	    breaksw
 	case "-verbose":
 	    set beverbose
 	    breaksw
 	case "-p":
 	case "-profile":
 	    set profile
+	    breaksw
+	case "-sptm":
+	    set DEF_SPTM="-DMASTER_CONFIG_ENABLE_SPTM"
 	    breaksw
 	default:
 	    echo "${prog}: ${argv[1]}: unknown switch"
@@ -134,60 +171,24 @@ end
 if ($#argv == 0) set argv=(GENERIC)
 
 if (! $?MACHINE) then
-    if (-d /NextApps) then
-	set MACHINE=`hostinfo | awk '/MC680x0/ { printf("m68k") } /MC880x0/ { printf("m88k") }'`
-    endif
+    echo "${prog}: MACHINE not set"
+    exit 1
 endif
 
-if (! $?MACHINE) then
-    if (-f /etc/machine) then
-	    set MACHINE="`/etc/machine`"
-    else
-	    echo "${prog}: no /etc/machine, specify machine type with -cpu"
-	    echo "${prog}: e.g. ${prog} -cpu VAX CONFIGURATION"
-	    exit 1
-    endif
-endif
-
-set FEATURES_EXTRA=
-
-switch ("$MACHINE")
-    case IBMRT:
-	set cpu=ca
-	set ID=RT
-	set FEATURES_EXTRA="romp_dualcall.h romp_fpa.h"
-	breaksw
-    case SUN:
-	set cpu=sun3
-	set ID=SUN3
-	breaksw
-    default:
-	set cpu=`echo $MACHINE | tr A-Z a-z`
-	set ID=`echo $MACHINE | tr a-z A-Z`
-	breaksw
-endsw
-set FEATURES=../h/features.h
-set FEATURES_H=(cs_*.h mach_*.h net_*.h\
-	        cputypes.h cpus.h vice.h\
-	        $FEATURES_EXTRA)
-set MASTER_DIR=../conf
+set cpu=`echo $MACHINE | tr A-Z a-z`
+set ID=`echo $MACHINE | tr a-z A-Z`
+set MASTER_DIR=${MASTER_CONF_DIR}
 set MASTER =   ${MASTER_DIR}/MASTER
-set MASTER_CPU=${MASTER}.${cpu}
-set MASTER_CPU_PER_SOC=${MASTER}.${cpu}.${SOC_CONFIG}
-if (-f $MASTER_CPU_PER_SOC) set MASTER_CPU = ${MASTER_CPU_PER_SOC}
 
-set MASTER_LOCAL = ${MASTER}.local
-set MASTER_CPU_LOCAL = ${MASTER_CPU}.local
-set MASTER_CPU_PER_SOC_LOCAL = ${MASTER_CPU_PER_SOC}.local
-if (! -f $MASTER_LOCAL) set MASTER_LOCAL = ""
-if (! -f $MASTER_CPU_LOCAL) set MASTER_CPU_LOCAL = ""
-if (-f $MASTER_CPU_PER_SOC_LOCAL) set MASTER_CPU_LOCAL = ${MASTER_CPU_PER_SOC_LOCAL}
-
-if (! -d $OBJDIR) then
-    if ($?beverbose) then
-        echo "[ creating $OBJDIR ]"
+foreach master_file (${MASTER}.${cpu}.${SOC_CONFIG}.${PLATFORM} ${MASTER}.${cpu}.${SOC_CONFIG} ${MASTER}.${cpu}.${PLATFORM} ${MASTER}.${cpu})
+    if (-f $master_file) then
+        set MASTER_CPU = $master_file
+        break
     endif
-    mkdir -p $OBJDIR
+end
+
+if ($?beverbose) then
+    echo MASTER_CPU=$MASTER_CPU
 endif
 
 foreach SYS ($argv)
@@ -195,12 +196,14 @@ foreach SYS ($argv)
     set SYSCONF=$OBJDIR/config.$SYSID
     set BLDDIR=$OBJDIR
     if ($?beverbose) then
-	echo "[ generating $SYSID from $MASTER_DIR/MASTER{,.$cpu}{,.local} ]"
+        echo "[ generating $SYSID from $MASTER_DIR/MASTER{,.$cpu}{,.local} ]"
     endif
     echo +$SYS \
     | \
-    cat $MASTER $MASTER_LOCAL $MASTER_CPU $MASTER_CPU_LOCAL - \
-        $MASTER $MASTER_LOCAL $MASTER_CPU $MASTER_CPU_LOCAL \
+    cat $MASTER $MASTER_CPU - \
+        $MASTER $MASTER_CPU \
+    | \
+    unifdef -t -DPLATFORM_${PLATFORM} -DCPU_$cpu -DSOC_CONFIG_${SOC_CONFIG} -DSYS_${SYS} $DEF_AVP $DEF_SEED $DEF_EXCLAVES $DEF_SPTM $DEF_BUILD $DEF_TAG - \
     | \
     sed -n \
 	-e "/^+/{" \
@@ -274,12 +277,6 @@ part != 0 {\
 	echo "${prog}: ${$SYSID}: no such configuration in $MASTER_DIR/MASTER{,.$cpu}"
 	rm -f $SYSCONF.new
     endif
-    if (! -d $BLDDIR) then
-        if ($?beverbose) then
-	    echo "[ creating $BLDDIR ]"
-        endif
-	mkdir -p $BLDDIR
-    endif
 #
 # These paths are used by config.
 #
@@ -315,15 +312,9 @@ part != 0 {\
 	    echo "[ configuring $SYSID ]"
         endif
 	if ($?profile) then
-	    $CONFIG_DIR/config -c $MASTER_DIR -p $SYSCONF
+	    $CONFIG_DIR/config -c $SOURCEDIR -p $SYSCONF
 	else
-	    $CONFIG_DIR/config -c $MASTER_DIR $SYSCONF
+	    $CONFIG_DIR/config -c $SOURCEDIR $SYSCONF
 	endif
-    endif
-    if ($?domake) then
-        if ($?beverbose) then
-            echo "[ making $SYSID ]"
-        endif
-        (cd $BLDDIR; make)
     endif
 end

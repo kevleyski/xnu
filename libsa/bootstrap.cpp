@@ -2,7 +2,7 @@
  * Copyright (c) 2000-2012 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
- * 
+ *
  * This file contains Original Code and/or Modifications of Original Code
  * as defined in and that are subject to the Apple Public Source License
  * Version 2.0 (the 'License'). You may not use this file except in
@@ -11,10 +11,10 @@
  * unlawful or unlicensed copies of an Apple operating system, or to
  * circumvent, violate, or enable the circumvention or violation of, any
  * terms of an Apple operating system software license agreement.
- * 
+ *
  * Please obtain a copy of the License at
  * http://www.opensource.apple.com/apsl/ and read it before using this file.
- * 
+ *
  * The Original Code and all software distributed under the License are
  * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
@@ -22,14 +22,17 @@
  * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
  * Please see the License for the specific language governing rights and
  * limitations under the License.
- * 
+ *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
 extern "C" {
 #include <mach/kmod.h>
 #include <libkern/kernel_mach_header.h>
 #include <libkern/prelink.h>
+#include <libkern/crypto/sha2.h>
 }
+
+#define IOKIT_ENABLE_SHARED_PTR
 
 #include <libkern/version.h>
 #include <libkern/c++/OSContainers.h>
@@ -63,8 +66,8 @@ extern "C" {
 * be linked against.
 *********************************************************************/
 extern "C" {
-    extern void (*record_startup_extensions_function)(void);
-    extern void (*load_security_extensions_function)(void);
+extern void (*record_startup_extensions_function)(void);
+extern void (*load_security_extensions_function)(void);
 };
 
 static void bootstrapRecordStartupExtensions(void);
@@ -95,20 +98,22 @@ extern "C" bool IORamDiskBSDRoot(void);
 * all the boot kexts and have them load up.
 *********************************************************************/
 static const char * sKernelComponentNames[] = {
-   // The kexts for these IDs must have a version matching 'osrelease'.
-   "com.apple.kernel",
-   "com.apple.kpi.bsd",
-   "com.apple.kpi.dsep",
-   "com.apple.kpi.iokit",
-   "com.apple.kpi.libkern",
-   "com.apple.kpi.mach",
-   "com.apple.kpi.private",
-   "com.apple.kpi.unsupported",
-   "com.apple.iokit.IONVRAMFamily",
-   "com.apple.driver.AppleNMI",
-   "com.apple.iokit.IOSystemManagementFamily",
-   "com.apple.iokit.ApplePlatformFamily",
-   NULL
+	// The kexts for these IDs must have a version matching 'osrelease'.
+	"com.apple.kernel",
+	"com.apple.kpi.bsd",
+	"com.apple.kpi.dsep",
+	"com.apple.kpi.iokit",
+	"com.apple.kpi.kasan",
+	"com.apple.kpi.kcov",
+	"com.apple.kpi.libkern",
+	"com.apple.kpi.mach",
+	"com.apple.kpi.private",
+	"com.apple.kpi.unsupported",
+	"com.apple.iokit.IONVRAMFamily",
+	"com.apple.driver.AppleNMI",
+	"com.apple.iokit.IOSystemManagementFamily",
+	"com.apple.iokit.ApplePlatformFamily",
+	NULL
 };
 
 #if PRAGMA_MARK
@@ -122,31 +127,27 @@ static const char * sKernelComponentNames[] = {
 * hide the instance through which we invoke the functions.
 *********************************************************************/
 class KLDBootstrap {
-    friend void bootstrapRecordStartupExtensions(void);
-    friend void bootstrapLoadSecurityExtensions(void);
+	friend void bootstrapRecordStartupExtensions(void);
+	friend void bootstrapLoadSecurityExtensions(void);
 
 private:
-    void readStartupExtensions(void);
+	void readStartupExtensions(void);
 
-    void readPrelinkedExtensions(
-        kernel_section_t * prelinkInfoSect);
-    void readBooterExtensions(void);
-    OSReturn readMkextExtensions(
-        OSString * deviceTreeName,
-        OSData   * deviceTreeData);
-    
-    OSReturn loadKernelComponentKexts(void);
-    void     loadKernelExternalComponents(void);
-    void     readBuiltinPersonalities(void);
+	void readPrelinkedExtensions(kernel_mach_header_t *mh, kc_kind_t type);
+	void readBooterExtensions(void);
 
-    void     loadSecurityExtensions(void);
-    
+	OSReturn loadKernelComponentKexts(void);
+	void     loadKernelExternalComponents(void);
+	void     readBuiltinPersonalities(void);
+
+	void     loadSecurityExtensions(void);
+
 public:
-    KLDBootstrap(void);
-    ~KLDBootstrap(void);
+	KLDBootstrap(void);
+	~KLDBootstrap(void);
 };
 
-static KLDBootstrap sBootstrapObject;
+LIBKERN_ALWAYS_DESTROY static KLDBootstrap sBootstrapObject;
 
 /*********************************************************************
 * Set the function pointers for the entry points into the bootstrap
@@ -154,11 +155,11 @@ static KLDBootstrap sBootstrapObject;
 *********************************************************************/
 KLDBootstrap::KLDBootstrap(void)
 {
-    if (this != &sBootstrapObject) {
-        panic("Attempt to access bootstrap segment.");
-    }
-    record_startup_extensions_function = &bootstrapRecordStartupExtensions;
-    load_security_extensions_function = &bootstrapLoadSecurityExtensions;
+	if (this != &sBootstrapObject) {
+		panic("Attempt to access bootstrap segment.");
+	}
+	record_startup_extensions_function = &bootstrapRecordStartupExtensions;
+	load_security_extensions_function = &bootstrapLoadSecurityExtensions;
 }
 
 /*********************************************************************
@@ -167,13 +168,13 @@ KLDBootstrap::KLDBootstrap(void)
 *********************************************************************/
 KLDBootstrap::~KLDBootstrap(void)
 {
-    if (this != &sBootstrapObject) {
-        panic("Attempt to access bootstrap segment.");
-    }
+	if (this != &sBootstrapObject) {
+		panic("Attempt to access bootstrap segment.");
+	}
 
 
-    record_startup_extensions_function = 0;
-    load_security_extensions_function = 0;
+	record_startup_extensions_function = NULL;
+	load_security_extensions_function = NULL;
 }
 
 /*********************************************************************
@@ -181,481 +182,319 @@ KLDBootstrap::~KLDBootstrap(void)
 void
 KLDBootstrap::readStartupExtensions(void)
 {
-    kernel_section_t * prelinkInfoSect = NULL;  // do not free
+	kernel_section_t * prelinkInfoSect = NULL; // do not free
 
-    OSKextLog(/* kext */ NULL,
-        kOSKextLogProgressLevel |
-        kOSKextLogGeneralFlag | kOSKextLogDirectoryScanFlag |
-        kOSKextLogKextBookkeepingFlag,
-        "Reading startup extensions.");
-    
-   /* If the prelink info segment has a nonzero size, we are prelinked
-    * and won't have any individual kexts or mkexts to read.
-    * Otherwise, we need to read kexts or the mkext from what the booter
-    * has handed us.
-    */
-    prelinkInfoSect = getsectbyname(kPrelinkInfoSegment, kPrelinkInfoSection);
-    if (prelinkInfoSect->size) {
-        readPrelinkedExtensions(prelinkInfoSect);
-    } else {
-        readBooterExtensions();
-    }
+	OSKextLog(/* kext */ NULL,
+	    kOSKextLogProgressLevel |
+	    kOSKextLogGeneralFlag | kOSKextLogDirectoryScanFlag |
+	    kOSKextLogKextBookkeepingFlag,
+	    "Reading startup extensions.");
 
-    loadKernelComponentKexts();
-    loadKernelExternalComponents();
-    readBuiltinPersonalities();
-    OSKext::sendAllKextPersonalitiesToCatalog();
+	kc_format_t kc_format;
+	kernel_mach_header_t *mh = &_mh_execute_header;
+	if (PE_get_primary_kc_format(&kc_format) && kc_format == KCFormatFileset) {
+		mh = (kernel_mach_header_t *)PE_get_kc_header(KCKindPrimary);
+	}
 
-    return;
+	/* If the prelink info segment has a nonzero size, we are prelinked
+	 * and won't have any individual kexts or mkexts to read.
+	 * Otherwise, we need to read kexts or the mkext from what the booter
+	 * has handed us.
+	 */
+	prelinkInfoSect = getsectbynamefromheader(mh, kPrelinkInfoSegment, kPrelinkInfoSection);
+	if (prelinkInfoSect->size) {
+		readPrelinkedExtensions(mh, KCKindPrimary);
+	} else {
+		readBooterExtensions();
+	}
+
+	kernel_mach_header_t *akc_mh;
+	akc_mh = (kernel_mach_header_t*)PE_get_kc_header(KCKindAuxiliary);
+	if (akc_mh) {
+		readPrelinkedExtensions(akc_mh, KCKindAuxiliary);
+	}
+
+	loadKernelComponentKexts();
+	loadKernelExternalComponents();
+	readBuiltinPersonalities();
+	OSKext::sendAllKextPersonalitiesToCatalog(true);
+
+	return;
 }
 
 /*********************************************************************
 *********************************************************************/
 void
-KLDBootstrap::readPrelinkedExtensions(
-    kernel_section_t * prelinkInfoSect)
+KLDBootstrap::readPrelinkedExtensions(kernel_mach_header_t *mh, kc_kind_t type)
 {
-    OSArray                   * infoDictArray           = NULL;  // do not release
-    OSObject                  * parsedXML       = NULL;  // must release
-    OSDictionary              * prelinkInfoDict         = NULL;  // do not release
-    OSString                  * errorString             = NULL;  // must release
-    OSKext                    * theKernel               = NULL;  // must release
+	bool ret;
+	OSSharedPtr<OSData> loaded_kcUUID;
+	OSSharedPtr<OSString> errorString;
+	OSSharedPtr<OSObject> parsedXML;
+	kernel_section_t *infoPlistSection = NULL;
+	OSDictionary *infoDict = NULL;         // do not release
 
-    kernel_segment_command_t  * prelinkTextSegment      = NULL;  // see code
-    kernel_segment_command_t  * prelinkInfoSegment      = NULL;  // see code
+	OSKextLog(/* kext */ NULL,
+	    kOSKextLogProgressLevel |
+	    kOSKextLogDirectoryScanFlag | kOSKextLogArchiveFlag,
+	    "Starting from prelinked kernel.");
 
-   /* We make some copies of data, but if anything fails we're basically
-    * going to fail the boot, so these won't be cleaned up on error.
-    */
-    void                      * prelinkData             = NULL;  // see code
-    vm_size_t                   prelinkLength           = 0;
-
-
-    OSDictionary              * infoDict                = NULL;  // do not release
-
-    IORegistryEntry           * registryRoot            = NULL;  // do not release
-    OSNumber                  * prelinkCountObj         = NULL;  // must release
-
-    u_int                       i = 0;
-#if NO_KEXTD
-    bool                        ramDiskBoot;
-    bool                        developerDevice;
-    bool                        dontLoad;
-#endif
-
-    OSKextLog(/* kext */ NULL,
-        kOSKextLogProgressLevel |
-        kOSKextLogDirectoryScanFlag | kOSKextLogArchiveFlag,
-        "Starting from prelinked kernel.");
-
-    prelinkTextSegment = getsegbyname(kPrelinkTextSegment);
-    if (!prelinkTextSegment) {
-        OSKextLog(/* kext */ NULL,
-            kOSKextLogErrorLevel |
-            kOSKextLogDirectoryScanFlag | kOSKextLogArchiveFlag,
-            "Can't find prelinked kexts' text segment.");
-        goto finish;
-    }
-    
-#if KASLR_KEXT_DEBUG
-    unsigned long   scratchSize;
-    vm_offset_t     scratchAddr;
-    
-    IOLog("kaslr: prelinked kernel address info: \n");
-    
-    scratchAddr = (vm_offset_t) getsegdatafromheader(&_mh_execute_header, "__TEXT", &scratchSize);
-    IOLog("kaslr: start 0x%lx end 0x%lx length %lu for __TEXT \n", 
-          (unsigned long)scratchAddr, 
-          (unsigned long)(scratchAddr + scratchSize),
-          scratchSize);
-    
-    scratchAddr = (vm_offset_t) getsegdatafromheader(&_mh_execute_header, "__DATA", &scratchSize);
-    IOLog("kaslr: start 0x%lx end 0x%lx length %lu for __DATA \n", 
-          (unsigned long)scratchAddr, 
-          (unsigned long)(scratchAddr + scratchSize),
-          scratchSize);
-    
-    scratchAddr = (vm_offset_t) getsegdatafromheader(&_mh_execute_header, "__LINKEDIT", &scratchSize);
-    IOLog("kaslr: start 0x%lx end 0x%lx length %lu for __LINKEDIT \n", 
-          (unsigned long)scratchAddr, 
-          (unsigned long)(scratchAddr + scratchSize),
-          scratchSize);
-    
-    scratchAddr = (vm_offset_t) getsegdatafromheader(&_mh_execute_header, "__KLD", &scratchSize);
-    IOLog("kaslr: start 0x%lx end 0x%lx length %lu for __KLD \n", 
-          (unsigned long)scratchAddr, 
-          (unsigned long)(scratchAddr + scratchSize),
-          scratchSize);
-    
-    scratchAddr = (vm_offset_t) getsegdatafromheader(&_mh_execute_header, "__PRELINK_TEXT", &scratchSize);
-    IOLog("kaslr: start 0x%lx end 0x%lx length %lu for __PRELINK_TEXT \n", 
-          (unsigned long)scratchAddr, 
-          (unsigned long)(scratchAddr + scratchSize),
-          scratchSize);
-    
-    scratchAddr = (vm_offset_t) getsegdatafromheader(&_mh_execute_header, "__PRELINK_INFO", &scratchSize);
-    IOLog("kaslr: start 0x%lx end 0x%lx length %lu for __PRELINK_INFO \n", 
-          (unsigned long)scratchAddr, 
-          (unsigned long)(scratchAddr + scratchSize),
-          scratchSize);
-#endif
-
-    prelinkData = (void *) prelinkTextSegment->vmaddr;
-    prelinkLength = prelinkTextSegment->vmsize;
-
-
-   /* Unserialize the info dictionary from the prelink info section.
-    */
-    parsedXML = OSUnserializeXML((const char *)prelinkInfoSect->addr,
-        &errorString);
-    if (parsedXML) {
-        prelinkInfoDict = OSDynamicCast(OSDictionary, parsedXML);
-    }
-    if (!prelinkInfoDict) {
-        const char * errorCString = "(unknown error)";
-        
-        if (errorString && errorString->getCStringNoCopy()) {
-            errorCString = errorString->getCStringNoCopy();
-        } else if (parsedXML) {
-            errorCString = "not a dictionary";
-        }
-        OSKextLog(/* kext */ NULL, kOSKextLogErrorLevel | kOSKextLogArchiveFlag,
-            "Error unserializing prelink plist: %s.", errorCString);
-        goto finish;
-    }
-
-#if NO_KEXTD
-    /* Check if we should keep developer kexts around.
-     * TODO: Check DeviceTree instead of a boot-arg <rdar://problem/10604201>
-     */
-    developerDevice = true;
-    PE_parse_boot_argn("developer", &developerDevice, sizeof(developerDevice));
-
-    ramDiskBoot = IORamDiskBSDRoot();
-#endif /* NO_KEXTD */
-
-    infoDictArray = OSDynamicCast(OSArray, 
-        prelinkInfoDict->getObject(kPrelinkInfoDictionaryKey));
-    if (!infoDictArray) {
-        OSKextLog(/* kext */ NULL, kOSKextLogErrorLevel | kOSKextLogArchiveFlag,
-            "The prelinked kernel has no kext info dictionaries");
-        goto finish;
-    }
-    
-    /* Create dictionary of excluded kexts
-     */
-    OSKext::createExcludeListFromPrelinkInfo(infoDictArray);
-
-    /* Create OSKext objects for each info dictionary. 
-     */
-    for (i = 0; i < infoDictArray->getCount(); ++i) {
-        infoDict = OSDynamicCast(OSDictionary, infoDictArray->getObject(i));
-        if (!infoDict) {
-            OSKextLog(/* kext */ NULL,
-                kOSKextLogErrorLevel |
-                kOSKextLogDirectoryScanFlag | kOSKextLogArchiveFlag,
-                "Can't find info dictionary for prelinked kext #%d.", i);
-            continue;
-        }
-
-#if NO_KEXTD
-        dontLoad = false;
-
-        /* If we're not on a developer device, skip and free developer kexts.
-         */
-        if (developerDevice == false) {
-            OSBoolean *devOnlyBool = OSDynamicCast(OSBoolean,
-                infoDict->getObject(kOSBundleDeveloperOnlyKey));
-            if (devOnlyBool == kOSBooleanTrue) {
-                dontLoad = true;
-            }
-        }
-
-        /* Skip and free kexts that are only needed when booted from a ram disk.
-         */
-        if (ramDiskBoot == false) {
-            OSBoolean *ramDiskOnlyBool = OSDynamicCast(OSBoolean,
-                infoDict->getObject(kOSBundleRamDiskOnlyKey));
-            if (ramDiskOnlyBool == kOSBooleanTrue) {
-                dontLoad = true;
-            }
+	/*
+	 * The 'infoPlistSection' should contains an XML dictionary that
+	 * contains some meta data about the KC, and also describes each kext
+	 * included in the kext collection. Unserialize this dictionary and
+	 * then iterate over each kext.
+	 */
+	infoPlistSection = getsectbynamefromheader(mh, kPrelinkInfoSegment, kPrelinkInfoSection);
+	parsedXML = OSUnserializeXML((const char *)infoPlistSection->addr, errorString);
+	if (parsedXML) {
+		infoDict = OSDynamicCast(OSDictionary, parsedXML.get());
 	}
 
-        if (dontLoad == true) {
-            OSString *bundleID = OSDynamicCast(OSString,
-                infoDict->getObject(kCFBundleIdentifierKey));
-            if (bundleID) {
-                OSKextLog(NULL, kOSKextLogWarningLevel | kOSKextLogGeneralFlag,
-                    "Kext %s not loading.", bundleID->getCStringNoCopy());
-            }
-            
-            OSNumber *addressNum = OSDynamicCast(OSNumber,
-                infoDict->getObject(kPrelinkExecutableLoadKey));
-            OSNumber *lengthNum = OSDynamicCast(OSNumber,
-                infoDict->getObject(kPrelinkExecutableSizeKey));
-            if (addressNum && lengthNum) {
-#error Pick the right way to free prelinked data on this arch
-            }
+	if (!infoDict) {
+		const char *errorCString = "(unknown error)";
 
-            infoDictArray->removeObject(i--);
-            continue;
-        }
-#endif /* NO_KEXTD */
+		if (errorString && errorString->getCStringNoCopy()) {
+			errorCString = errorString->getCStringNoCopy();
+		} else if (parsedXML) {
+			errorCString = "not a dictionary";
+		}
+		OSKextLog(/* kext */ NULL, kOSKextLogErrorLevel | kOSKextLogArchiveFlag,
+		    "Error unserializing kext info plist section: %s.", errorCString);
+		return;
+	}
 
-       /* Create the kext for the entry, then release it, because the
-        * kext system keeps them around until explicitly removed.
-        * Any creation/registration failures are already logged for us.
-        */
-        OSKext * newKext = OSKext::withPrelinkedInfoDict(infoDict);
-        OSSafeReleaseNULL(newKext);
-    }
-    
-   /* Store the number of prelinked kexts in the registry so we can tell
-    * when the system has been started from a prelinked kernel.
-    */
-    registryRoot = IORegistryEntry::getRegistryRoot();
-    assert(registryRoot);
+	/* Validate that the Kext Collection is prelinked to the loaded KC */
+	if (type == KCKindAuxiliary) {
+		if (OSKext::validateKCFileSetUUID(infoDict, KCKindAuxiliary) != 0) {
+			OSKextLog(/* kext */ NULL, kOSKextLogErrorLevel | kOSKextLogArchiveFlag,
+			    "Early boot AuxKC  doesn't appear to be linked against the loaded BootKC.");
+			return;
+		}
 
-    prelinkCountObj = OSNumber::withNumber(
-        (unsigned long long)infoDictArray->getCount(),
-        8 * sizeof(uint32_t));
-    assert(prelinkCountObj);
-    if (prelinkCountObj) {
-        registryRoot->setProperty(kOSPrelinkKextCountKey, prelinkCountObj);
-    }
+		/*
+		 * Defer further processing of the AuxKC, but keep the
+		 * processed info dictionary around so we can ml_static_free
+		 * the segment.
+		 */
+		if (!OSKext::registerDeferredKextCollection(mh, parsedXML, KCKindAuxiliary)) {
+			OSKextLog(/* kext */ NULL, kOSKextLogErrorLevel | kOSKextLogArchiveFlag,
+			    "Error deferring AuxKC kext processing: Kexts in this collection will be unusable.");
+		}
+		goto skip_adding_kexts;
+	}
 
-    OSKextLog(/* kext */ NULL,
-        kOSKextLogProgressLevel |
-        kOSKextLogGeneralFlag | kOSKextLogKextBookkeepingFlag |
-        kOSKextLogDirectoryScanFlag | kOSKextLogArchiveFlag,
-        "%u prelinked kexts", 
-        infoDictArray->getCount());
+	/*
+	 * this function does all the heavy lifting of adding OSKext objects
+	 * and potentially sliding them if necessary
+	 */
+	ret = OSKext::addKextsFromKextCollection(mh, infoDict,
+	    kPrelinkTextSegment, loaded_kcUUID, (mh->filetype == MH_FILESET) ? type : KCKindUnknown);
 
+	if (!ret) {
+		OSKextLog(/* kext */ NULL, kOSKextLogErrorLevel | kOSKextLogArchiveFlag,
+		    "Error loading kext info from prelinked primary KC");
+		return;
+	}
+
+	/* Copy in the kernelcache UUID */
+	if (!loaded_kcUUID) {
+		OSKextLog(/* kext */ NULL, kOSKextLogErrorLevel | kOSKextLogArchiveFlag,
+		    "WARNING: did not find UUID in %s KC!", (type == KCKindAuxiliary) ? "Aux" : "Primary");
+	} else if (type != KCKindAuxiliary) {
+		kernelcache_uuid_valid = TRUE;
+		memcpy((void *)&kernelcache_uuid, (const void *)loaded_kcUUID->getBytesNoCopy(), loaded_kcUUID->getLength());
+		uuid_unparse_upper(kernelcache_uuid, kernelcache_uuid_string);
+	} else {
+		auxkc_uuid_valid = TRUE;
+		memcpy((void *)&auxkc_uuid, (const void *)loaded_kcUUID->getBytesNoCopy(), loaded_kcUUID->getLength());
+		uuid_unparse_upper(auxkc_uuid, auxkc_uuid_string);
+	}
+
+skip_adding_kexts:
 #if CONFIG_KEXT_BASEMENT
-        /* On CONFIG_KEXT_BASEMENT systems, kexts are copied to their own 
-         * special VM region during OSKext init time, so we can free the whole 
-         * segment now.
-         */
-        ml_static_mfree((vm_offset_t) prelinkData, prelinkLength);
-#endif /* __x86_64__ */
+	if (mh->filetype != MH_FILESET) {
+		/*
+		 * On CONFIG_KEXT_BASEMENT systems which do _not_ boot the new
+		 * MH_FILESET kext collection, kexts are copied to their own
+		 * special VM region during OSKext init time, so we can free
+		 * the whole segment now.
+		 */
+		kernel_segment_command_t *prelinkTextSegment = NULL;
+		prelinkTextSegment = getsegbyname(kPrelinkTextSegment);
+		if (!prelinkTextSegment) {
+			OSKextLog(/* kext */ NULL,
+			    kOSKextLogErrorLevel | kOSKextLogArchiveFlag,
+			    "Can't find prelinked kexts' text segment.");
+			return;
+		}
 
-   /* Free the prelink info segment, we're done with it.
-    */
-    prelinkInfoSegment = getsegbyname(kPrelinkInfoSegment);
-    if (prelinkInfoSegment) {
-        ml_static_mfree((vm_offset_t)prelinkInfoSegment->vmaddr,
-            (vm_size_t)prelinkInfoSegment->vmsize);
-    }
+		ml_static_mfree((vm_offset_t)prelinkTextSegment->vmaddr, prelinkTextSegment->vmsize);
+	}
+#endif /* CONFIG_KEXT_BASEMENT */
 
-finish:
-    OSSafeRelease(errorString);
-    OSSafeRelease(parsedXML);
-    OSSafeRelease(theKernel);
-    OSSafeRelease(prelinkCountObj);
-    return;
+	/*
+	 * Free the prelink info segment, we're done with it.
+	 */
+
+#if !XNU_TARGET_OS_OSX
+	/*
+	 * For now, we are limiting this freeing to embedded platforms.
+	 * To enable freeing of prelink info segment on macOS, we need to
+	 * fix rdar://88929016
+	 */
+	bool freedPrelinkInfo = false;
+	kernel_segment_command_t *prelinkInfoSegment = NULL;
+	prelinkInfoSegment = getsegbynamefromheader(mh, kPrelinkInfoSegment);
+	if (prelinkInfoSegment) {
+		if (prelinkInfoSegment->vmsize != 0) {
+			freedPrelinkInfo = true;
+			ml_static_mfree((vm_offset_t)prelinkInfoSegment->vmaddr,
+			    (vm_size_t)prelinkInfoSegment->vmsize);
+		}
+	}
+
+	if (!freedPrelinkInfo) {
+		OSKextLog(NULL, kOSKextLogErrorLevel | kOSKextLogArchiveFlag, "Failed to free prelink info.");
+	}
+#endif
+	return;
 }
+
 
 /*********************************************************************
 *********************************************************************/
 #define BOOTER_KEXT_PREFIX   "Driver-"
-#define BOOTER_MKEXT_PREFIX  "DriversPackage-"
 
 typedef struct _DeviceTreeBuffer {
-    uint32_t paddr;
-    uint32_t length;
+	uint32_t paddr;
+	uint32_t length;
 } _DeviceTreeBuffer;
 
 void
 KLDBootstrap::readBooterExtensions(void)
 {
-    IORegistryEntry           * booterMemoryMap         = NULL;  // must release
-    OSDictionary              * propertyDict            = NULL;  // must release
-    OSCollectionIterator      * keyIterator             = NULL;  // must release
-    OSString                  * deviceTreeName          = NULL;  // do not release
-    
-    const _DeviceTreeBuffer   * deviceTreeBuffer        = NULL;  // do not free
-    char                      * booterDataPtr           = NULL;  // do not free
-    OSData                    * booterData              = NULL;  // must release
+	OSSharedPtr<IORegistryEntry> booterMemoryMap;
+	OSSharedPtr<OSDictionary>    propertyDict;
+	OSSharedPtr<OSCollectionIterator>      keyIterator;
+	OSString                  * deviceTreeName          = NULL;// do not release
 
-    OSKext                    * aKext                   = NULL;  // must release
+	const _DeviceTreeBuffer   * deviceTreeBuffer        = NULL;// do not free
+	char                      * booterDataPtr           = NULL;// do not free
+	OSSharedPtr<OSData>         booterData;
+	OSSharedPtr<OSKext>         aKext;
 
-    OSKextLog(/* kext */ NULL,
-        kOSKextLogProgressLevel |
-        kOSKextLogDirectoryScanFlag | kOSKextLogKextBookkeepingFlag,
-        "Reading startup extensions/mkexts from booter memory.");
-    
-    booterMemoryMap = IORegistryEntry::fromPath( "/chosen/memory-map", gIODTPlane);
+	OSKextLog(/* kext */ NULL,
+	    kOSKextLogProgressLevel |
+	    kOSKextLogDirectoryScanFlag | kOSKextLogKextBookkeepingFlag,
+	    "Reading startup extensions from booter memory.");
 
-    if (!booterMemoryMap) {
-        OSKextLog(/* kext */ NULL,
-            kOSKextLogErrorLevel |
-            kOSKextLogGeneralFlag | kOSKextLogDirectoryScanFlag,
-            "Can't read booter memory map.");
-        goto finish;
-    }
+	booterMemoryMap = IORegistryEntry::fromPath( "/chosen/memory-map", gIODTPlane);
 
-    propertyDict = booterMemoryMap->dictionaryWithProperties();
-    if (!propertyDict) {
-        OSKextLog(/* kext */ NULL,
-            kOSKextLogErrorLevel |
-            kOSKextLogDirectoryScanFlag,
-            "Can't get property dictionary from memory map.");
-        goto finish;
-    }
+	if (!booterMemoryMap) {
+		OSKextLog(/* kext */ NULL,
+		    kOSKextLogErrorLevel |
+		    kOSKextLogGeneralFlag | kOSKextLogDirectoryScanFlag,
+		    "Can't read booter memory map.");
+		goto finish;
+	}
 
-    keyIterator = OSCollectionIterator::withCollection(propertyDict);
-    if (!keyIterator) {
-        OSKextLog(/* kext */ NULL,
-            kOSKextLogErrorLevel |
-            kOSKextLogGeneralFlag,
-            "Can't allocate iterator for driver images.");
-        goto finish;
-    }
+	propertyDict = booterMemoryMap->dictionaryWithProperties();
+	if (!propertyDict) {
+		OSKextLog(/* kext */ NULL,
+		    kOSKextLogErrorLevel |
+		    kOSKextLogDirectoryScanFlag,
+		    "Can't get property dictionary from memory map.");
+		goto finish;
+	}
 
-    /* Create dictionary of excluded kexts
-     */
-    OSKext::createExcludeListFromBooterData(propertyDict, keyIterator);
-    keyIterator->reset();
+	keyIterator = OSCollectionIterator::withCollection(propertyDict.get());
+	if (!keyIterator) {
+		OSKextLog(/* kext */ NULL,
+		    kOSKextLogErrorLevel |
+		    kOSKextLogGeneralFlag,
+		    "Can't allocate iterator for driver images.");
+		goto finish;
+	}
 
-    while ( ( deviceTreeName =
-        OSDynamicCast(OSString, keyIterator->getNextObject() ))) {
+	/* Create dictionary of excluded kexts
+	 */
+#ifndef CONFIG_EMBEDDED
+	OSKext::createExcludeListFromBooterData(propertyDict.get(), keyIterator.get());
+#endif
+	// !! reset the iterator, not the pointer
+	keyIterator->reset();
 
-        boolean_t isMkext = FALSE;
-        const char * devTreeNameCString = deviceTreeName->getCStringNoCopy();
-        OSData * deviceTreeEntry = OSDynamicCast(OSData,
-            propertyDict->getObject(deviceTreeName));
+	while ((deviceTreeName =
+	    OSDynamicCast(OSString, keyIterator->getNextObject()))) {
+		const char * devTreeNameCString = deviceTreeName->getCStringNoCopy();
+		OSData * deviceTreeEntry = OSDynamicCast(OSData,
+		    propertyDict->getObject(deviceTreeName));
 
-       /* Clear out the booterData from the prior iteration.
-        */
-        OSSafeReleaseNULL(booterData);
+		/* If there is no entry for the name, we can't do much with it. */
+		if (!deviceTreeEntry) {
+			continue;
+		}
 
-        /* If there is no entry for the name, we can't do much with it. */
-        if (!deviceTreeEntry) {
-            continue;
-        }
+		/* Make sure it is a kext */
+		if (strncmp(devTreeNameCString,
+		    BOOTER_KEXT_PREFIX,
+		    CONST_STRLEN(BOOTER_KEXT_PREFIX))) {
+			continue;
+		}
 
-        /* Make sure it is either a kext or an mkext */
-        if (!strncmp(devTreeNameCString, BOOTER_KEXT_PREFIX,
-            CONST_STRLEN(BOOTER_KEXT_PREFIX))) {
+		deviceTreeBuffer = (const _DeviceTreeBuffer *)
+		    deviceTreeEntry->getBytesNoCopy(0, sizeof(deviceTreeBuffer));
+		if (!deviceTreeBuffer) {
+			/* We can't get to the data, so we can't do anything,
+			 * not even free it from physical memory (if it's there).
+			 */
+			OSKextLog(/* kext */ NULL,
+			    kOSKextLogErrorLevel |
+			    kOSKextLogDirectoryScanFlag,
+			    "Device tree entry %s has NULL pointer.",
+			    devTreeNameCString);
+			goto finish; // xxx - continue, panic?
+		}
 
-            isMkext = FALSE;
+		booterDataPtr = (char *)ml_static_ptovirt(deviceTreeBuffer->paddr);
+		if (!booterDataPtr) {
+			OSKextLog(/* kext */ NULL,
+			    kOSKextLogErrorLevel |
+			    kOSKextLogDirectoryScanFlag,
+			    "Can't get virtual address for device tree entry %s.",
+			    devTreeNameCString);
+			goto finish;
+		}
 
-        } else if (!strncmp(devTreeNameCString, BOOTER_MKEXT_PREFIX,
-            CONST_STRLEN(BOOTER_MKEXT_PREFIX))) {
+		/* Wrap the booter data buffer in an OSData and set a dealloc function
+		 * so it will take care of the physical memory when freed. Kexts will
+		 * retain the booterData for as long as they need it. Remove the entry
+		 * from the booter memory map after this is done.
+		 */
+		booterData = OSData::withBytesNoCopy(booterDataPtr,
+		    deviceTreeBuffer->length);
+		if (!booterData) {
+			OSKextLog(/* kext */ NULL,
+			    kOSKextLogErrorLevel |
+			    kOSKextLogGeneralFlag,
+			    "Error - Can't allocate OSData wrapper for device tree entry %s.",
+			    devTreeNameCString);
+			goto finish;
+		}
+		booterData->setDeallocFunction(osdata_phys_free);
 
-            isMkext = TRUE;
+		/* Create the kext for the entry, then release it, because the
+		 * kext system keeps them around until explicitly removed.
+		 * Any creation/registration failures are already logged for us.
+		 */
+		OSSharedPtr<OSKext> newKext = OSKext::withBooterData(deviceTreeName, booterData.get());
 
-        } else {
-            continue;
-        }
-
-        deviceTreeBuffer = (const _DeviceTreeBuffer *)
-            deviceTreeEntry->getBytesNoCopy(0, sizeof(deviceTreeBuffer));
-        if (!deviceTreeBuffer) {
-           /* We can't get to the data, so we can't do anything,
-            * not even free it from physical memory (if it's there).
-            */
-            OSKextLog(/* kext */ NULL,
-                kOSKextLogErrorLevel |
-                kOSKextLogDirectoryScanFlag,
-                "Device tree entry %s has NULL pointer.",
-                devTreeNameCString);
-            goto finish;  // xxx - continue, panic?
-        }
-
-        booterDataPtr = (char *)ml_static_ptovirt(deviceTreeBuffer->paddr);
-        if (!booterDataPtr) {
-            OSKextLog(/* kext */ NULL,
-                kOSKextLogErrorLevel |
-                kOSKextLogDirectoryScanFlag,
-                "Can't get virtual address for device tree mkext entry %s.",
-                devTreeNameCString);
-            goto finish;
-        }
-
-       /* Wrap the booter data buffer in an OSData and set a dealloc function
-        * so it will take care of the physical memory when freed. Kexts will
-        * retain the booterData for as long as they need it. Remove the entry
-        * from the booter memory map after this is done.
-        */
-        booterData = OSData::withBytesNoCopy(booterDataPtr,
-            deviceTreeBuffer->length);
-        if (!booterData) {
-            OSKextLog(/* kext */ NULL,
-                kOSKextLogErrorLevel |
-                kOSKextLogGeneralFlag,
-                "Error - Can't allocate OSData wrapper for device tree entry %s.",
-                devTreeNameCString);
-            goto finish;
-        }
-        booterData->setDeallocFunction(osdata_phys_free);
-
-        if (isMkext) {
-            readMkextExtensions(deviceTreeName, booterData);
-        } else {
-           /* Create the kext for the entry, then release it, because the
-            * kext system keeps them around until explicitly removed.
-            * Any creation/registration failures are already logged for us.
-            */
-            OSKext * newKext = OSKext::withBooterData(deviceTreeName, booterData);
-            OSSafeRelease(newKext);
-        }
-
-        booterMemoryMap->removeProperty(deviceTreeName);
-
-    } /* while ( (deviceTreeName = OSDynamicCast(OSString, ...) ) ) */
+		booterMemoryMap->removeProperty(deviceTreeName);
+	} /* while ( (deviceTreeName = OSDynamicCast(OSString, ...) ) ) */
 
 finish:
-
-    OSSafeRelease(booterMemoryMap);
-    OSSafeRelease(propertyDict);
-    OSSafeRelease(keyIterator);
-    OSSafeRelease(booterData);
-    OSSafeRelease(aKext);
-    return;
-}
-
-/*********************************************************************
-*********************************************************************/
-OSReturn
-KLDBootstrap::readMkextExtensions(
-    OSString   * deviceTreeName,
-    OSData     * booterData)
-{
-    OSReturn result = kOSReturnError;
-
-    uint32_t          checksum;
-    IORegistryEntry * registryRoot = NULL;  // do not release
-    OSData          * checksumObj  = NULL;   // must release
-
-    OSKextLog(/* kext */ NULL,
-        kOSKextLogStepLevel |
-        kOSKextLogDirectoryScanFlag | kOSKextLogArchiveFlag,
-        "Reading startup mkext archive from device tree entry %s.",
-        deviceTreeName->getCStringNoCopy());
-
-   /* If we successfully read the archive,
-    * then save the mkext's checksum in the IORegistry.
-    * assumes we'll only ever have one mkext to boot
-    */
-    result = OSKext::readMkextArchive(booterData, &checksum);
-    if (result == kOSReturnSuccess) {
-
-        OSKextLog(/* kext */ NULL,
-            kOSKextLogProgressLevel |
-            kOSKextLogArchiveFlag,
-            "Startup mkext archive has checksum 0x%x.", (int)checksum);
-
-        registryRoot = IORegistryEntry::getRegistryRoot();
-        assert(registryRoot);
-        checksumObj = OSData::withBytes((void *)&checksum, sizeof(checksum));
-        assert(checksumObj);
-        if (checksumObj) {
-            registryRoot->setProperty(kOSStartupMkextCRC, checksumObj);
-        }
-    }
-    
-    return result;
+	return;
 }
 
 /*********************************************************************
@@ -665,65 +504,57 @@ KLDBootstrap::readMkextExtensions(
 void
 KLDBootstrap::loadSecurityExtensions(void)
 {
-    OSDictionary         * extensionsDict = NULL;  // must release
-    OSCollectionIterator * keyIterator    = NULL;  // must release
-    OSString             * bundleID       = NULL;  // don't release
-    OSKext               * theKext        = NULL;  // don't release
-    OSBoolean            * isSecurityKext = NULL;  // don't release
+	OSSharedPtr<OSDictionary>         extensionsDict;
+	OSSharedPtr<OSCollectionIterator> keyIterator;
+	OSString             * bundleID       = NULL;// don't release
+	OSKext               * theKext        = NULL;// don't release
 
-    OSKextLog(/* kext */ NULL,
-        kOSKextLogStepLevel |
-        kOSKextLogLoadFlag,
-        "Loading security extensions.");
+	OSKextLog(/* kext */ NULL,
+	    kOSKextLogStepLevel |
+	    kOSKextLogLoadFlag,
+	    "Loading security extensions.");
 
-    extensionsDict = OSKext::copyKexts();
-    if (!extensionsDict) {
-        return;
-    }
+	extensionsDict = OSKext::copyKexts();
+	if (!extensionsDict) {
+		return;
+	}
 
-    keyIterator = OSCollectionIterator::withCollection(extensionsDict);
-    if (!keyIterator) {
-        OSKextLog(/* kext */ NULL,
-            kOSKextLogErrorLevel |
-            kOSKextLogGeneralFlag,
-            "Failed to allocate iterator for security extensions.");
-        goto finish;
-    }
+	keyIterator = OSCollectionIterator::withCollection(extensionsDict.get());
+	if (!keyIterator) {
+		OSKextLog(/* kext */ NULL,
+		    kOSKextLogErrorLevel |
+		    kOSKextLogGeneralFlag,
+		    "Failed to allocate iterator for security extensions.");
+		goto finish;
+	}
 
-    while ((bundleID = OSDynamicCast(OSString, keyIterator->getNextObject()))) {
+	while ((bundleID = OSDynamicCast(OSString, keyIterator->getNextObject()))) {
+		const char * bundle_id = bundleID->getCStringNoCopy();
 
-        const char * bundle_id = bundleID->getCStringNoCopy();
-        
-       /* Skip extensions whose bundle IDs don't start with "com.apple.".
-        */
-        if (!bundle_id ||
-            (strncmp(bundle_id, COM_APPLE, CONST_STRLEN(COM_APPLE)) != 0)) {
+		/* Skip extensions whose bundle IDs don't start with "com.apple.".
+		 */
+		if (!bundle_id ||
+		    (strncmp(bundle_id, COM_APPLE, CONST_STRLEN(COM_APPLE)) != 0)) {
+			continue;
+		}
 
-            continue;
-        }
+		theKext = OSDynamicCast(OSKext, extensionsDict->getObject(bundleID));
+		if (!theKext) {
+			continue;
+		}
 
-        theKext = OSDynamicCast(OSKext, extensionsDict->getObject(bundleID));
-        if (!theKext) {
-            continue;
-        }
-
-        isSecurityKext = OSDynamicCast(OSBoolean,
-            theKext->getPropertyForHostArch(kAppleSecurityExtensionKey));
-        if (isSecurityKext && isSecurityKext->isTrue()) {
-            OSKextLog(/* kext */ NULL,
-                kOSKextLogStepLevel |
-                kOSKextLogLoadFlag,
-                "Loading security extension %s.", bundleID->getCStringNoCopy());
-            OSKext::loadKextWithIdentifier(bundleID->getCStringNoCopy(),
-                /* allowDefer */ false);
-        }
-    }
+		if (kOSBooleanTrue == theKext->getPropertyForHostArch(kAppleSecurityExtensionKey)) {
+			OSKextLog(/* kext */ NULL,
+			    kOSKextLogStepLevel |
+			    kOSKextLogLoadFlag,
+			    "Loading security extension %s.", bundleID->getCStringNoCopy());
+			OSKext::loadKextWithIdentifier(bundleID->getCStringNoCopy(),
+			    /* allowDefer */ false);
+		}
+	}
 
 finish:
-    OSSafeRelease(keyIterator);
-    OSSafeRelease(extensionsDict);
-
-    return;
+	return;
 }
 
 /*********************************************************************
@@ -740,31 +571,27 @@ finish:
 OSReturn
 KLDBootstrap::loadKernelComponentKexts(void)
 {
-    OSReturn      result      = kOSReturnSuccess;  // optimistic
-    OSKext      * theKext     = NULL;              // must release
-    const char ** kextIDPtr   = NULL;              // do not release
+	OSReturn            result      = kOSReturnSuccess;// optimistic
+	OSSharedPtr<OSKext> theKext;
+	const char       ** kextIDPtr   = NULL;          // do not release
 
-    for (kextIDPtr = &sKernelComponentNames[0]; *kextIDPtr; kextIDPtr++) {
-        
-        OSSafeReleaseNULL(theKext);
-        theKext = OSKext::lookupKextWithIdentifier(*kextIDPtr);
+	for (kextIDPtr = &sKernelComponentNames[0]; *kextIDPtr; kextIDPtr++) {
+		theKext = OSKext::lookupKextWithIdentifier(*kextIDPtr);
 
-        if (theKext) {
-            if (kOSReturnSuccess != OSKext::loadKextWithIdentifier(
-                *kextIDPtr, /* allowDefer */ false)) {
+		if (theKext) {
+			if (kOSReturnSuccess != OSKext::loadKextWithIdentifier(
+				    *kextIDPtr, /* allowDefer */ false)) {
+				// xxx - check KextBookkeeping, might be redundant
+				OSKextLog(/* kext */ NULL,
+				    kOSKextLogErrorLevel |
+				    kOSKextLogDirectoryScanFlag | kOSKextLogKextBookkeepingFlag,
+				    "Failed to initialize kernel component %s.", *kextIDPtr);
+				result = kOSReturnError;
+			}
+		}
+	}
 
-                // xxx - check KextBookkeeping, might be redundant
-                OSKextLog(/* kext */ NULL,
-                    kOSKextLogErrorLevel |
-                    kOSKextLogDirectoryScanFlag | kOSKextLogKextBookkeepingFlag,
-                    "Failed to initialize kernel component %s.", *kextIDPtr);
-                result = kOSReturnError;
-            }
-        }
-    }
-
-    OSSafeRelease(theKext);
-    return result;
+	return result;
 }
 
 /*********************************************************************
@@ -780,186 +607,174 @@ KLDBootstrap::loadKernelComponentKexts(void)
 void
 KLDBootstrap::loadKernelExternalComponents(void)
 {
-    OSDictionary         * extensionsDict = NULL;  // must release
-    OSCollectionIterator * keyIterator    = NULL;  // must release
-    OSString             * bundleID       = NULL;  // don't release
-    OSKext               * theKext        = NULL;  // don't release
-    OSBoolean            * isKernelExternalComponent = NULL;  // don't release
+	OSSharedPtr<OSDictionary>         extensionsDict;
+	OSSharedPtr<OSCollectionIterator> keyIterator;
+	OSString             * bundleID       = NULL;// don't release
+	OSKext               * theKext        = NULL;// don't release
+	OSBoolean            * isKernelExternalComponent = NULL;// don't release
 
-    OSKextLog(/* kext */ NULL,
-        kOSKextLogStepLevel |
-        kOSKextLogLoadFlag,
-        "Loading Kernel External Components.");
+	OSKextLog(/* kext */ NULL,
+	    kOSKextLogStepLevel |
+	    kOSKextLogLoadFlag,
+	    "Loading Kernel External Components.");
 
-    extensionsDict = OSKext::copyKexts();
-    if (!extensionsDict) {
-        return;
-    }
+	extensionsDict = OSKext::copyKexts();
+	if (!extensionsDict) {
+		return;
+	}
 
-    keyIterator = OSCollectionIterator::withCollection(extensionsDict);
-    if (!keyIterator) {
-        OSKextLog(/* kext */ NULL,
-            kOSKextLogErrorLevel |
-            kOSKextLogGeneralFlag,
-            "Failed to allocate iterator for Kernel External Components.");
-        goto finish;
-    }
+	keyIterator = OSCollectionIterator::withCollection(extensionsDict.get());
+	if (!keyIterator) {
+		OSKextLog(/* kext */ NULL,
+		    kOSKextLogErrorLevel |
+		    kOSKextLogGeneralFlag,
+		    "Failed to allocate iterator for Kernel External Components.");
+		goto finish;
+	}
 
-    while ((bundleID = OSDynamicCast(OSString, keyIterator->getNextObject()))) {
+	while ((bundleID = OSDynamicCast(OSString, keyIterator->getNextObject()))) {
+		const char * bundle_id = bundleID->getCStringNoCopy();
 
-        const char * bundle_id = bundleID->getCStringNoCopy();
-        
-       /* Skip extensions whose bundle IDs don't start with "com.apple.kec.".
-        */
-        if (!bundle_id ||
-            (strncmp(bundle_id, COM_APPLE_KEC, CONST_STRLEN(COM_APPLE_KEC)) != 0)) {
+		/* Skip extensions whose bundle IDs don't start with "com.apple.kec.".
+		 */
+		if (!bundle_id ||
+		    (strncmp(bundle_id, COM_APPLE_KEC, CONST_STRLEN(COM_APPLE_KEC)) != 0)) {
+			continue;
+		}
 
-            continue;
-        }
+		theKext = OSDynamicCast(OSKext, extensionsDict->getObject(bundleID));
+		if (!theKext) {
+			continue;
+		}
 
-        theKext = OSDynamicCast(OSKext, extensionsDict->getObject(bundleID));
-        if (!theKext) {
-            continue;
-        }
-
-        isKernelExternalComponent = OSDynamicCast(OSBoolean,
-            theKext->getPropertyForHostArch(kAppleKernelExternalComponentKey));
-        if (isKernelExternalComponent && isKernelExternalComponent->isTrue()) {
-            OSKextLog(/* kext */ NULL,
-                kOSKextLogStepLevel |
-                kOSKextLogLoadFlag,
-                "Loading kernel external component %s.", bundleID->getCStringNoCopy());
-            OSKext::loadKextWithIdentifier(bundleID->getCStringNoCopy(),
-                /* allowDefer */ false);
-        }
-    }
+		isKernelExternalComponent = OSDynamicCast(OSBoolean,
+		    theKext->getPropertyForHostArch(kAppleKernelExternalComponentKey));
+		if (isKernelExternalComponent && isKernelExternalComponent->isTrue()) {
+			OSKextLog(/* kext */ NULL,
+			    kOSKextLogStepLevel |
+			    kOSKextLogLoadFlag,
+			    "Loading kernel external component %s.", bundleID->getCStringNoCopy());
+			OSKext::loadKextWithIdentifier(bundleID->getCStringNoCopy(),
+			    /* allowDefer */ false);
+		}
+	}
 
 finish:
-    OSSafeRelease(keyIterator);
-    OSSafeRelease(extensionsDict);
-
-    return;
+	return;
 }
 
 /*********************************************************************
- *********************************************************************/
+*********************************************************************/
 void
 KLDBootstrap::readBuiltinPersonalities(void)
 {
-    OSObject              * parsedXML             = NULL;  // must release
-    OSArray               * builtinExtensions     = NULL;  // do not release
-    OSArray               * allPersonalities      = NULL;  // must release
-    OSString              * errorString           = NULL;  // must release
-    kernel_section_t      * infosect              = NULL;  // do not free
-    OSCollectionIterator  * personalitiesIterator = NULL;  // must release
-    unsigned int            count, i;
-    
-    OSKextLog(/* kext */ NULL,
-        kOSKextLogStepLevel |
-        kOSKextLogLoadFlag,
-        "Reading built-in kernel personalities for I/O Kit drivers.");
+	OSSharedPtr<OSObject>   parsedXML;
+	OSArray               * builtinExtensions     = NULL;// do not release
+	OSSharedPtr<OSArray>    allPersonalities;
+	OSSharedPtr<OSString>   errorString;
+	kernel_section_t      * infosect              = NULL;// do not free
+	OSSharedPtr<OSCollectionIterator>  personalitiesIterator;
+	unsigned int            count, i;
 
-   /* Look in the __BUILTIN __info segment for an array of Info.plist
-    * entries. For each one, extract the personalities dictionary, add
-    * it to our array, then push them all (without matching) to
-    * the IOCatalogue. This can be used to augment the personalities
-    * in gIOKernelConfigTables, especially when linking entire kexts into
-    * the mach_kernel image.
-    */
-    infosect   = getsectbyname("__BUILTIN", "__info");
-    if (!infosect) {
-        // this isn't fatal
-        goto finish;
-    }
-        
-    parsedXML = OSUnserializeXML((const char *) (uintptr_t)infosect->addr,
-        &errorString);
-    if (parsedXML) {
-        builtinExtensions = OSDynamicCast(OSArray, parsedXML);
-    }
-    if (!builtinExtensions) {
-        const char * errorCString = "(unknown error)";
-        
-        if (errorString && errorString->getCStringNoCopy()) {
-            errorCString = errorString->getCStringNoCopy();
-        } else if (parsedXML) {
-            errorCString = "not an array";
-        }
-        OSKextLog(/* kext */ NULL,
-            kOSKextLogErrorLevel |
-            kOSKextLogLoadFlag,
-            "Error unserializing built-in personalities: %s.", errorCString);
-        goto finish;
-    }
-            
-    // estimate 3 personalities per Info.plist/kext
-    count = builtinExtensions->getCount();
-    allPersonalities = OSArray::withCapacity(count * 3);
-            
-    for (i = 0; i < count; i++) {
-        OSDictionary            * infoDict = NULL;      // do not release
-        OSString                * moduleName = NULL;    // do not release
-        OSDictionary            * personalities;        // do not release
-        OSString                * personalityName;      // do not release    
-        
-        OSSafeReleaseNULL(personalitiesIterator);
+	OSKextLog(/* kext */ NULL,
+	    kOSKextLogStepLevel |
+	    kOSKextLogLoadFlag,
+	    "Reading built-in kernel personalities for I/O Kit drivers.");
 
-        infoDict = OSDynamicCast(OSDictionary,
-            builtinExtensions->getObject(i));
-        if (!infoDict) {
-            continue;
-        }
-        
-        moduleName = OSDynamicCast(OSString,
-            infoDict->getObject(kCFBundleIdentifierKey));
-        if (!moduleName) {
-            continue;
-        }
-        
-        OSKextLog(/* kext */ NULL,
-            kOSKextLogStepLevel |
-            kOSKextLogLoadFlag,
-            "Adding personalities for built-in driver %s:",
-            moduleName->getCStringNoCopy());
-        
-        personalities = OSDynamicCast(OSDictionary,
-            infoDict->getObject("IOKitPersonalities"));
-        if (!personalities) {
-            continue;
-        }
-        
-        personalitiesIterator = OSCollectionIterator::withCollection(personalities);
-        if (!personalitiesIterator) {
-            continue;  // xxx - well really, what can we do? should we panic?
-        }
-        
-        while ((personalityName = OSDynamicCast(OSString,
-            personalitiesIterator->getNextObject()))) {
-            
-            OSDictionary * personality = OSDynamicCast(OSDictionary,
-                personalities->getObject(personalityName));
+	/* Look in the __BUILTIN __info segment for an array of Info.plist
+	 * entries. For each one, extract the personalities dictionary, add
+	 * it to our array, then push them all (without matching) to
+	 * the IOCatalogue. This can be used to augment the personalities
+	 * in gIOKernelConfigTables, especially when linking entire kexts into
+	 * the mach_kernel image.
+	 */
+	infosect   = getsectbyname("__BUILTIN", "__info");
+	if (!infosect) {
+		// this isn't fatal
+		goto finish;
+	}
 
-            OSKextLog(/* kext */ NULL,
-                kOSKextLogDetailLevel |
-                kOSKextLogLoadFlag,
-                "Adding built-in driver personality %s.",
-                personalityName->getCStringNoCopy());
-        
+	parsedXML = OSUnserializeXML((const char *) (uintptr_t)infosect->addr,
+	    errorString);
+	if (parsedXML) {
+		builtinExtensions = OSDynamicCast(OSArray, parsedXML.get());
+	}
+	if (!builtinExtensions) {
+		const char * errorCString = "(unknown error)";
+
+		if (errorString && errorString->getCStringNoCopy()) {
+			errorCString = errorString->getCStringNoCopy();
+		} else if (parsedXML) {
+			errorCString = "not an array";
+		}
+		OSKextLog(/* kext */ NULL,
+		    kOSKextLogErrorLevel |
+		    kOSKextLogLoadFlag,
+		    "Error unserializing built-in personalities: %s.", errorCString);
+		goto finish;
+	}
+
+	// estimate 3 personalities per Info.plist/kext
+	count = builtinExtensions->getCount();
+	allPersonalities = OSArray::withCapacity(count * 3);
+
+	for (i = 0; i < count; i++) {
+		OSDictionary            * infoDict = NULL;// do not release
+		OSString                * moduleName = NULL;// do not release
+		OSDictionary            * personalities;// do not release
+		OSString                * personalityName;// do not release
+
+		infoDict = OSDynamicCast(OSDictionary,
+		    builtinExtensions->getObject(i));
+		if (!infoDict) {
+			continue;
+		}
+
+		moduleName = OSDynamicCast(OSString,
+		    infoDict->getObject(kCFBundleIdentifierKey));
+		if (!moduleName) {
+			continue;
+		}
+
+		OSKextLog(/* kext */ NULL,
+		    kOSKextLogStepLevel |
+		    kOSKextLogLoadFlag,
+		    "Adding personalities for built-in driver %s:",
+		    moduleName->getCStringNoCopy());
+
+		personalities = OSDynamicCast(OSDictionary,
+		    infoDict->getObject("IOKitPersonalities"));
+		if (!personalities) {
+			continue;
+		}
+
+		personalitiesIterator = OSCollectionIterator::withCollection(personalities);
+		if (!personalitiesIterator) {
+			continue; // xxx - well really, what can we do? should we panic?
+		}
+
+		while ((personalityName = OSDynamicCast(OSString,
+		    personalitiesIterator->getNextObject()))) {
+			OSDictionary * personality = OSDynamicCast(OSDictionary,
+			    personalities->getObject(personalityName));
+
+			OSKextLog(/* kext */ NULL,
+			    kOSKextLogDetailLevel |
+			    kOSKextLogLoadFlag,
+			    "Adding built-in driver personality %s.",
+			    personalityName->getCStringNoCopy());
+
 			if (personality && !personality->getObject(kCFBundleIdentifierKey)) {
 				personality->setObject(kCFBundleIdentifierKey, moduleName);
 			}
-            allPersonalities->setObject(personality);
-        }
-    }
-    
-    gIOCatalogue->addDrivers(allPersonalities, false);
+			allPersonalities->setObject(personality);
+		}
+	}
+
+	gIOCatalogue->addDrivers(allPersonalities.get(), false);
 
 finish:
-    OSSafeRelease(parsedXML);
-    OSSafeRelease(allPersonalities);
-    OSSafeRelease(errorString);
-    OSSafeRelease(personalitiesIterator);
-    return;
+	return;
 }
 
 #if PRAGMA_MARK
@@ -968,15 +783,17 @@ finish:
 /*********************************************************************
 * Bootstrap Functions
 *********************************************************************/
-static void bootstrapRecordStartupExtensions(void)
+static void
+bootstrapRecordStartupExtensions(void)
 {
-    sBootstrapObject.readStartupExtensions();
-    return;
+	sBootstrapObject.readStartupExtensions();
+	return;
 }
 
-static void bootstrapLoadSecurityExtensions(void)
+static void
+bootstrapLoadSecurityExtensions(void)
 {
-    sBootstrapObject.loadSecurityExtensions();
-    return;
+	sBootstrapObject.loadSecurityExtensions();
+	return;
 }
 

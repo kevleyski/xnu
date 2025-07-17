@@ -1,8 +1,8 @@
 /*
- * Copyright (c) 2004-2011 Apple Inc. All rights reserved.
+ * Copyright (c) 2004-2020 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
- * 
+ *
  * This file contains Original Code and/or Modifications of Original Code
  * as defined in and that are subject to the Apple Public Source License
  * Version 2.0 (the 'License'). You may not use this file except in
@@ -11,10 +11,10 @@
  * unlawful or unlicensed copies of an Apple operating system, or to
  * circumvent, violate, or enable the circumvention or violation of, any
  * terms of an Apple operating system software license agreement.
- * 
+ *
  * Please obtain a copy of the License at
  * http://www.opensource.apple.com/apsl/ and read it before using this file.
- * 
+ *
  * The Original Code and all software distributed under the License are
  * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
@@ -22,7 +22,7 @@
  * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
  * Please see the License for the specific language governing rights and
  * limitations under the License.
- * 
+ *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
 /*
@@ -37,7 +37,7 @@
  * and identity information.
  */
 
-#include <sys/param.h>	/* XXX trim includes */
+#include <sys/param.h>  /* XXX trim includes */
 #include <sys/acct.h>
 #include <sys/systm.h>
 #include <sys/ucred.h>
@@ -53,32 +53,31 @@
 #include <security/audit/audit.h>
 
 #include <sys/mount.h>
-#include <sys/stat.h>	/* For manifest constants in posix_cred_access */
+#include <sys/stat.h>   /* For manifest constants in posix_cred_access */
 #include <sys/sysproto.h>
 #include <mach/message.h>
-#include <mach/host_security.h>
 
-#include <libkern/OSAtomic.h>
+#include <machine/atomic.h>
+#include <libkern/OSByteOrder.h>
 
+#include <kern/smr_hash.h>
 #include <kern/task.h>
-#include <kern/lock.h>
+#include <kern/locks.h>
 #ifdef MACH_ASSERT
 # undef MACH_ASSERT
 #endif
-#define MACH_ASSERT 1	/* XXX so bogus */
+#define MACH_ASSERT 1   /* XXX so bogus */
 #include <kern/assert.h>
 
 #if CONFIG_MACF
 #include <security/mac.h>
+#include <security/mac_policy.h>
 #include <security/mac_framework.h>
 #include <security/_label.h>
 #endif
 
-void mach_kauth_cred_uthread_update( void );
-
-#define CRED_DIAGNOSTIC 0
-
-# define NULLCRED_CHECK(_c)	do {if (!IS_VALID_CRED(_c)) panic("%s: bad credential %p", __FUNCTION__,_c);} while(0)
+#include <os/hash.h>
+#include <IOKit/IOBSD.h>
 
 /* Set to 1 to turn on KAUTH_DEBUG for kern_credential.c */
 #if 0
@@ -95,55 +94,9 @@ void mach_kauth_cred_uthread_update( void );
 #endif
 
 # define K_UUID_FMT "%08x:%08x:%08x:%08x"
-# define K_UUID_ARG(_u) *(int *)&_u.g_guid[0],*(int *)&_u.g_guid[4],*(int *)&_u.g_guid[8],*(int *)&_u.g_guid[12]
+# define K_UUID_ARG(_u) &_u.g_guid_asint[0],&_u.g_guid_asint[1],&_u.g_guid_asint[2],&_u.g_guid_asint[3]
 # define KAUTH_DEBUG(fmt, args...)      do { printf("%s:%d: " fmt "\n", __PRETTY_FUNCTION__, __LINE__ , ##args); } while (0)
 #endif
-
-/*
- * Credential debugging; we can track entry into a function that might
- * change a credential, and we can track actual credential changes that
- * result.
- *
- * Note:	Does *NOT* currently include per-thread credential changes
- */
-
-#if DEBUG_CRED
-#define	DEBUG_CRED_ENTER		printf
-#define	DEBUG_CRED_CHANGE		printf
-extern void kauth_cred_print(kauth_cred_t cred);
-
-#include <libkern/OSDebug.h>	/* needed for get_backtrace( ) */
-
-int is_target_cred( kauth_cred_t the_cred );
-void get_backtrace( void );
-
-static int sysctl_dump_creds( __unused struct sysctl_oid *oidp, __unused void *arg1, 
-							  __unused int arg2, struct sysctl_req *req );
-static int
-sysctl_dump_cred_backtraces( __unused struct sysctl_oid *oidp, __unused void *arg1, 
-							 __unused int arg2, struct sysctl_req *req );
-
-#define MAX_STACK_DEPTH 8
-struct cred_backtrace {
-	int				depth;
-	void *			stack[ MAX_STACK_DEPTH ];
-};
-typedef struct cred_backtrace cred_backtrace;
-
-#define MAX_CRED_BUFFER_SLOTS 200
-struct cred_debug_buffer {
-	int				next_slot;
-	cred_backtrace	stack_buffer[ MAX_CRED_BUFFER_SLOTS ];	
-};
-typedef struct cred_debug_buffer cred_debug_buffer;
-cred_debug_buffer * cred_debug_buf_p = NULL;
-
-#else	/* !DEBUG_CRED */
-
-#define	DEBUG_CRED_ENTER(fmt, ...)	do {} while (0)
-#define	DEBUG_CRED_CHANGE(fmt, ...)	do {} while (0)
-
-#endif	/* !DEBUG_CRED */
 
 #if CONFIG_EXT_RESOLVER
 /*
@@ -155,56 +108,75 @@ cred_debug_buffer * cred_debug_buf_p = NULL;
  * times out.
  */
 
-static lck_mtx_t *kauth_resolver_mtx;
-#define KAUTH_RESOLVER_LOCK()	lck_mtx_lock(kauth_resolver_mtx);
-#define KAUTH_RESOLVER_UNLOCK()	lck_mtx_unlock(kauth_resolver_mtx);
+static LCK_MTX_DECLARE(kauth_resolver_mtx, &kauth_lck_grp);
+#define KAUTH_RESOLVER_LOCK()   lck_mtx_lock(&kauth_resolver_mtx);
+#define KAUTH_RESOLVER_UNLOCK() lck_mtx_unlock(&kauth_resolver_mtx);
 
-static volatile pid_t	kauth_resolver_identity;
-static int	kauth_identitysvc_has_registered;
-static int	kauth_resolver_registered;
-static uint32_t	kauth_resolver_sequence;
-static int	kauth_resolver_timeout = 30;	/* default: 30 seconds */
+static volatile pid_t   kauth_resolver_identity;
+static int      kauth_identitysvc_has_registered;
+static int      kauth_resolver_registered;
+static uint32_t kauth_resolver_sequence = 31337;
+static int      kauth_resolver_timeout = 30;    /* default: 30 seconds */
 
 struct kauth_resolver_work {
 	TAILQ_ENTRY(kauth_resolver_work) kr_link;
 	struct kauth_identity_extlookup kr_work;
-	uint64_t	kr_extend;
-	uint32_t	kr_seqno;
-	int		kr_refs;
-	int		kr_flags;
-#define KAUTH_REQUEST_UNSUBMITTED	(1<<0)
-#define KAUTH_REQUEST_SUBMITTED		(1<<1)
-#define KAUTH_REQUEST_DONE		(1<<2)
-	int		kr_result;
+	uint64_t        kr_extend;
+	uint32_t        kr_seqno;
+	int             kr_refs;
+	int             kr_flags;
+#define KAUTH_REQUEST_UNSUBMITTED       (1<<0)
+#define KAUTH_REQUEST_SUBMITTED         (1<<1)
+#define KAUTH_REQUEST_DONE              (1<<2)
+	int             kr_result;
 };
 
-TAILQ_HEAD(kauth_resolver_unsubmitted_head, kauth_resolver_work) kauth_resolver_unsubmitted;
-TAILQ_HEAD(kauth_resolver_submitted_head, kauth_resolver_work)	kauth_resolver_submitted;
-TAILQ_HEAD(kauth_resolver_done_head, kauth_resolver_work)	kauth_resolver_done;
+TAILQ_HEAD(kauth_resolver_unsubmitted_head, kauth_resolver_work) kauth_resolver_unsubmitted =
+    TAILQ_HEAD_INITIALIZER(kauth_resolver_unsubmitted);
+TAILQ_HEAD(kauth_resolver_submitted_head, kauth_resolver_work) kauth_resolver_submitted =
+    TAILQ_HEAD_INITIALIZER(kauth_resolver_submitted);
+TAILQ_HEAD(kauth_resolver_done_head, kauth_resolver_work) kauth_resolver_done =
+    TAILQ_HEAD_INITIALIZER(kauth_resolver_done);
 
 /* Number of resolver timeouts between logged complaints */
 #define KAUTH_COMPLAINT_INTERVAL 1000
 int kauth_resolver_timeout_cnt = 0;
 
-static int	kauth_resolver_submit(struct kauth_identity_extlookup *lkp, uint64_t extend_data);
-static int	kauth_resolver_complete(user_addr_t message);
-static int	kauth_resolver_getwork(user_addr_t message);
-static int	kauth_resolver_getwork2(user_addr_t message);
-static __attribute__((noinline)) int __KERNEL_IS_WAITING_ON_EXTERNAL_CREDENTIAL_RESOLVER__(
-	struct kauth_resolver_work *); 
+#if DEVELOPMENT || DEBUG
+/* Internal builds get different (less ambiguous) breadcrumbs. */
+#define KAUTH_RESOLVER_FAILED_ERRCODE   EOWNERDEAD
+#else
+/* But non-Internal builds get errors that are allowed by standards. */
+#define KAUTH_RESOLVER_FAILED_ERRCODE   EIO
+#endif /* DEVELOPMENT || DEBUG */
 
-#define	KAUTH_CACHES_MAX_SIZE 10000 /* Max # entries for both groups and id caches */
+int kauth_resolver_failed_cnt = 0;
+#define RESOLVER_FAILED_MESSAGE(fmt, args...)                           \
+do {                                                                    \
+	if (!(kauth_resolver_failed_cnt++ % 100)) {                     \
+	        printf("%s: " fmt "\n", __PRETTY_FUNCTION__, ##args);   \
+	}                                                               \
+} while (0)
+
+static int      kauth_resolver_submit(struct kauth_identity_extlookup *lkp, uint64_t extend_data);
+static int      kauth_resolver_complete(user_addr_t message);
+static int      kauth_resolver_getwork(user_addr_t message);
+static int      kauth_resolver_getwork2(user_addr_t message);
+static __attribute__((noinline)) int __KERNEL_IS_WAITING_ON_EXTERNAL_CREDENTIAL_RESOLVER__(
+	struct kauth_resolver_work *);
+
+#define KAUTH_CACHES_MAX_SIZE 10000 /* Max # entries for both groups and id caches */
 
 struct kauth_identity {
 	TAILQ_ENTRY(kauth_identity) ki_link;
-	int	ki_valid;
-	uid_t	ki_uid;
-	gid_t	ki_gid;
-	int	ki_supgrpcnt;
-	gid_t	ki_supgrps[NGROUPS];
-	guid_t	ki_guid;
+	int     ki_valid;
+	uid_t   ki_uid;
+	gid_t   ki_gid;
+	uint32_t         ki_supgrpcnt;
+	gid_t   ki_supgrps[NGROUPS];
+	guid_t  ki_guid;
 	ntsid_t ki_ntsid;
-	const char	*ki_name;	/* string name from string cache */
+	const char      *ki_name;       /* string name from string cache */
 	/*
 	 * Expiry times are the earliest time at which we will disregard the
 	 * cached state and go to userland.  Before then if the valid bit is
@@ -212,87 +184,63 @@ struct kauth_identity {
 	 * not go to userland to resolve, just assume that there is no answer
 	 * available.
 	 */
-	time_t	ki_groups_expiry;
-	time_t	ki_guid_expiry;
-	time_t	ki_ntsid_expiry;
+	time_t  ki_groups_expiry;
+	time_t  ki_guid_expiry;
+	time_t  ki_ntsid_expiry;
 };
 
-static TAILQ_HEAD(kauth_identity_head, kauth_identity) kauth_identities;
-static lck_mtx_t *kauth_identity_mtx;
-#define KAUTH_IDENTITY_LOCK()	lck_mtx_lock(kauth_identity_mtx);
-#define KAUTH_IDENTITY_UNLOCK()	lck_mtx_unlock(kauth_identity_mtx);
-#define KAUTH_IDENTITY_CACHEMAX_DEFAULT 100	/* XXX default sizing? */
+static TAILQ_HEAD(kauth_identity_head, kauth_identity) kauth_identities =
+    TAILQ_HEAD_INITIALIZER(kauth_identities);
+static LCK_MTX_DECLARE(kauth_identity_mtx, &kauth_lck_grp);
+#define KAUTH_IDENTITY_LOCK()   lck_mtx_lock(&kauth_identity_mtx);
+#define KAUTH_IDENTITY_UNLOCK() lck_mtx_unlock(&kauth_identity_mtx);
+#define KAUTH_IDENTITY_CACHEMAX_DEFAULT 100     /* XXX default sizing? */
 static int kauth_identity_cachemax = KAUTH_IDENTITY_CACHEMAX_DEFAULT;
 static int kauth_identity_count;
 
 static struct kauth_identity *kauth_identity_alloc(uid_t uid, gid_t gid, guid_t *guidp, time_t guid_expiry,
-	ntsid_t *ntsidp, time_t ntsid_expiry, int supgrpcnt, gid_t *supgrps, time_t groups_expiry,
-	const char *name, int nametype);
-static void	kauth_identity_register_and_free(struct kauth_identity *kip);
-static void	kauth_identity_updatecache(struct kauth_identity_extlookup *elp, struct kauth_identity *kip, uint64_t extend_data);
-static void	kauth_identity_trimcache(int newsize);
-static void	kauth_identity_lru(struct kauth_identity *kip);
-static int	kauth_identity_guid_expired(struct kauth_identity *kip);
-static int	kauth_identity_ntsid_expired(struct kauth_identity *kip);
-static int	kauth_identity_find_uid(uid_t uid, struct kauth_identity *kir, char *getname);
-static int	kauth_identity_find_gid(gid_t gid, struct kauth_identity *kir, char *getname);
-static int	kauth_identity_find_guid(guid_t *guidp, struct kauth_identity *kir, char *getname);
-static int	kauth_identity_find_ntsid(ntsid_t *ntsid, struct kauth_identity *kir, char *getname);
-static int	kauth_identity_find_nam(char *name, int valid, struct kauth_identity *kir);
+    ntsid_t *ntsidp, time_t ntsid_expiry, size_t supgrpcnt, gid_t *supgrps, time_t groups_expiry,
+    const char *name, int nametype);
+static void     kauth_identity_register_and_free(struct kauth_identity *kip);
+static void     kauth_identity_updatecache(struct kauth_identity_extlookup *elp, struct kauth_identity *kip, uint64_t extend_data);
+static void     kauth_identity_trimcache(int newsize);
+static void     kauth_identity_lru(struct kauth_identity *kip);
+static int      kauth_identity_guid_expired(struct kauth_identity *kip);
+static int      kauth_identity_ntsid_expired(struct kauth_identity *kip);
+static int      kauth_identity_find_uid(uid_t uid, struct kauth_identity *kir, char *getname);
+static int      kauth_identity_find_gid(gid_t gid, struct kauth_identity *kir, char *getname);
+static int      kauth_identity_find_guid(guid_t *guidp, struct kauth_identity *kir, char *getname);
+static int      kauth_identity_find_ntsid(ntsid_t *ntsid, struct kauth_identity *kir, char *getname);
+static int      kauth_identity_find_nam(char *name, int valid, struct kauth_identity *kir);
 
 struct kauth_group_membership {
 	TAILQ_ENTRY(kauth_group_membership) gm_link;
-	uid_t	gm_uid;		/* the identity whose membership we're recording */
-	gid_t	gm_gid;		/* group of which they are a member */
-	time_t	gm_expiry;	/* TTL for the membership, or 0 for persistent entries */
-	int	gm_flags;
-#define KAUTH_GROUP_ISMEMBER	(1<<0)
+	uid_t   gm_uid;         /* the identity whose membership we're recording */
+	gid_t   gm_gid;         /* group of which they are a member */
+	time_t  gm_expiry;      /* TTL for the membership, or 0 for persistent entries */
+	int     gm_flags;
+#define KAUTH_GROUP_ISMEMBER    (1<<0)
 };
 
-TAILQ_HEAD(kauth_groups_head, kauth_group_membership) kauth_groups;
-static lck_mtx_t *kauth_groups_mtx;
-#define KAUTH_GROUPS_LOCK()	lck_mtx_lock(kauth_groups_mtx);
-#define KAUTH_GROUPS_UNLOCK()	lck_mtx_unlock(kauth_groups_mtx);
-#define KAUTH_GROUPS_CACHEMAX_DEFAULT 100	/* XXX default sizing? */
+TAILQ_HEAD(kauth_groups_head, kauth_group_membership) kauth_groups =
+    TAILQ_HEAD_INITIALIZER(kauth_groups);
+static LCK_MTX_DECLARE(kauth_groups_mtx, &kauth_lck_grp);
+#define KAUTH_GROUPS_LOCK()     lck_mtx_lock(&kauth_groups_mtx);
+#define KAUTH_GROUPS_UNLOCK()   lck_mtx_unlock(&kauth_groups_mtx);
+#define KAUTH_GROUPS_CACHEMAX_DEFAULT 100       /* XXX default sizing? */
 static int kauth_groups_cachemax = KAUTH_GROUPS_CACHEMAX_DEFAULT;
 static int kauth_groups_count;
 
-static int	kauth_groups_expired(struct kauth_group_membership *gm);
-static void	kauth_groups_lru(struct kauth_group_membership *gm);
-static void	kauth_groups_updatecache(struct kauth_identity_extlookup *el);
-static void	kauth_groups_trimcache(int newsize);
-
-#endif	/* CONFIG_EXT_RESOLVER */
-
-static const int kauth_cred_primes[KAUTH_CRED_PRIMES_COUNT] = KAUTH_CRED_PRIMES;
-static int	kauth_cred_primes_index = 0;
-static int	kauth_cred_table_size = 0;
-
-TAILQ_HEAD(kauth_cred_entry_head, ucred);
-static struct kauth_cred_entry_head * kauth_cred_table_anchor = NULL;
-
-#define KAUTH_CRED_HASH_DEBUG	0
-
-static int kauth_cred_add(kauth_cred_t new_cred);
-static boolean_t kauth_cred_remove(kauth_cred_t cred);
-static inline u_long kauth_cred_hash(const uint8_t *datap, int data_len, u_long start_key);
-static u_long kauth_cred_get_hashkey(kauth_cred_t cred);
-static kauth_cred_t kauth_cred_update(kauth_cred_t old_cred, kauth_cred_t new_cred, boolean_t retain_auditinfo);
-static boolean_t kauth_cred_unref_hashlocked(kauth_cred_t *credp);
-
-#if KAUTH_CRED_HASH_DEBUG
-static int	kauth_cred_count = 0;
-static void kauth_cred_hash_print(void);
-static void kauth_cred_print(kauth_cred_t cred);
-#endif
-
-#if CONFIG_EXT_RESOLVER
+static int      kauth_groups_expired(struct kauth_group_membership *gm);
+static void     kauth_groups_lru(struct kauth_group_membership *gm);
+static void     kauth_groups_updatecache(struct kauth_identity_extlookup *el);
+static void     kauth_groups_trimcache(int newsize);
 
 /*
  *  __KERNEL_IS_WAITING_ON_EXTERNAL_CREDENTIAL_RESOLVER__
  *
  * Description:  Waits for the user space daemon to respond to the request
- *               we made. Function declared non inline to be visible in 
+ *               we made. Function declared non inline to be visible in
  *               stackshots and spindumps as well as debugging.
  *
  * Parameters:   workp                     Work queue entry.
@@ -304,7 +252,7 @@ static void kauth_cred_print(kauth_cred_t cred);
  *               ERESTART                  returned by msleep.
  *
  */
-static __attribute__((noinline)) int 
+static __attribute__((noinline)) int
 __KERNEL_IS_WAITING_ON_EXTERNAL_CREDENTIAL_RESOLVER__(
 	struct kauth_resolver_work  *workp)
 {
@@ -314,60 +262,48 @@ __KERNEL_IS_WAITING_ON_EXTERNAL_CREDENTIAL_RESOLVER__(
 		/* we could compute a better timeout here */
 		ts.tv_sec = kauth_resolver_timeout;
 		ts.tv_nsec = 0;
-		error = msleep(workp, kauth_resolver_mtx, PCATCH, "kr_submit", &ts);
+		error = msleep(workp, &kauth_resolver_mtx, PCATCH, "kr_submit", &ts);
 		/* request has been completed? */
-		if ((error == 0) && (workp->kr_flags & KAUTH_REQUEST_DONE))
+		if ((error == 0) && (workp->kr_flags & KAUTH_REQUEST_DONE)) {
 			break;
+		}
 		/* woken because the resolver has died? */
 		if (kauth_resolver_identity == 0) {
-			error = EIO;
+			RESOLVER_FAILED_MESSAGE("kauth external resolver died while while waiting for work to complete");
+			error = KAUTH_RESOLVER_FAILED_ERRCODE;
 			break;
 		}
 		/* an error? */
-		if (error != 0)
+		if (error != 0) {
 			break;
+		}
 	}
 	return error;
 }
 
 
 /*
- * kauth_resolver_init
+ * kauth_resolver_identity_reset
  *
- * Description:	Initialize the daemon side of the credential identity resolver
+ * Description: Reset the identity of the external resolver in certain
+ *              controlled circumstances.
  *
- * Parameters:	(void)
+ * Parameters:  None.
  *
- * Returns:	(void)
- *
- * Notes:	Initialize the credential identity resolver for use; the
- *		credential identity resolver is the KPI used by the user
- *		space credential identity resolver daemon to communicate
- *		with the kernel via the identitysvc() system call..
- *
- *		This is how membership in more than 16 groups (1 effective
- *		and 15 supplementary) is supported, and also how UID's,
- *		UUID's, and so on, are translated to/from POSIX credential
- *		values.
- *
- *		The credential identity resolver operates by attempting to
- *		determine identity first from the credential, then from
- *		the kernel credential identity cache, and finally by
- *		enqueueing a request to a user space daemon.
- *
- *		This function is called from kauth_init() in the file
- *		kern_authorization.c.
+ * Returns:     Nothing.
  */
 void
-kauth_resolver_init(void)
+kauth_resolver_identity_reset(void)
 {
-	TAILQ_INIT(&kauth_resolver_unsubmitted);
-	TAILQ_INIT(&kauth_resolver_submitted);
-	TAILQ_INIT(&kauth_resolver_done);
-	kauth_resolver_sequence = 31337;
-	kauth_resolver_mtx = lck_mtx_alloc_init(kauth_lck_grp, 0/*LCK_ATTR_NULL*/);
+	KAUTH_RESOLVER_LOCK();
+	if (kauth_resolver_identity != 0) {
+		printf("kauth external resolver %d failed to de-register.\n",
+		    kauth_resolver_identity);
+		kauth_resolver_identity = 0;
+		kauth_resolver_registered = 0;
+	}
+	KAUTH_RESOLVER_UNLOCK();
 }
-
 
 /*
  * kauth_resolver_submit
@@ -411,8 +347,8 @@ kauth_resolver_submit(struct kauth_identity_extlookup *lkp, uint64_t extend_data
 {
 	struct kauth_resolver_work *workp, *killp;
 	struct timespec ts;
-	int	error, shouldfree;
-	
+	int     error, shouldfree;
+
 	/* no point actually blocking if the resolver isn't up yet */
 	if (kauth_resolver_identity == 0) {
 		/*
@@ -424,20 +360,18 @@ kauth_resolver_submit(struct kauth_identity_extlookup *lkp, uint64_t extend_data
 		 * process, so that memberd doesn't starve while we are in a
 		 * tight loop between user and kernel, eating all the CPU.
 		 */
-		error = tsleep(&ts, PZERO | PCATCH, "kr_submit", hz/2);
+		error = tsleep(&ts, PZERO | PCATCH, "kr_submit", hz / 2);
 		if (kauth_resolver_identity == 0) {
 			/*
 			 * if things haven't changed while we were asleep,
 			 * tell the caller we couldn't get an authoritative
 			 * answer.
 			 */
-			return(EWOULDBLOCK);
+			return EWOULDBLOCK;
 		}
 	}
-		
-	MALLOC(workp, struct kauth_resolver_work *, sizeof(*workp), M_KAUTH, M_WAITOK);
-	if (workp == NULL)
-		return(ENOMEM);
+
+	workp = kalloc_type(struct kauth_resolver_work, Z_WAITOK | Z_NOFAIL);
 
 	workp->kr_work = *lkp;
 	workp->kr_extend = extend_data;
@@ -471,42 +405,43 @@ kauth_resolver_submit(struct kauth_identity_extlookup *lkp, uint64_t extend_data
 	error = __KERNEL_IS_WAITING_ON_EXTERNAL_CREDENTIAL_RESOLVER__(workp);
 
 	/* if the request was processed, copy the result */
-	if (error == 0)
+	if (error == 0) {
 		*lkp = workp->kr_work;
-	
+	}
+
 	if (error == EWOULDBLOCK) {
-	        if ((kauth_resolver_timeout_cnt++ % KAUTH_COMPLAINT_INTERVAL) == 0) {
-                        printf("kauth external resolver timed out (%d timeout(s) of %d seconds).\n",
-                                kauth_resolver_timeout_cnt, kauth_resolver_timeout);
-                }
-                
-	        if (workp->kr_flags & KAUTH_REQUEST_UNSUBMITTED) {
-	                /*
-                	 * If the request timed out and was never collected, the resolver
-                	 * is dead and probably not coming back anytime soon.  In this
-                	 * case we revert to no-resolver behaviour, and punt all the other
-                	 * sleeping requests to clear the backlog.
-                	 */
-                        KAUTH_DEBUG("RESOLVER - request timed out without being collected for processing, resolver dead");
+		if ((kauth_resolver_timeout_cnt++ % KAUTH_COMPLAINT_INTERVAL) == 0) {
+			printf("kauth external resolver timed out (%d timeout(s) of %d seconds).\n",
+			    kauth_resolver_timeout_cnt, kauth_resolver_timeout);
+		}
 
-                        /*
-                        * Make the current resolver non-authoritative, and mark it as
-                        * no longer registered to prevent kauth_cred_ismember_gid()
-                        * enqueueing more work until a new one is registered.  This
-                        * mitigates the damage a crashing resolver may inflict.
-                        */
-                        kauth_resolver_identity = 0;
-                        kauth_resolver_registered = 0;
+		if (workp->kr_flags & KAUTH_REQUEST_UNSUBMITTED) {
+			/*
+			 * If the request timed out and was never collected, the resolver
+			 * is dead and probably not coming back anytime soon.  In this
+			 * case we revert to no-resolver behaviour, and punt all the other
+			 * sleeping requests to clear the backlog.
+			 */
+			KAUTH_DEBUG("RESOLVER - request timed out without being collected for processing, resolver dead");
 
-                        /* kill all the other requestes that are waiting as well */
-                        TAILQ_FOREACH(killp, &kauth_resolver_submitted, kr_link)
-                                wakeup(killp);
-                        TAILQ_FOREACH(killp, &kauth_resolver_unsubmitted, kr_link)
-                                wakeup(killp);
-                        /* Cause all waiting-for-work threads to return EIO */
-                        wakeup((caddr_t)&kauth_resolver_unsubmitted);
-                }
-        }
+			/*
+			 * Make the current resolver non-authoritative, and mark it as
+			 * no longer registered to prevent kauth_cred_ismember_gid()
+			 * enqueueing more work until a new one is registered.  This
+			 * mitigates the damage a crashing resolver may inflict.
+			 */
+			kauth_resolver_identity = 0;
+			kauth_resolver_registered = 0;
+
+			/* kill all the other requestes that are waiting as well */
+			TAILQ_FOREACH(killp, &kauth_resolver_submitted, kr_link)
+			wakeup(killp);
+			TAILQ_FOREACH(killp, &kauth_resolver_unsubmitted, kr_link)
+			wakeup(killp);
+			/* Cause all waiting-for-work threads to return EIO */
+			wakeup((caddr_t)&kauth_resolver_unsubmitted);
+		}
+	}
 
 	/*
 	 * drop our reference on the work item, and note whether we should
@@ -539,11 +474,11 @@ kauth_resolver_submit(struct kauth_identity_extlookup *lkp, uint64_t extend_data
 	 * If we dropped the last reference, free the request.
 	 */
 	if (shouldfree) {
-		FREE(workp, M_KAUTH);
+		kfree_type(struct kauth_resolver_work, workp);
 	}
 
 	KAUTH_DEBUG("RESOLVER - returning %d", error);
-	return(error);
+	return error;
 }
 
 
@@ -576,18 +511,23 @@ identitysvc(__unused struct proc *p, struct identitysvc_args *uap, __unused int3
 	int opcode = uap->opcode;
 	user_addr_t message = uap->message;
 	struct kauth_resolver_work *workp;
-	struct kauth_cache_sizes sz_arg;
+	struct kauth_cache_sizes sz_arg = {};
 	int error;
 	pid_t new_id;
+
+	if (!IOCurrentTaskHasEntitlement(IDENTITYSVC_ENTITLEMENT)) {
+		KAUTH_DEBUG("RESOLVER - pid %d not entitled to call identitysvc", proc_getpid(current_proc()));
+		return EPERM;
+	}
 
 	/*
 	 * New server registering itself.
 	 */
 	if (opcode == KAUTH_EXTLOOKUP_REGISTER) {
-		new_id = current_proc()->p_pid;
+		new_id = proc_getpid(current_proc());
 		if ((error = kauth_authorize_generic(kauth_cred_get(), KAUTH_GENERIC_ISSUSER)) != 0) {
 			KAUTH_DEBUG("RESOLVER - pid %d refused permission to become identity resolver", new_id);
-			return(error);
+			return error;
 		}
 		KAUTH_RESOLVER_LOCK();
 		if (kauth_resolver_identity != new_id) {
@@ -606,7 +546,7 @@ identitysvc(__unused struct proc *p, struct identitysvc_args *uap, __unused int3
 			 * external resolution timeout
 			 */
 			if (message > 30 && message < 10000) {
-				kauth_resolver_timeout = message;
+				kauth_resolver_timeout = (int)message;
 				KAUTH_DEBUG("RESOLVER - new resolver changes timeout to %d seconds\n", (int)message);
 			}
 			kauth_resolver_identity = new_id;
@@ -615,57 +555,58 @@ identitysvc(__unused struct proc *p, struct identitysvc_args *uap, __unused int3
 			wakeup(&kauth_resolver_unsubmitted);
 		}
 		KAUTH_RESOLVER_UNLOCK();
-		return(0);
+		return 0;
 	}
 
 	/*
-	 * Beyond this point, we must be the resolver process.
+	 * Beyond this point, we must be the resolver process. We verify this
+	 * by confirming the resolver credential and pid.
 	 */
-	if (current_proc()->p_pid != kauth_resolver_identity) {
-		KAUTH_DEBUG("RESOLVER - call from bogus resolver %d\n", current_proc()->p_pid);
-		return(EPERM);
+	if ((kauth_cred_getuid(kauth_cred_get()) != 0) || (proc_getpid(current_proc()) != kauth_resolver_identity)) {
+		KAUTH_DEBUG("RESOLVER - call from bogus resolver %d\n", proc_getpid(current_proc()));
+		return EPERM;
 	}
-	
+
 	if (opcode == KAUTH_GET_CACHE_SIZES) {
 		KAUTH_IDENTITY_LOCK();
 		sz_arg.kcs_id_size = kauth_identity_cachemax;
 		KAUTH_IDENTITY_UNLOCK();
-		
+
 		KAUTH_GROUPS_LOCK();
 		sz_arg.kcs_group_size = kauth_groups_cachemax;
 		KAUTH_GROUPS_UNLOCK();
 
-		if ((error = copyout(&sz_arg, uap->message, sizeof (sz_arg))) != 0) {
-			return (error);
+		if ((error = copyout(&sz_arg, uap->message, sizeof(sz_arg))) != 0) {
+			return error;
 		}
-		
-		return (0);
+
+		return 0;
 	} else if (opcode == KAUTH_SET_CACHE_SIZES) {
-		if ((error = copyin(uap->message, &sz_arg, sizeof (sz_arg))) != 0) {
-			return (error);
+		if ((error = copyin(uap->message, &sz_arg, sizeof(sz_arg))) != 0) {
+			return error;
 		}
-		
+
 		if ((sz_arg.kcs_group_size > KAUTH_CACHES_MAX_SIZE) ||
 		    (sz_arg.kcs_id_size > KAUTH_CACHES_MAX_SIZE)) {
-			return (EINVAL);
+			return EINVAL;
 		}
-		
+
 		KAUTH_IDENTITY_LOCK();
 		kauth_identity_cachemax = sz_arg.kcs_id_size;
 		kauth_identity_trimcache(kauth_identity_cachemax);
 		KAUTH_IDENTITY_UNLOCK();
-		
+
 		KAUTH_GROUPS_LOCK();
 		kauth_groups_cachemax = sz_arg.kcs_group_size;
 		kauth_groups_trimcache(kauth_groups_cachemax);
 		KAUTH_GROUPS_UNLOCK();
-		
-		return (0);
+
+		return 0;
 	} else if (opcode == KAUTH_CLEAR_CACHES) {
 		KAUTH_IDENTITY_LOCK();
 		kauth_identity_trimcache(0);
 		KAUTH_IDENTITY_UNLOCK();
-		
+
 		KAUTH_GROUPS_LOCK();
 		kauth_groups_trimcache(0);
 		KAUTH_GROUPS_UNLOCK();
@@ -687,37 +628,39 @@ identitysvc(__unused struct proc *p, struct identitysvc_args *uap, __unused int3
 		kauth_resolver_registered = 0;
 
 		TAILQ_FOREACH(killp, &kauth_resolver_submitted, kr_link)
-		    wakeup(killp);
+		wakeup(killp);
 		TAILQ_FOREACH(killp, &kauth_resolver_unsubmitted, kr_link)
-		    wakeup(killp);
+		wakeup(killp);
 		/* Cause all waiting-for-work threads to return EIO */
 		wakeup((caddr_t)&kauth_resolver_unsubmitted);
 		KAUTH_RESOLVER_UNLOCK();
 	}
-	
+
 	/*
 	 * Got a result returning?
 	 */
 	if (opcode & KAUTH_EXTLOOKUP_RESULT) {
-		if ((error = kauth_resolver_complete(message)) != 0)
-			return(error);
+		if ((error = kauth_resolver_complete(message)) != 0) {
+			return error;
+		}
 	}
 
 	/*
 	 * Caller wants to take more work?
 	 */
 	if (opcode & KAUTH_EXTLOOKUP_WORKER) {
-		if ((error = kauth_resolver_getwork(message)) != 0)
-			return(error);
+		if ((error = kauth_resolver_getwork(message)) != 0) {
+			return error;
+		}
 	}
 
-	return(0);
+	return 0;
 }
 
 
 /*
  * kauth_resolver_getwork_continue
- *		
+ *
  * Description:	Continuation for kauth_resolver_getwork
  *
  * Parameters:	result				Error code or 0 for the sleep
@@ -739,7 +682,7 @@ kauth_resolver_getwork_continue(int result)
 
 	if (result) {
 		KAUTH_RESOLVER_UNLOCK();
-		return(result);
+		return result;
 	}
 
 	/*
@@ -751,21 +694,23 @@ kauth_resolver_getwork_continue(int result)
 	if (TAILQ_FIRST(&kauth_resolver_unsubmitted) == NULL) {
 		int error;
 
-		error = msleep0(&kauth_resolver_unsubmitted, kauth_resolver_mtx, PCATCH, "GRGetWork", 0, kauth_resolver_getwork_continue);
+		error = msleep0(&kauth_resolver_unsubmitted, &kauth_resolver_mtx, PCATCH, "GRGetWork", 0, kauth_resolver_getwork_continue);
 		/*
 		 * If this is a wakeup from another thread in the resolver
 		 * deregistering it, error out the request-for-work thread
 		 */
-		if (!kauth_resolver_identity)
-			error = EIO;
+		if (!kauth_resolver_identity) {
+			RESOLVER_FAILED_MESSAGE("external resolver died");
+			error = KAUTH_RESOLVER_FAILED_ERRCODE;
+		}
 		KAUTH_RESOLVER_UNLOCK();
-		return(error);
+		return error;
 	}
 
 	thread = current_thread();
 	ut = get_bsdthread_info(thread);
-	message = ut->uu_kevent.uu_kauth.message;
-	return(kauth_resolver_getwork2(message));
+	message = ut->uu_save.uus_kauth.message;
+	return kauth_resolver_getwork2(message);
 }
 
 
@@ -792,7 +737,7 @@ static int
 kauth_resolver_getwork2(user_addr_t message)
 {
 	struct kauth_resolver_work *workp;
-	int		error;
+	int             error;
 
 	/*
 	 * Note: We depend on the caller protecting us from a NULL work item
@@ -814,8 +759,8 @@ kauth_resolver_getwork2(user_addr_t message)
 	}
 	/* AFTER FIELD */
 	if ((error = copyout(&workp->kr_work.el_info_reserved_1,
-			message + offsetof(struct kauth_identity_extlookup, el_info_reserved_1),
-		sizeof(struct kauth_identity_extlookup) - offsetof(struct kauth_identity_extlookup, el_info_reserved_1))) != 0) {
+	    message + offsetof(struct kauth_identity_extlookup, el_info_reserved_1),
+	    sizeof(struct kauth_identity_extlookup) - offsetof(struct kauth_identity_extlookup, el_info_reserved_1))) != 0) {
 		KAUTH_DEBUG("RESOLVER - error submitting work to resolve");
 		goto out;
 	}
@@ -836,13 +781,13 @@ kauth_resolver_getwork2(user_addr_t message)
 
 		error = copyin(message + offsetof(struct kauth_identity_extlookup, el_extend), &uaddr, sizeof(uaddr));
 		if (!error) {
-			size_t actual;	/* not used */
+			size_t actual;  /* not used */
 			/*
 			 * Use copyoutstr() to reduce the copy size; we let
 			 * this catch a NULL uaddr because we shouldn't be
 			 * asking in that case anyway.
 			 */
-			error = copyoutstr(CAST_DOWN(void *,workp->kr_extend), uaddr, MAXPATHLEN, &actual);
+			error = copyoutstr(CAST_DOWN(void *, workp->kr_extend), uaddr, MAXPATHLEN, &actual);
 		}
 		if (error) {
 			KAUTH_DEBUG("RESOLVER - error submitting work to resolve");
@@ -856,7 +801,7 @@ kauth_resolver_getwork2(user_addr_t message)
 
 out:
 	KAUTH_RESOLVER_UNLOCK();
-	return(error);
+	return error;
 }
 
 
@@ -883,7 +828,7 @@ static int
 kauth_resolver_getwork(user_addr_t message)
 {
 	struct kauth_resolver_work *workp;
-	int		error;
+	int             error;
 
 	KAUTH_RESOLVER_LOCK();
 	error = 0;
@@ -891,16 +836,18 @@ kauth_resolver_getwork(user_addr_t message)
 		thread_t thread = current_thread();
 		struct uthread *ut = get_bsdthread_info(thread);
 
-		ut->uu_kevent.uu_kauth.message = message;
-		error = msleep0(&kauth_resolver_unsubmitted, kauth_resolver_mtx, PCATCH, "GRGetWork", 0, kauth_resolver_getwork_continue);
+		ut->uu_save.uus_kauth.message = message;
+		error = msleep0(&kauth_resolver_unsubmitted, &kauth_resolver_mtx, PCATCH, "GRGetWork", 0, kauth_resolver_getwork_continue);
 		KAUTH_RESOLVER_UNLOCK();
 		/*
 		 * If this is a wakeup from another thread in the resolver
 		 * deregistering it, error out the request-for-work thread
 		 */
-		if (!kauth_resolver_identity)
-			error = EIO;
-		return(error);
+		if (!kauth_resolver_identity) {
+			printf("external resolver died");
+			error = KAUTH_RESOLVER_FAILED_ERRCODE;
+		}
+		return error;
 	}
 	return kauth_resolver_getwork2(message);
 }
@@ -920,10 +867,10 @@ kauth_resolver_getwork(user_addr_t message)
 static int
 kauth_resolver_complete(user_addr_t message)
 {
-	struct kauth_identity_extlookup	extl;
+	struct kauth_identity_extlookup extl;
 	struct kauth_resolver_work *workp;
 	struct kauth_resolver_work *killp;
-	int error, result;
+	int error, result, want_extend_data;
 
 	/*
 	 * Copy in the mesage, including the extension field, since we are
@@ -931,7 +878,7 @@ kauth_resolver_complete(user_addr_t message)
 	 */
 	if ((error = copyin(message, &extl, sizeof(extl))) != 0) {
 		KAUTH_DEBUG("RESOLVER - error getting completed work\n");
-		return(error);
+		return error;
 	}
 
 	KAUTH_RESOLVER_LOCK();
@@ -949,7 +896,7 @@ kauth_resolver_complete(user_addr_t message)
 			once = 1;
 		}
 	}
-	/* FALLTHROUGH */
+		OS_FALLTHROUGH;
 
 	case KAUTH_EXTLOOKUP_SUCCESS:
 		break;
@@ -957,6 +904,7 @@ kauth_resolver_complete(user_addr_t message)
 	case KAUTH_EXTLOOKUP_FATAL:
 		/* fatal error means the resolver is dead */
 		KAUTH_DEBUG("RESOLVER - resolver %d died, waiting for a new one", kauth_resolver_identity);
+		RESOLVER_FAILED_MESSAGE("resolver %d died, waiting for a new one", kauth_resolver_identity);
 		/*
 		 * Terminate outstanding requests; without an authoritative
 		 * resolver, we are now back on our own authority.  Tag the
@@ -968,13 +916,13 @@ kauth_resolver_complete(user_addr_t message)
 		kauth_resolver_registered = 0;
 
 		TAILQ_FOREACH(killp, &kauth_resolver_submitted, kr_link)
-		    wakeup(killp);
+		wakeup(killp);
 		TAILQ_FOREACH(killp, &kauth_resolver_unsubmitted, kr_link)
-		    wakeup(killp);
+		wakeup(killp);
 		/* Cause all waiting-for-work threads to return EIO */
 		wakeup((caddr_t)&kauth_resolver_unsubmitted);
 		/* and return EIO to the caller */
-		error = EIO;
+		error = KAUTH_RESOLVER_FAILED_ERRCODE;
 		break;
 
 	case KAUTH_EXTLOOKUP_BADRQ:
@@ -984,12 +932,14 @@ kauth_resolver_complete(user_addr_t message)
 
 	case KAUTH_EXTLOOKUP_FAILURE:
 		KAUTH_DEBUG("RESOLVER - resolver reported transient failure for request %d", extl.el_seqno);
-		result = EIO;
+		RESOLVER_FAILED_MESSAGE("resolver reported transient failure for request %d", extl.el_seqno);
+		result = KAUTH_RESOLVER_FAILED_ERRCODE;
 		break;
 
 	default:
 		KAUTH_DEBUG("RESOLVER - resolver returned unexpected status %d", extl.el_result);
-		result = EIO;
+		RESOLVER_FAILED_MESSAGE("resolver returned unexpected status %d", extl.el_result);
+		result = KAUTH_RESOLVER_FAILED_ERRCODE;
 		break;
 	}
 
@@ -1004,6 +954,10 @@ kauth_resolver_complete(user_addr_t message)
 		TAILQ_FOREACH(workp, &kauth_resolver_submitted, kr_link) {
 			/* found it? */
 			if (workp->kr_seqno == extl.el_seqno) {
+				/*
+				 * Do we want extend_data?
+				 */
+				want_extend_data = (workp->kr_work.el_flags & (KAUTH_EXTLOOKUP_WANT_PWNAM | KAUTH_EXTLOOKUP_WANT_GRNAM));
 
 				/*
 				 * Get the request of the submitted queue so
@@ -1041,13 +995,23 @@ kauth_resolver_complete(user_addr_t message)
 				 * issue and is easily detectable by comparing
 				 * time to live on last response vs. time of
 				 * next request in the resolver logs.
+				 *
+				 * A malicious/faulty resolver could overwrite
+				 * part of a user's address space if they return
+				 * flags that mismatch the original request's flags.
 				 */
-				if (extl.el_flags & (KAUTH_EXTLOOKUP_VALID_PWNAM|KAUTH_EXTLOOKUP_VALID_GRNAM)) {
-					size_t actual;	/* notused */
+				if (want_extend_data && (extl.el_flags & (KAUTH_EXTLOOKUP_VALID_PWNAM | KAUTH_EXTLOOKUP_VALID_GRNAM))) {
+					size_t actual;  /* notused */
 
 					KAUTH_RESOLVER_UNLOCK();
 					error = copyinstr(extl.el_extend, CAST_DOWN(void *, workp->kr_extend), MAXPATHLEN, &actual);
+					KAUTH_DEBUG("RESOLVER - resolver got name :%*s: len = %d\n", (int)actual,
+					    actual ? "null" : (char *)extl.el_extend, actual);
 					KAUTH_RESOLVER_LOCK();
+				} else if (extl.el_flags &  (KAUTH_EXTLOOKUP_VALID_PWNAM | KAUTH_EXTLOOKUP_VALID_GRNAM)) {
+					error = EFAULT;
+					KAUTH_DEBUG("RESOLVER - resolver returned mismatching extension flags (%d), request contained (%d)",
+					    extl.el_flags, want_extend_data);
 				}
 
 				/*
@@ -1065,8 +1029,8 @@ kauth_resolver_complete(user_addr_t message)
 	 * timed out the work record will be gone.
 	 */
 	KAUTH_RESOLVER_UNLOCK();
-	
-	return(error);
+
+	return error;
 }
 #endif /* CONFIG_EXT_RESOLVER */
 
@@ -1075,39 +1039,15 @@ kauth_resolver_complete(user_addr_t message)
  * Identity cache.
  */
 
-#define	KI_VALID_UID	(1<<0)		/* UID and GID are mutually exclusive */
-#define KI_VALID_GID	(1<<1)
-#define KI_VALID_GUID	(1<<2)
-#define KI_VALID_NTSID	(1<<3)
-#define KI_VALID_PWNAM	(1<<4)	/* Used for translation */
-#define KI_VALID_GRNAM	(1<<5)	/* Used for translation */
+#define KI_VALID_UID    (1<<0)          /* UID and GID are mutually exclusive */
+#define KI_VALID_GID    (1<<1)
+#define KI_VALID_GUID   (1<<2)
+#define KI_VALID_NTSID  (1<<3)
+#define KI_VALID_PWNAM  (1<<4)  /* Used for translation */
+#define KI_VALID_GRNAM  (1<<5)  /* Used for translation */
 #define KI_VALID_GROUPS (1<<6)
 
 #if CONFIG_EXT_RESOLVER
-/*
- * kauth_identity_init
- *
- * Description:	Initialize the kernel side of the credential identity resolver
- *
- * Parameters:	(void)
- *
- * Returns:	(void)
- *
- * Notes:	Initialize the credential identity resolver for use; the
- *		credential identity resolver is the KPI used to communicate
- *		with a user space credential identity resolver daemon.
- *
- *		This function is called from kauth_init() in the file
- *		kern_authorization.c.
- */
-void
-kauth_identity_init(void)
-{
-	TAILQ_INIT(&kauth_identities);
-	kauth_identity_mtx = lck_mtx_alloc_init(kauth_lck_grp, 0/*LCK_ATTR_NULL*/);
-}
-
-
 /*
  * kauth_identity_alloc
  *
@@ -1117,7 +1057,7 @@ kauth_identity_init(void)
  * Parameters:	uid
  *
  * Returns:	NULL				Insufficient memory to satisfy
- *						the request
+ *						the request or bad parameters
  *		!NULL				A pointer to the allocated
  *						structure, filled in
  *
@@ -1127,50 +1067,57 @@ kauth_identity_init(void)
  */
 static struct kauth_identity *
 kauth_identity_alloc(uid_t uid, gid_t gid, guid_t *guidp, time_t guid_expiry,
-	ntsid_t *ntsidp, time_t ntsid_expiry, int supgrpcnt, gid_t *supgrps, time_t groups_expiry,
-	const char *name, int nametype)
+    ntsid_t *ntsidp, time_t ntsid_expiry, size_t supgrpcnt, gid_t *supgrps, time_t groups_expiry,
+    const char *name, int nametype)
 {
 	struct kauth_identity *kip;
-	
+
 	/* get and fill in a new identity */
-	MALLOC(kip, struct kauth_identity *, sizeof(*kip), M_KAUTH, M_WAITOK | M_ZERO);
-	if (kip != NULL) {
-		if (gid != KAUTH_GID_NONE) {
-			kip->ki_gid = gid;
-			kip->ki_valid = KI_VALID_GID;
-		}
-		if (uid != KAUTH_UID_NONE) {
-			if (kip->ki_valid & KI_VALID_GID)
-				panic("can't allocate kauth identity with both uid and gid");
-			kip->ki_uid = uid;
-			kip->ki_valid = KI_VALID_UID;
-		}
-		if (supgrpcnt) {
-			assert(supgrpcnt <= NGROUPS);
-			assert(supgrps != NULL);
-			if (kip->ki_valid & KI_VALID_GID)
-				panic("can't allocate kauth identity with both gid and supplementary groups");
-			kip->ki_supgrpcnt = supgrpcnt;
-			memcpy(kip->ki_supgrps, supgrps, sizeof(supgrps[0]) * supgrpcnt);
-			kip->ki_valid |= KI_VALID_GROUPS;
-		}
-		kip->ki_groups_expiry = groups_expiry;
-		if (guidp != NULL) {
-			kip->ki_guid = *guidp;
-			kip->ki_valid |= KI_VALID_GUID;
-		}
-		kip->ki_guid_expiry = guid_expiry;
-		if (ntsidp != NULL) {
-			kip->ki_ntsid = *ntsidp;
-			kip->ki_valid |= KI_VALID_NTSID;
-		}
-		kip->ki_ntsid_expiry = ntsid_expiry;
-		if (name != NULL) {
-			kip->ki_name = name;
-			kip->ki_valid |= nametype;
-		}
+	kip = kalloc_type(struct kauth_identity, Z_WAITOK | Z_ZERO | Z_NOFAIL);
+	if (gid != KAUTH_GID_NONE) {
+		kip->ki_gid = gid;
+		kip->ki_valid = KI_VALID_GID;
 	}
-	return(kip);
+	if (uid != KAUTH_UID_NONE) {
+		if (kip->ki_valid & KI_VALID_GID) {
+			panic("can't allocate kauth identity with both uid and gid");
+		}
+		kip->ki_uid = uid;
+		kip->ki_valid = KI_VALID_UID;
+	}
+	if (supgrpcnt) {
+		/*
+		 * A malicious/faulty resolver could return bad values
+		 */
+		assert(supgrpcnt <= NGROUPS);
+		assert(supgrps != NULL);
+
+		if ((supgrpcnt > NGROUPS) || (supgrps == NULL)) {
+			return NULL;
+		}
+		if (kip->ki_valid & KI_VALID_GID) {
+			panic("can't allocate kauth identity with both gid and supplementary groups");
+		}
+		kip->ki_supgrpcnt = (uint32_t)supgrpcnt;
+		memcpy(kip->ki_supgrps, supgrps, sizeof(supgrps[0]) * supgrpcnt);
+		kip->ki_valid |= KI_VALID_GROUPS;
+	}
+	kip->ki_groups_expiry = groups_expiry;
+	if (guidp != NULL) {
+		kip->ki_guid = *guidp;
+		kip->ki_valid |= KI_VALID_GUID;
+	}
+	kip->ki_guid_expiry = guid_expiry;
+	if (ntsidp != NULL) {
+		kip->ki_ntsid = *ntsidp;
+		kip->ki_valid |= KI_VALID_NTSID;
+	}
+	kip->ki_ntsid_expiry = ntsid_expiry;
+	if (name != NULL) {
+		kip->ki_name = name;
+		kip->ki_valid |= nametype;
+	}
+	return kip;
 }
 
 
@@ -1200,19 +1147,22 @@ kauth_identity_register_and_free(struct kauth_identity *kip)
 	ip = NULL;
 	KAUTH_IDENTITY_LOCK();
 	if (kip->ki_valid & KI_VALID_UID) {
-		if (kip->ki_valid & KI_VALID_GID)
+		if (kip->ki_valid & KI_VALID_GID) {
 			panic("kauth_identity: can't insert record with both UID and GID as key");
+		}
 		TAILQ_FOREACH(ip, &kauth_identities, ki_link)
-		    if ((ip->ki_valid & KI_VALID_UID) && (ip->ki_uid == kip->ki_uid))
-				break;
+		if ((ip->ki_valid & KI_VALID_UID) && (ip->ki_uid == kip->ki_uid)) {
+			break;
+		}
 	} else if (kip->ki_valid & KI_VALID_GID) {
 		TAILQ_FOREACH(ip, &kauth_identities, ki_link)
-		    if ((ip->ki_valid & KI_VALID_GID) && (ip->ki_gid == kip->ki_gid))
-				break;
+		if ((ip->ki_valid & KI_VALID_GID) && (ip->ki_gid == kip->ki_gid)) {
+			break;
+		}
 	} else {
 		panic("kauth_identity: can't insert record without UID or GID as key");
 	}
-		
+
 	if (ip != NULL) {
 		/* we already have an entry, merge/overwrite */
 		if (kip->ki_valid & KI_VALID_GUID) {
@@ -1229,8 +1179,9 @@ kauth_identity_register_and_free(struct kauth_identity *kip)
 		if (kip->ki_valid & (KI_VALID_PWNAM | KI_VALID_GRNAM)) {
 			/* if there's an old one, discard it */
 			const char *oname = NULL;
-			if (ip->ki_valid & (KI_VALID_PWNAM | KI_VALID_GRNAM))
+			if (ip->ki_valid & (KI_VALID_PWNAM | KI_VALID_GRNAM)) {
 				oname = ip->ki_name;
+			}
 			ip->ki_name = kip->ki_name;
 			kip->ki_name = oname;
 		}
@@ -1252,10 +1203,11 @@ kauth_identity_register_and_free(struct kauth_identity *kip)
 	/* have to drop lock before freeing expired entry (it may be in use) */
 	if (ip != NULL) {
 		/* if the ki_name field is used, clear it first */
-		if (ip->ki_valid & (KI_VALID_PWNAM | KI_VALID_GRNAM))
+		if (ip->ki_valid & (KI_VALID_PWNAM | KI_VALID_GRNAM)) {
 			vfs_removename(ip->ki_name);
+		}
 		/* free the expired entry */
-		FREE(ip, M_KAUTH);
+		kfree_type(struct kauth_identity, ip);
 	}
 }
 
@@ -1306,10 +1258,10 @@ kauth_identity_updatecache(struct kauth_identity_extlookup *elp, struct kauth_id
 	 * over the allocation later.
 	 */
 	if (elp->el_flags & (KAUTH_EXTLOOKUP_VALID_PWNAM | KAUTH_EXTLOOKUP_VALID_GRNAM)) {
-		const char *tmp = CAST_DOWN(const char *,extend_data);
-		speculative_name = vfs_addname(tmp, strnlen(tmp, MAXPATHLEN - 1), 0, 0);
+		const char *tmp = CAST_DOWN(const char *, extend_data);
+		speculative_name = vfs_addname(tmp, (uint32_t)strnlen(tmp, MAXPATHLEN - 1), 0, 0);
 	}
-	
+
 	/* user identity? */
 	if (elp->el_flags & KAUTH_EXTLOOKUP_VALID_UID) {
 		KAUTH_IDENTITY_LOCK();
@@ -1318,6 +1270,11 @@ kauth_identity_updatecache(struct kauth_identity_extlookup *elp, struct kauth_id
 			if ((kip->ki_valid & KI_VALID_UID) && (kip->ki_uid == elp->el_uid)) {
 				if (elp->el_flags & KAUTH_EXTLOOKUP_VALID_SUPGRPS) {
 					assert(elp->el_sup_grp_cnt <= NGROUPS);
+					if (elp->el_sup_grp_cnt > NGROUPS) {
+						KAUTH_DEBUG("CACHE - invalid sup_grp_cnt provided (%d), truncating to  %d",
+						    elp->el_sup_grp_cnt, NGROUPS);
+						elp->el_sup_grp_cnt = NGROUPS;
+					}
 					kip->ki_supgrpcnt = elp->el_sup_grp_cnt;
 					memcpy(kip->ki_supgrps, elp->el_sup_groups, sizeof(elp->el_sup_groups[0]) * kip->ki_supgrpcnt);
 					kip->ki_valid |= KI_VALID_GROUPS;
@@ -1347,8 +1304,9 @@ kauth_identity_updatecache(struct kauth_identity_extlookup *elp, struct kauth_id
 					}
 				}
 				kauth_identity_lru(kip);
-				if (rkip != NULL)
+				if (rkip != NULL) {
 					*rkip = *kip;
+				}
 				KAUTH_DEBUG("CACHE - refreshed %d is " K_UUID_FMT, kip->ki_uid, K_UUID_ARG(kip->ki_guid));
 				break;
 			}
@@ -1367,10 +1325,12 @@ kauth_identity_updatecache(struct kauth_identity_extlookup *elp, struct kauth_id
 			    (elp->el_flags & KAUTH_EXTLOOKUP_VALID_PWNAM) ? speculative_name : NULL,
 			    KI_VALID_PWNAM);
 			if (kip != NULL) {
-				if (rkip != NULL)
+				if (rkip != NULL) {
 					*rkip = *kip;
-				if (elp->el_flags & KAUTH_EXTLOOKUP_VALID_PWNAM)
+				}
+				if (elp->el_flags & KAUTH_EXTLOOKUP_VALID_PWNAM) {
 					speculative_name = NULL;
+				}
 				KAUTH_DEBUG("CACHE - learned %d is " K_UUID_FMT, kip->ki_uid, K_UUID_ARG(kip->ki_guid));
 				kauth_identity_register_and_free(kip);
 			}
@@ -1407,8 +1367,9 @@ kauth_identity_updatecache(struct kauth_identity_extlookup *elp, struct kauth_id
 					}
 				}
 				kauth_identity_lru(kip);
-				if (rkip != NULL)
+				if (rkip != NULL) {
 					*rkip = *kip;
+				}
 				KAUTH_DEBUG("CACHE - refreshed %d is " K_UUID_FMT, kip->ki_uid, K_UUID_ARG(kip->ki_guid));
 				break;
 			}
@@ -1427,10 +1388,12 @@ kauth_identity_updatecache(struct kauth_identity_extlookup *elp, struct kauth_id
 			    (elp->el_flags & KAUTH_EXTLOOKUP_VALID_GRNAM) ? speculative_name : NULL,
 			    KI_VALID_GRNAM);
 			if (kip != NULL) {
-				if (rkip != NULL)
+				if (rkip != NULL) {
 					*rkip = *kip;
-				if (elp->el_flags & KAUTH_EXTLOOKUP_VALID_GRNAM)
+				}
+				if (elp->el_flags & KAUTH_EXTLOOKUP_VALID_GRNAM) {
 					speculative_name = NULL;
+				}
 				KAUTH_DEBUG("CACHE - learned %d is " K_UUID_FMT, kip->ki_uid, K_UUID_ARG(kip->ki_guid));
 				kauth_identity_register_and_free(kip);
 			}
@@ -1450,16 +1413,17 @@ kauth_identity_updatecache(struct kauth_identity_extlookup *elp, struct kauth_id
  * Must be called with the identity cache lock held.
  */
 static void
-kauth_identity_trimcache(int newsize) {
-	struct kauth_identity 		*kip;
-	
-	lck_mtx_assert(kauth_identity_mtx, LCK_MTX_ASSERT_OWNED);
-		
+kauth_identity_trimcache(int newsize)
+{
+	struct kauth_identity           *kip;
+
+	lck_mtx_assert(&kauth_identity_mtx, LCK_MTX_ASSERT_OWNED);
+
 	while (kauth_identity_count > newsize) {
 		kip = TAILQ_LAST(&kauth_identities, kauth_identity_head);
 		TAILQ_REMOVE(&kauth_identities, kip, ki_link);
 		kauth_identity_count--;
-		FREE(kip, M_KAUTH);
+		kfree_type(struct kauth_identity, kip);
 	}
 }
 
@@ -1509,13 +1473,14 @@ kauth_identity_guid_expired(struct kauth_identity *kip)
 	/*
 	 * Expiration time of 0 means this entry is persistent.
 	 */
-	if (kip->ki_guid_expiry == 0)
-		return (0);
+	if (kip->ki_guid_expiry == 0) {
+		return 0;
+	}
 
 	microuptime(&tv);
 	KAUTH_DEBUG("CACHE - GUID expires @ %ld now %ld", kip->ki_guid_expiry, tv.tv_sec);
 
-	return((kip->ki_guid_expiry <= tv.tv_sec) ? 1 : 0);
+	return (kip->ki_guid_expiry <= tv.tv_sec) ? 1 : 0;
 }
 
 
@@ -1538,13 +1503,14 @@ kauth_identity_ntsid_expired(struct kauth_identity *kip)
 	/*
 	 * Expiration time of 0 means this entry is persistent.
 	 */
-	if (kip->ki_ntsid_expiry == 0)
-		return (0);
+	if (kip->ki_ntsid_expiry == 0) {
+		return 0;
+	}
 
 	microuptime(&tv);
 	KAUTH_DEBUG("CACHE - NTSID expires @ %ld now %ld", kip->ki_ntsid_expiry, tv.tv_sec);
 
-	return((kip->ki_ntsid_expiry <= tv.tv_sec) ? 1 : 0);
+	return (kip->ki_ntsid_expiry <= tv.tv_sec) ? 1 : 0;
 }
 
 /*
@@ -1566,13 +1532,14 @@ kauth_identity_groups_expired(struct kauth_identity *kip)
 	/*
 	 * Expiration time of 0 means this entry is persistent.
 	 */
-	if (kip->ki_groups_expiry == 0)
-		return (0);
+	if (kip->ki_groups_expiry == 0) {
+		return 0;
+	}
 
 	microuptime(&tv);
 	KAUTH_DEBUG("CACHE - GROUPS expires @ %ld now %ld\n", kip->ki_groups_expiry, tv.tv_sec);
 
-	return((kip->ki_groups_expiry <= tv.tv_sec) ? 1 : 0);
+	return (kip->ki_groups_expiry <= tv.tv_sec) ? 1 : 0;
 }
 
 /*
@@ -1602,13 +1569,14 @@ kauth_identity_find_uid(uid_t uid, struct kauth_identity *kir, char *getname)
 			/* Copy via structure assignment */
 			*kir = *kip;
 			/* If a name is wanted and one exists, copy it out */
-			if (getname != NULL && (kip->ki_valid & (KI_VALID_PWNAM | KI_VALID_GRNAM)))
+			if (getname != NULL && (kip->ki_valid & (KI_VALID_PWNAM | KI_VALID_GRNAM))) {
 				strlcpy(getname, kip->ki_name, MAXPATHLEN);
+			}
 			break;
 		}
 	}
 	KAUTH_IDENTITY_UNLOCK();
-	return((kip == NULL) ? ENOENT : 0);
+	return (kip == NULL) ? ENOENT : 0;
 }
 
 
@@ -1639,13 +1607,14 @@ kauth_identity_find_gid(uid_t gid, struct kauth_identity *kir, char *getname)
 			/* Copy via structure assignment */
 			*kir = *kip;
 			/* If a name is wanted and one exists, copy it out */
-			if (getname != NULL && (kip->ki_valid & (KI_VALID_PWNAM | KI_VALID_GRNAM)))
+			if (getname != NULL && (kip->ki_valid & (KI_VALID_PWNAM | KI_VALID_GRNAM))) {
 				strlcpy(getname, kip->ki_name, MAXPATHLEN);
+			}
 			break;
 		}
 	}
 	KAUTH_IDENTITY_UNLOCK();
-	return((kip == NULL) ? ENOENT : 0);
+	return (kip == NULL) ? ENOENT : 0;
 }
 
 
@@ -1679,13 +1648,14 @@ kauth_identity_find_guid(guid_t *guidp, struct kauth_identity *kir, char *getnam
 			/* Copy via structure assignment */
 			*kir = *kip;
 			/* If a name is wanted and one exists, copy it out */
-			if (getname != NULL && (kip->ki_valid & (KI_VALID_PWNAM | KI_VALID_GRNAM)))
+			if (getname != NULL && (kip->ki_valid & (KI_VALID_PWNAM | KI_VALID_GRNAM))) {
 				strlcpy(getname, kip->ki_name, MAXPATHLEN);
+			}
 			break;
 		}
 	}
 	KAUTH_IDENTITY_UNLOCK();
-	return((kip == NULL) ? ENOENT : 0);
+	return (kip == NULL) ? ENOENT : 0;
 }
 
 /*
@@ -1718,7 +1688,7 @@ kauth_identity_find_nam(char *name, int valid, struct kauth_identity *kir)
 		}
 	}
 	KAUTH_IDENTITY_UNLOCK();
-	return((kip == NULL) ? ENOENT : 0);
+	return (kip == NULL) ? ENOENT : 0;
 }
 
 
@@ -1752,15 +1722,16 @@ kauth_identity_find_ntsid(ntsid_t *ntsid, struct kauth_identity *kir, char *getn
 			/* Copy via structure assignment */
 			*kir = *kip;
 			/* If a name is wanted and one exists, copy it out */
-			if (getname != NULL && (kip->ki_valid & (KI_VALID_PWNAM | KI_VALID_GRNAM)))
+			if (getname != NULL && (kip->ki_valid & (KI_VALID_PWNAM | KI_VALID_GRNAM))) {
 				strlcpy(getname, kip->ki_name, MAXPATHLEN);
+			}
 			break;
 		}
 	}
 	KAUTH_IDENTITY_UNLOCK();
-	return((kip == NULL) ? ENOENT : 0);
+	return (kip == NULL) ? ENOENT : 0;
 }
-#endif	/* CONFIG_EXT_RESOLVER */
+#endif  /* CONFIG_EXT_RESOLVER */
 
 
 /*
@@ -1783,7 +1754,7 @@ guid_t kauth_null_guid;
 int
 kauth_guid_equal(guid_t *guid1, guid_t *guid2)
 {
-	return(bcmp(guid1, guid2, sizeof(*guid1)) == 0);
+	return bcmp(guid1, guid2, sizeof(*guid1)) == 0;
 }
 
 
@@ -1803,8 +1774,8 @@ kauth_guid_equal(guid_t *guid1, guid_t *guid2)
 int
 kauth_wellknown_guid(guid_t *guid)
 {
-	static char	fingerprint[] = {0xab, 0xcd, 0xef, 0xab, 0xcd, 0xef, 0xab, 0xcd, 0xef, 0xab, 0xcd, 0xef};
-	uint32_t		code;
+	static char     fingerprint[] = {0xab, 0xcd, 0xef, 0xab, 0xcd, 0xef, 0xab, 0xcd, 0xef, 0xab, 0xcd, 0xef};
+	uint32_t                code;
 	/*
 	 * All WKGs begin with the same 12 bytes.
 	 */
@@ -1813,25 +1784,25 @@ kauth_wellknown_guid(guid_t *guid)
 		 * The final 4 bytes are our code (in network byte order).
 		 */
 		code = OSSwapHostToBigInt32(*(uint32_t *)&guid->g_guid[12]);
-		switch(code) {
+		switch (code) {
 		case 0x0000000c:
-			return(KAUTH_WKG_EVERYBODY);
+			return KAUTH_WKG_EVERYBODY;
 		case 0xfffffffe:
-			return(KAUTH_WKG_NOBODY);
+			return KAUTH_WKG_NOBODY;
 		case 0x0000000a:
-			return(KAUTH_WKG_OWNER);
+			return KAUTH_WKG_OWNER;
 		case 0x00000010:
-			return(KAUTH_WKG_GROUP);
+			return KAUTH_WKG_GROUP;
 		}
 	}
-	return(KAUTH_WKG_NOT);
+	return KAUTH_WKG_NOT;
 }
 
 
 /*
  * kauth_ntsid_equal
  *
- * Description:	Determine the equality of two NTSIDs (NT Security Identifiers) 
+ * Description:	Determine the equality of two NTSIDs (NT Security Identifiers)
  *
  * Parameters:	sid1				Pointer to first NTSID
  *		sid2				Pointer to second NTSID
@@ -1845,9 +1816,10 @@ kauth_ntsid_equal(ntsid_t *sid1, ntsid_t *sid2)
 	/* check sizes for equality, also sanity-check size while we're at it */
 	if ((KAUTH_NTSID_SIZE(sid1) == KAUTH_NTSID_SIZE(sid2)) &&
 	    (KAUTH_NTSID_SIZE(sid1) <= sizeof(*sid1)) &&
-	    bcmp(sid1, sid2, KAUTH_NTSID_SIZE(sid1)) == 0)
-		return(1);
-	return(0);
+	    bcmp(sid1, sid2, KAUTH_NTSID_SIZE(sid1)) == 0) {
+		return 1;
+	}
+	return 0;
 }
 
 
@@ -1892,12 +1864,12 @@ kauth_ntsid_equal(ntsid_t *sid1, ntsid_t *sid2)
 static int
 kauth_cred_change_egid(kauth_cred_t cred, gid_t new_egid)
 {
-	int	i;
-	int	displaced = 1;
+	int     i;
+	int     displaced = 1;
 #if radar_4600026
-	int	is_member;
-#endif	/* radar_4600026 */
-	gid_t	old_egid = kauth_cred_getgid(cred);
+	int     is_member;
+#endif  /* radar_4600026 */
+	gid_t   old_egid = kauth_cred_getgid(cred);
 	posix_cred_t pcred = posix_cred_get(cred);
 
 	/* Ignoring the first entry, scan for a match for the new egid */
@@ -1908,7 +1880,6 @@ kauth_cred_change_egid(kauth_cred_t cred, gid_t new_egid)
 		 */
 		if (pcred->cr_groups[i] == new_egid) {
 			pcred->cr_groups[i] = old_egid;
-			DEBUG_CRED_CHANGE("kauth_cred_change_egid: unset displaced\n");
 			displaced = 0;
 			break;
 		}
@@ -1918,12 +1889,12 @@ kauth_cred_change_egid(kauth_cred_t cred, gid_t new_egid)
 #error Fix radar 4600026 first!!!
 
 /*
-This is correct for memberd behaviour, but incorrect for POSIX; to address
-this, we would need to automatically opt-out any SUID/SGID binary, and force
-it to use initgroups to opt back in.  We take the approach of considering it
-opt'ed out in any group of 16 displacement instead, since it's a much more
-conservative approach (i.e. less likely to cause things to break).
-*/
+ *  This is correct for memberd behaviour, but incorrect for POSIX; to address
+ *  this, we would need to automatically opt-out any SUID/SGID binary, and force
+ *  it to use initgroups to opt back in.  We take the approach of considering it
+ *  opt'ed out in any group of 16 displacement instead, since it's a much more
+ *  conservative approach (i.e. less likely to cause things to break).
+ */
 
 	/*
 	 * If we displaced a member of the supplementary groups list of the
@@ -1936,142 +1907,129 @@ conservative approach (i.e. less likely to cause things to break).
 	if (displaced && !(pcred->cr_flags & CRF_NOMEMBERD) &&
 	    kauth_cred_ismember_gid(cred, new_egid, &is_member) == 0 &&
 	    is_member) {
-	    	displaced = 0;
-		DEBUG_CRED_CHANGE("kauth_cred_change_egid: reset displaced\n");
+		displaced = 0;
 	}
-#endif	/* radar_4600026 */
+#endif  /* radar_4600026 */
 
 	/* set the new EGID into the old spot */
 	pcred->cr_groups[0] = new_egid;
 
-	return (displaced);
+	return displaced;
 }
 
 
-/*
- * kauth_cred_getuid
- *
- * Description:	Fetch UID from credential
- *
- * Parameters:	cred				Credential to examine
- *
- * Returns:	(uid_t)				UID associated with credential
- */
 uid_t
 kauth_cred_getuid(kauth_cred_t cred)
 {
-	NULLCRED_CHECK(cred);
-	return(posix_cred_get(cred)->cr_uid);
+	return posix_cred_get(cred)->cr_uid;
 }
 
-
-/*
- * kauth_cred_getruid
- *
- * Description:	Fetch RUID from credential
- *
- * Parameters:	cred				Credential to examine
- *
- * Returns:	(uid_t)				RUID associated with credential
- */
 uid_t
 kauth_cred_getruid(kauth_cred_t cred)
 {
-	NULLCRED_CHECK(cred);
-	return(posix_cred_get(cred)->cr_ruid);
+	return posix_cred_get(cred)->cr_ruid;
 }
 
-
-/*
- * kauth_cred_getsvuid
- *
- * Description:	Fetch SVUID from credential
- *
- * Parameters:	cred				Credential to examine
- *
- * Returns:	(uid_t)				SVUID associated with credential
- */
 uid_t
 kauth_cred_getsvuid(kauth_cred_t cred)
 {
-	NULLCRED_CHECK(cred);
-	return(posix_cred_get(cred)->cr_svuid);
+	return posix_cred_get(cred)->cr_svuid;
 }
 
 
-/*
- * kauth_cred_getgid
- *
- * Description:	Fetch GID from credential
- *
- * Parameters:	cred				Credential to examine
- *
- * Returns:	(gid_t)				GID associated with credential
- */
 gid_t
 kauth_cred_getgid(kauth_cred_t cred)
 {
-	NULLCRED_CHECK(cred);
-	return(posix_cred_get(cred)->cr_gid);
+	return posix_cred_get(cred)->cr_gid;
 }
 
-
-/*
- * kauth_cred_getrgid
- *
- * Description:	Fetch RGID from credential
- *
- * Parameters:	cred				Credential to examine
- *
- * Returns:	(gid_t)				RGID associated with credential
- */
 gid_t
 kauth_cred_getrgid(kauth_cred_t cred)
 {
-	NULLCRED_CHECK(cred);
-	return(posix_cred_get(cred)->cr_rgid);
+	return posix_cred_get(cred)->cr_rgid;
 }
 
-
-/*
- * kauth_cred_getsvgid
- *
- * Description:	Fetch SVGID from credential
- *
- * Parameters:	cred				Credential to examine
- *
- * Returns:	(gid_t)				SVGID associated with credential
- */
 gid_t
 kauth_cred_getsvgid(kauth_cred_t cred)
 {
-	NULLCRED_CHECK(cred);
-	return(posix_cred_get(cred)->cr_svgid);
+	return posix_cred_get(cred)->cr_svgid;
 }
 
 
-static int	kauth_cred_cache_lookup(int from, int to, void *src, void *dst);
+static int      kauth_cred_cache_lookup(int from, int to, void *src, void *dst);
 
 #if CONFIG_EXT_RESOLVER == 0
 /*
- * If there's no resolver, short-circuit the kauth_cred_x2y() lookups.
+ * If there's no resolver, only support a subset of the kauth_cred_x2y() lookups.
  */
 static __inline int
-kauth_cred_cache_lookup(__unused int from, __unused int to,
-	__unused void *src, __unused void *dst)
+kauth_cred_cache_lookup(int from, int to, void *src, void *dst)
 {
-	return (EWOULDBLOCK);
+	/* NB: These must match the definitions used by Libinfo's mbr_identifier_translate(). */
+	static const uuid_t _user_compat_prefix = {0xff, 0xff, 0xee, 0xee, 0xdd, 0xdd, 0xcc, 0xcc, 0xbb, 0xbb, 0xaa, 0xaa, 0x00, 0x00, 0x00, 0x00};
+	static const uuid_t _group_compat_prefix = {0xab, 0xcd, 0xef, 0xab, 0xcd, 0xef, 0xab, 0xcd, 0xef, 0xab, 0xcd, 0xef, 0x00, 0x00, 0x00, 0x00};
+#define COMPAT_PREFIX_LEN       (sizeof(uuid_t) - sizeof(id_t))
 
+	assert(from != to);
+
+	switch (from) {
+	case KI_VALID_UID: {
+		id_t uid = htonl(*(id_t *)src);
+
+		if (to == KI_VALID_GUID) {
+			uint8_t *uu = dst;
+			memcpy(uu, _user_compat_prefix, sizeof(_user_compat_prefix));
+			memcpy(&uu[COMPAT_PREFIX_LEN], &uid, sizeof(uid));
+			return 0;
+		}
+		break;
+	}
+	case KI_VALID_GID: {
+		id_t gid = htonl(*(id_t *)src);
+
+		if (to == KI_VALID_GUID) {
+			uint8_t *uu = dst;
+			memcpy(uu, _group_compat_prefix, sizeof(_group_compat_prefix));
+			memcpy(&uu[COMPAT_PREFIX_LEN], &gid, sizeof(gid));
+			return 0;
+		}
+		break;
+	}
+	case KI_VALID_GUID: {
+		const uint8_t *uu = src;
+
+		if (to == KI_VALID_UID) {
+			if (memcmp(uu, _user_compat_prefix, COMPAT_PREFIX_LEN) == 0) {
+				id_t uid;
+				memcpy(&uid, &uu[COMPAT_PREFIX_LEN], sizeof(uid));
+				*(id_t *)dst = ntohl(uid);
+				return 0;
+			}
+		} else if (to == KI_VALID_GID) {
+			if (memcmp(uu, _group_compat_prefix, COMPAT_PREFIX_LEN) == 0) {
+				id_t gid;
+				memcpy(&gid, &uu[COMPAT_PREFIX_LEN], sizeof(gid));
+				*(id_t *)dst = ntohl(gid);
+				return 0;
+			}
+		}
+		break;
+	}
+	default:
+		/* NOT IMPLEMENTED */
+		break;
+	}
+	return ENOENT;
 }
 #endif
 
 #if defined(CONFIG_EXT_RESOLVER) && (CONFIG_EXT_RESOLVER)
 /*
- * Structure to hold supplemental groups. Used for impedance matching with 
+ * Structure to hold supplemental groups. Used for impedance matching with
  * kauth_cred_cache_lookup below.
  */
 struct supgroups {
-	int *count;
+	size_t *count;
 	gid_t *groups;
 };
 
@@ -2093,7 +2051,7 @@ struct supgroups {
  *
  */
 static int
-kauth_cred_uid2groups(uid_t *uid, gid_t *groups, int *gcount)
+kauth_cred_uid2groups(uid_t *uid, gid_t *groups, size_t *gcount)
 {
 	int rv;
 
@@ -2103,7 +2061,7 @@ kauth_cred_uid2groups(uid_t *uid, gid_t *groups, int *gcount)
 
 	rv = kauth_cred_cache_lookup(KI_VALID_UID, KI_VALID_GROUPS, uid, &supgroups);
 
-	return (rv);
+	return rv;
 }
 #endif
 
@@ -2126,7 +2084,7 @@ kauth_cred_uid2groups(uid_t *uid, gid_t *groups, int *gcount)
 int
 kauth_cred_guid2pwnam(guid_t *guidp, char *pwnam)
 {
-	return(kauth_cred_cache_lookup(KI_VALID_GUID, KI_VALID_PWNAM, guidp, pwnam));
+	return kauth_cred_cache_lookup(KI_VALID_GUID, KI_VALID_PWNAM, guidp, pwnam);
 }
 
 
@@ -2149,7 +2107,7 @@ kauth_cred_guid2pwnam(guid_t *guidp, char *pwnam)
 int
 kauth_cred_guid2grnam(guid_t *guidp, char *grnam)
 {
-	return(kauth_cred_cache_lookup(KI_VALID_GUID, KI_VALID_GRNAM, guidp, grnam));
+	return kauth_cred_cache_lookup(KI_VALID_GUID, KI_VALID_GRNAM, guidp, grnam);
 }
 
 
@@ -2173,7 +2131,7 @@ kauth_cred_guid2grnam(guid_t *guidp, char *grnam)
 int
 kauth_cred_pwnam2guid(char *pwnam, guid_t *guidp)
 {
-	return(kauth_cred_cache_lookup(KI_VALID_PWNAM, KI_VALID_GUID, pwnam, guidp));
+	return kauth_cred_cache_lookup(KI_VALID_PWNAM, KI_VALID_GUID, pwnam, guidp);
 }
 
 
@@ -2197,7 +2155,7 @@ kauth_cred_pwnam2guid(char *pwnam, guid_t *guidp)
 int
 kauth_cred_grnam2guid(char *grnam, guid_t *guidp)
 {
-	return(kauth_cred_cache_lookup(KI_VALID_GRNAM, KI_VALID_GUID, grnam, guidp));
+	return kauth_cred_cache_lookup(KI_VALID_GRNAM, KI_VALID_GUID, grnam, guidp);
 }
 
 
@@ -2218,7 +2176,7 @@ kauth_cred_grnam2guid(char *grnam, guid_t *guidp)
 int
 kauth_cred_guid2uid(guid_t *guidp, uid_t *uidp)
 {
-	return(kauth_cred_cache_lookup(KI_VALID_GUID, KI_VALID_UID, guidp, uidp));
+	return kauth_cred_cache_lookup(KI_VALID_GUID, KI_VALID_UID, guidp, uidp);
 }
 
 
@@ -2239,9 +2197,48 @@ kauth_cred_guid2uid(guid_t *guidp, uid_t *uidp)
 int
 kauth_cred_guid2gid(guid_t *guidp, gid_t *gidp)
 {
-	return(kauth_cred_cache_lookup(KI_VALID_GUID, KI_VALID_GID, guidp, gidp));
+	return kauth_cred_cache_lookup(KI_VALID_GUID, KI_VALID_GID, guidp, gidp);
 }
 
+/*
+ * kauth_cred_nfs4domain2dsnode
+ *
+ * Description: Fetch dsnode from nfs4domain
+ *
+ * Parameters:	nfs4domain			Pointer to a string nfs4 domain
+ *		dsnode				Pointer to buffer for dsnode
+ *
+ * Returns:	0				Success
+ *		ENOENT				For now just a stub that always fails
+ *
+ * Implicit returns:
+ *		*dsnode				Modified, if successuful
+ */
+int
+kauth_cred_nfs4domain2dsnode(__unused char *nfs4domain, __unused char *dsnode)
+{
+	return ENOENT;
+}
+
+/*
+ * kauth_cred_dsnode2nfs4domain
+ *
+ * Description: Fetch nfs4domain from dsnode
+ *
+ * Parameters:	nfs4domain			Pointer to  string dsnode
+ *		dsnode				Pointer to buffer for nfs4domain
+ *
+ * Returns:	0				Success
+ *		ENOENT				For now just a stub that always fails
+ *
+ * Implicit returns:
+ *		*nfs4domain			Modified, if successuful
+ */
+int
+kauth_cred_dsnode2nfs4domain(__unused char *dsnode, __unused char *nfs4domain)
+{
+	return ENOENT;
+}
 
 /*
  * kauth_cred_ntsid2uid
@@ -2260,7 +2257,7 @@ kauth_cred_guid2gid(guid_t *guidp, gid_t *gidp)
 int
 kauth_cred_ntsid2uid(ntsid_t *sidp, uid_t *uidp)
 {
-	return(kauth_cred_cache_lookup(KI_VALID_NTSID, KI_VALID_UID, sidp, uidp));
+	return kauth_cred_cache_lookup(KI_VALID_NTSID, KI_VALID_UID, sidp, uidp);
 }
 
 
@@ -2281,7 +2278,7 @@ kauth_cred_ntsid2uid(ntsid_t *sidp, uid_t *uidp)
 int
 kauth_cred_ntsid2gid(ntsid_t *sidp, gid_t *gidp)
 {
-	return(kauth_cred_cache_lookup(KI_VALID_NTSID, KI_VALID_GID, sidp, gidp));
+	return kauth_cred_cache_lookup(KI_VALID_NTSID, KI_VALID_GID, sidp, gidp);
 }
 
 
@@ -2302,7 +2299,7 @@ kauth_cred_ntsid2gid(ntsid_t *sidp, gid_t *gidp)
 int
 kauth_cred_ntsid2guid(ntsid_t *sidp, guid_t *guidp)
 {
-	return(kauth_cred_cache_lookup(KI_VALID_NTSID, KI_VALID_GUID, sidp, guidp));
+	return kauth_cred_cache_lookup(KI_VALID_NTSID, KI_VALID_GUID, sidp, guidp);
 }
 
 
@@ -2323,7 +2320,7 @@ kauth_cred_ntsid2guid(ntsid_t *sidp, guid_t *guidp)
 int
 kauth_cred_uid2guid(uid_t uid, guid_t *guidp)
 {
-	return(kauth_cred_cache_lookup(KI_VALID_UID, KI_VALID_GUID, &uid, guidp));
+	return kauth_cred_cache_lookup(KI_VALID_UID, KI_VALID_GUID, &uid, guidp);
 }
 
 
@@ -2344,8 +2341,7 @@ kauth_cred_uid2guid(uid_t uid, guid_t *guidp)
 int
 kauth_cred_getguid(kauth_cred_t cred, guid_t *guidp)
 {
-	NULLCRED_CHECK(cred);
-	return(kauth_cred_uid2guid(kauth_cred_getuid(cred), guidp));
+	return kauth_cred_uid2guid(kauth_cred_getuid(cred), guidp);
 }
 
 
@@ -2366,7 +2362,7 @@ kauth_cred_getguid(kauth_cred_t cred, guid_t *guidp)
 int
 kauth_cred_gid2guid(gid_t gid, guid_t *guidp)
 {
-	return(kauth_cred_cache_lookup(KI_VALID_GID, KI_VALID_GUID, &gid, guidp));
+	return kauth_cred_cache_lookup(KI_VALID_GID, KI_VALID_GUID, &gid, guidp);
 }
 
 
@@ -2387,7 +2383,7 @@ kauth_cred_gid2guid(gid_t gid, guid_t *guidp)
 int
 kauth_cred_uid2ntsid(uid_t uid, ntsid_t *sidp)
 {
-	return(kauth_cred_cache_lookup(KI_VALID_UID, KI_VALID_NTSID, &uid, sidp));
+	return kauth_cred_cache_lookup(KI_VALID_UID, KI_VALID_NTSID, &uid, sidp);
 }
 
 
@@ -2408,8 +2404,7 @@ kauth_cred_uid2ntsid(uid_t uid, ntsid_t *sidp)
 int
 kauth_cred_getntsid(kauth_cred_t cred, ntsid_t *sidp)
 {
-	NULLCRED_CHECK(cred);
-	return(kauth_cred_uid2ntsid(kauth_cred_getuid(cred), sidp));
+	return kauth_cred_uid2ntsid(kauth_cred_getuid(cred), sidp);
 }
 
 
@@ -2430,7 +2425,7 @@ kauth_cred_getntsid(kauth_cred_t cred, ntsid_t *sidp)
 int
 kauth_cred_gid2ntsid(gid_t gid, ntsid_t *sidp)
 {
-	return(kauth_cred_cache_lookup(KI_VALID_GID, KI_VALID_NTSID, &gid, sidp));
+	return kauth_cred_cache_lookup(KI_VALID_GID, KI_VALID_NTSID, &gid, sidp);
 }
 
 
@@ -2451,7 +2446,7 @@ kauth_cred_gid2ntsid(gid_t gid, ntsid_t *sidp)
 int
 kauth_cred_guid2ntsid(guid_t *guidp, ntsid_t *sidp)
 {
-	return(kauth_cred_cache_lookup(KI_VALID_GUID, KI_VALID_NTSID, guidp, sidp));
+	return kauth_cred_cache_lookup(KI_VALID_GUID, KI_VALID_NTSID, guidp, sidp);
 }
 
 
@@ -2484,7 +2479,7 @@ kauth_cred_cache_lookup(int from, int to, void *src, void *dst)
 	char *namebuf = NULL;
 
 	KAUTH_DEBUG("CACHE - translate %d to %d", from, to);
-	
+
 	/*
 	 * Look for an existing cache entry for this association.
 	 * If the entry has not expired, return the cached information.
@@ -2493,10 +2488,14 @@ kauth_cred_cache_lookup(int from, int to, void *src, void *dst)
 	 * atomically.
 	 */
 	if (to == KI_VALID_PWNAM || to == KI_VALID_GRNAM) {
+		if (dst == NULL) {
+			return EINVAL;
+		}
 		namebuf = dst;
+		*namebuf = '\0';
 	}
 	ki.ki_valid = 0;
-	switch(from) {
+	switch (from) {
 	case KI_VALID_UID:
 		error = kauth_identity_find_uid(*(uid_t *)src, &ki, namebuf);
 		break;
@@ -2515,7 +2514,11 @@ kauth_cred_cache_lookup(int from, int to, void *src, void *dst)
 		error = kauth_identity_find_nam((char *)src, from, &ki);
 		break;
 	default:
-		return(EINVAL);
+		return EINVAL;
+	}
+	/* If we didn't get what we're asking for. Call the resolver */
+	if (!error && !(to & ki.ki_valid)) {
+		error = ENOENT;
 	}
 	/* lookup failure or error */
 	if (error != 0) {
@@ -2523,11 +2526,11 @@ kauth_cred_cache_lookup(int from, int to, void *src, void *dst)
 		if (error != ENOENT) {
 			/* XXX bogus check - this is not possible */
 			KAUTH_DEBUG("CACHE - cache search error %d", error);
-			return(error);
+			return error;
 		}
 	} else {
 		/* found a valid cached entry, check expiry */
-		switch(to) {
+		switch (to) {
 		case KI_VALID_GUID:
 			expired = kauth_identity_guid_expired;
 			break;
@@ -2538,7 +2541,7 @@ kauth_cred_cache_lookup(int from, int to, void *src, void *dst)
 			expired = kauth_identity_groups_expired;
 			break;
 		default:
-			switch(from) {
+			switch (from) {
 			case KI_VALID_GUID:
 				expired = kauth_identity_guid_expired;
 				break;
@@ -2565,13 +2568,13 @@ kauth_cred_cache_lookup(int from, int to, void *src, void *dst)
 				 * get a result from the resolver, we will use it as
 				 * a better-than nothing alternative.
 				 */
-				
+
 				KAUTH_DEBUG("CACHE - expired entry found");
 			}
 		} else {
 			KAUTH_DEBUG("CACHE - no expiry function");
 		}
-		
+
 		if (!expired) {
 			/* do we have a translation? */
 			if (ki.ki_valid & to) {
@@ -2580,26 +2583,26 @@ kauth_cred_cache_lookup(int from, int to, void *src, void *dst)
 				goto found;
 			} else {
 				/*
-				 * GUIDs and NTSIDs map to either a UID or a GID, but not both. 
-				 * If we went looking for a translation from GUID or NTSID and 
-				 * found a translation that wasn't for our desired type, then 
-				 * don't bother calling the resolver. We know that this 
+				 * GUIDs and NTSIDs map to either a UID or a GID, but not both.
+				 * If we went looking for a translation from GUID or NTSID and
+				 * found a translation that wasn't for our desired type, then
+				 * don't bother calling the resolver. We know that this
 				 * GUID/NTSID can't translate to our desired type.
 				 */
-				switch(from) {
+				switch (from) {
 				case KI_VALID_GUID:
 				case KI_VALID_NTSID:
-					switch(to) {
+					switch (to) {
 					case KI_VALID_GID:
 						if ((ki.ki_valid & KI_VALID_UID)) {
 							KAUTH_DEBUG("CACHE - unexpected entry 0x%08x & %x", ki.ki_valid, KI_VALID_GID);
-							return (ENOENT);
+							return ENOENT;
 						}
 						break;
 					case KI_VALID_UID:
 						if ((ki.ki_valid & KI_VALID_GID)) {
 							KAUTH_DEBUG("CACHE - unexpected entry 0x%08x & %x", ki.ki_valid, KI_VALID_UID);
-							return (ENOENT);
+							return ENOENT;
 						}
 						break;
 					}
@@ -2619,8 +2622,8 @@ kauth_cred_cache_lookup(int from, int to, void *src, void *dst)
 	 *		data we don't need.
 	 */
 	bzero(&el, sizeof(el));
-	el.el_info_pid = current_proc()->p_pid;
-	switch(from) {
+	el.el_info_pid = proc_getpid(current_proc());
+	switch (from) {
 	case KI_VALID_UID:
 		el.el_flags = KAUTH_EXTLOOKUP_VALID_UID;
 		el.el_uid = *(uid_t *)src;
@@ -2650,7 +2653,7 @@ kauth_cred_cache_lookup(int from, int to, void *src, void *dst)
 		extend_data = CAST_USER_ADDR_T(src);
 		break;
 	default:
-		return(EINVAL);
+		return EINVAL;
 	}
 	/*
 	 * Here we ask for everything all at once, to avoid having to work
@@ -2679,32 +2682,38 @@ kauth_cred_cache_lookup(int from, int to, void *src, void *dst)
 		el.el_flags |= KAUTH_EXTLOOKUP_WANT_SUPGRPS;
 		if (ki.ki_valid & KI_VALID_GROUPS) {
 			/*
-			 * Copy the current supplemental groups for the resolver. 
+			 * Copy the current supplemental groups for the resolver.
 			 * The resolver should check these groups first and if
-			 * the user (uid) is still a member it should endeavor to 
+			 * the user (uid) is still a member it should endeavor to
 			 * keep them in the list. Otherwise NFS clients could get
 			 * changing access to server file system objects on each
 			 * expiration.
 			 */
-			el.el_sup_grp_cnt = ki.ki_supgrpcnt;
+			if (ki.ki_supgrpcnt > NGROUPS) {
+				panic("kauth data structure corrupted. kauth identity 0x%p with %u groups, greater than max of %d",
+				    &ki, ki.ki_supgrpcnt, NGROUPS);
+			}
 
-			memcpy(el.el_sup_groups, ki.ki_supgrps, sizeof (el.el_sup_groups[0]) * ki.ki_supgrpcnt);
+			el.el_sup_grp_cnt = (uint32_t)ki.ki_supgrpcnt;
+
+			memcpy(el.el_sup_groups, ki.ki_supgrps, sizeof(el.el_sup_groups[0]) * ki.ki_supgrpcnt);
 			/* Let the resolver know these were the previous valid groups */
 			el.el_flags |= KAUTH_EXTLOOKUP_VALID_SUPGRPS;
 			KAUTH_DEBUG("GROUPS: Sending previously valid GROUPS");
-		} else
+		} else {
 			KAUTH_DEBUG("GROUPS: no valid groups to send");
+		}
 	}
 
 	/* Call resolver */
 	KAUTH_DEBUG("CACHE - calling resolver for %x", el.el_flags);
 
 	DTRACE_PROC3(kauth__id__resolver__submitted, int, from, int, to, uintptr_t, src);
-	
+
 	error = kauth_resolver_submit(&el, extend_data);
 
 	DTRACE_PROC2(kauth__id__resolver__returned, int, error, struct kauth_identity_extlookup *, &el)
-	
+
 	KAUTH_DEBUG("CACHE - resolver returned %d", error);
 
 	/* was the external lookup successful? */
@@ -2716,10 +2725,11 @@ kauth_cred_cache_lookup(int from, int to, void *src, void *dst)
 		 *
 		 * If we came from a name, we know the extend_data is valid.
 		 */
-		if (from == KI_VALID_PWNAM)
+		if (from == KI_VALID_PWNAM) {
 			el.el_flags |= KAUTH_EXTLOOKUP_VALID_PWNAM;
-		else if (from == KI_VALID_GRNAM)
+		} else if (from == KI_VALID_GRNAM) {
 			el.el_flags |= KAUTH_EXTLOOKUP_VALID_GRNAM;
+		}
 
 		kauth_identity_updatecache(&el, &ki, extend_data);
 
@@ -2731,14 +2741,15 @@ kauth_cred_cache_lookup(int from, int to, void *src, void *dst)
 			error = ENOENT;
 		}
 	}
-	if (error)
-		return(error);
+	if (error) {
+		return error;
+	}
 found:
 	/*
 	 * Copy from the appropriate struct kauth_identity cache entry
 	 * structure into the destination buffer area.
 	 */
-	switch(to) {
+	switch (to) {
 	case KI_VALID_UID:
 		*(uid_t *)dst = ki.ki_uid;
 		break;
@@ -2752,26 +2763,26 @@ found:
 		*(ntsid_t *)dst = ki.ki_ntsid;
 		break;
 	case KI_VALID_GROUPS: {
-			struct supgroups *gp = (struct supgroups *)dst;
-			u_int32_t limit = ki.ki_supgrpcnt;
-			
-			if (gp->count) {
-				limit = MIN(ki.ki_supgrpcnt, *gp->count);
-				*gp->count = limit;
-			}
-			
-			memcpy(gp->groups, ki.ki_supgrps, sizeof(gid_t) * limit);
+		struct supgroups *gp = (struct supgroups *)dst;
+		size_t limit = ki.ki_supgrpcnt;
+
+		if (gp->count) {
+			limit = MIN(ki.ki_supgrpcnt, *gp->count);
+			*gp->count = limit;
 		}
-		break;
+
+		memcpy(gp->groups, ki.ki_supgrps, sizeof(gid_t) * limit);
+	}
+	break;
 	case KI_VALID_PWNAM:
 	case KI_VALID_GRNAM:
 		/* handled in kauth_resolver_complete() */
 		break;
 	default:
-		return(EINVAL);
+		return EINVAL;
 	}
 	KAUTH_DEBUG("CACHE - returned successfully");
-	return(0);
+	return 0;
 }
 
 
@@ -2780,29 +2791,6 @@ found:
  *
  * XXX the linked-list implementation here needs to be optimized.
  */
-
-/*
- * kauth_groups_init
- *
- * Description:	Initialize the groups cache
- *
- * Parameters:	(void)
- *
- * Returns:	(void)
- *
- * Notes:	Initialize the groups cache for use; the group cache is used
- *		to avoid unnecessary calls out to user space.
- *
- *		This function is called from kauth_init() in the file
- *		kern_authorization.c.
- */
-void
-kauth_groups_init(void)
-{
-	TAILQ_INIT(&kauth_groups);
-	kauth_groups_mtx = lck_mtx_alloc_init(kauth_lck_grp, 0/*LCK_ATTR_NULL*/);
-}
-
 
 /*
  * kauth_groups_expired
@@ -2823,12 +2811,13 @@ kauth_groups_expired(struct kauth_group_membership *gm)
 	/*
 	 * Expiration time of 0 means this entry is persistent.
 	 */
-	if (gm->gm_expiry == 0)
-		return (0);
-		
+	if (gm->gm_expiry == 0) {
+		return 0;
+	}
+
 	microuptime(&tv);
-	
-	return((gm->gm_expiry <= tv.tv_sec) ? 1 : 0);
+
+	return (gm->gm_expiry <= tv.tv_sec) ? 1 : 0;
 }
 
 
@@ -2877,12 +2866,13 @@ kauth_groups_updatecache(struct kauth_identity_extlookup *el)
 {
 	struct kauth_group_membership *gm;
 	struct timeval tv;
-	
+
 	/* need a valid response if we are to cache anything */
 	if ((el->el_flags &
-		(KAUTH_EXTLOOKUP_VALID_UID | KAUTH_EXTLOOKUP_VALID_GID | KAUTH_EXTLOOKUP_VALID_MEMBERSHIP)) !=
-	    (KAUTH_EXTLOOKUP_VALID_UID | KAUTH_EXTLOOKUP_VALID_GID | KAUTH_EXTLOOKUP_VALID_MEMBERSHIP))
+	    (KAUTH_EXTLOOKUP_VALID_UID | KAUTH_EXTLOOKUP_VALID_GID | KAUTH_EXTLOOKUP_VALID_MEMBERSHIP)) !=
+	    (KAUTH_EXTLOOKUP_VALID_UID | KAUTH_EXTLOOKUP_VALID_GID | KAUTH_EXTLOOKUP_VALID_MEMBERSHIP)) {
 		return;
+	}
 
 	microuptime(&tv);
 
@@ -2907,21 +2897,20 @@ kauth_groups_updatecache(struct kauth_identity_extlookup *el)
 	KAUTH_GROUPS_UNLOCK();
 
 	/* if we found an entry to update, stop here */
-	if (gm != NULL)
+	if (gm != NULL) {
 		return;
+	}
 
 	/* allocate a new record */
-	MALLOC(gm, struct kauth_group_membership *, sizeof(*gm), M_KAUTH, M_WAITOK);
-	if (gm != NULL) {
-		gm->gm_uid = el->el_uid;
-		gm->gm_gid = el->el_gid;
-		if (el->el_flags & KAUTH_EXTLOOKUP_ISMEMBER) {
-			gm->gm_flags |= KAUTH_GROUP_ISMEMBER;
-		} else {
-			gm->gm_flags &= ~KAUTH_GROUP_ISMEMBER;
-		}
-		gm->gm_expiry = (el->el_member_valid) ? el->el_member_valid + tv.tv_sec : 0;
-	}		
+	gm = kalloc_type(struct kauth_group_membership, Z_WAITOK | Z_NOFAIL);
+	gm->gm_uid = el->el_uid;
+	gm->gm_gid = el->el_gid;
+	if (el->el_flags & KAUTH_EXTLOOKUP_ISMEMBER) {
+		gm->gm_flags |= KAUTH_GROUP_ISMEMBER;
+	} else {
+		gm->gm_flags &= ~KAUTH_GROUP_ISMEMBER;
+	}
+	gm->gm_expiry = (el->el_member_valid) ? el->el_member_valid + tv.tv_sec : 0;
 
 	/*
 	 * Insert the new entry.  Note that it's possible to race ourselves
@@ -2941,8 +2930,7 @@ kauth_groups_updatecache(struct kauth_identity_extlookup *el)
 	KAUTH_GROUPS_UNLOCK();
 
 	/* free expired cache entry */
-	if (gm != NULL)
-		FREE(gm, M_KAUTH);
+	kfree_type(struct kauth_group_membership, gm);
 }
 
 /*
@@ -2951,19 +2939,20 @@ kauth_groups_updatecache(struct kauth_identity_extlookup *el)
  * Must be called with the group cache lock held.
  */
 static void
-kauth_groups_trimcache(int new_size) {
-        struct kauth_group_membership *gm;
+kauth_groups_trimcache(int new_size)
+{
+	struct kauth_group_membership *gm;
 
-	lck_mtx_assert(kauth_groups_mtx, LCK_MTX_ASSERT_OWNED);
-        
+	lck_mtx_assert(&kauth_groups_mtx, LCK_MTX_ASSERT_OWNED);
+
 	while (kauth_groups_count > new_size) {
 		gm = TAILQ_LAST(&kauth_groups, kauth_groups_head);
 		TAILQ_REMOVE(&kauth_groups, gm, gm_link);
 		kauth_groups_count--;
-		FREE(gm, M_KAUTH);
+		kfree_type(struct kauth_group_membership, gm);
 	}
 }
-#endif	/* CONFIG_EXT_RESOLVER */
+#endif  /* CONFIG_EXT_RESOLVER */
 
 /*
  * Group membership KPI
@@ -3015,7 +3004,7 @@ kauth_cred_ismember_gid(kauth_cred_t cred, gid_t gid, int *resultp)
 	for (i = 0; i < pcred->cr_ngroups; i++) {
 		if (gid == pcred->cr_groups[i]) {
 			*resultp = 1;
-			return(0);
+			return 0;
 		}
 	}
 
@@ -3025,9 +3014,9 @@ kauth_cred_ismember_gid(kauth_cred_t cred, gid_t gid, int *resultp)
 	 */
 	if (pcred->cr_gmuid == KAUTH_UID_NONE) {
 		*resultp = 0;
-		return(0);
+		return 0;
 	}
-		
+
 #if CONFIG_EXT_RESOLVER
 	struct kauth_group_membership *gm;
 	struct kauth_identity_extlookup el;
@@ -3039,7 +3028,7 @@ kauth_cred_ismember_gid(kauth_cred_t cred, gid_t gid, int *resultp)
 	 */
 	if (!kauth_resolver_registered) {
 		*resultp = 0;
-		return(0);
+		return 0;
 	}
 
 	/* TODO: */
@@ -3059,45 +3048,47 @@ kauth_cred_ismember_gid(kauth_cred_t cred, gid_t gid, int *resultp)
 	}
 
 	/* did we find a membership entry? */
-	if (gm != NULL)
+	if (gm != NULL) {
 		*resultp = (gm->gm_flags & KAUTH_GROUP_ISMEMBER) ? 1 : 0;
+	}
 	KAUTH_GROUPS_UNLOCK();
 
 	/* if we did, we can return now */
 	if (gm != NULL) {
 		DTRACE_PROC2(kauth__group__cache__hit, int, pcred->cr_gmuid, int, gid);
-		return(0);
+		return 0;
 	}
 
 	/* nothing in the cache, need to go to userland */
 	bzero(&el, sizeof(el));
-	el.el_info_pid = current_proc()->p_pid;
+	el.el_info_pid = proc_getpid(current_proc());
 	el.el_flags = KAUTH_EXTLOOKUP_VALID_UID | KAUTH_EXTLOOKUP_VALID_GID | KAUTH_EXTLOOKUP_WANT_MEMBERSHIP;
 	el.el_uid = pcred->cr_gmuid;
 	el.el_gid = gid;
-	el.el_member_valid = 0;		/* XXX set by resolver? */
+	el.el_member_valid = 0;         /* XXX set by resolver? */
 
 	DTRACE_PROC2(kauth__group__resolver__submitted, int, el.el_uid, int, el.el_gid);
-	
+
 	error = kauth_resolver_submit(&el, 0ULL);
-	
+
 	DTRACE_PROC2(kauth__group__resolver__returned, int, error, int, el.el_flags);
-	
-	if (error != 0)
-		return(error);
+
+	if (error != 0) {
+		return error;
+	}
 	/* save the results from the lookup */
 	kauth_groups_updatecache(&el);
 
 	/* if we successfully ascertained membership, report */
 	if (el.el_flags & KAUTH_EXTLOOKUP_VALID_MEMBERSHIP) {
 		*resultp = (el.el_flags & KAUTH_EXTLOOKUP_ISMEMBER) ? 1 : 0;
-		return(0);
+		return 0;
 	}
 
-	return(ENOENT);
+	return ENOENT;
 #else
 	*resultp = 0;
-	return(0);
+	return 0;
 #endif
 }
 
@@ -3140,11 +3131,11 @@ kauth_cred_ismember_guid(__unused kauth_cred_t cred, guid_t *guidp, int *resultp
 		*resultp = 1;
 		break;
 	default:
-#if CONFIG_EXT_RESOLVER
 	{
-		struct kauth_identity ki;
 		gid_t gid;
-#if 6603280
+#if CONFIG_EXT_RESOLVER
+		struct kauth_identity ki;
+
 		/*
 		 * Grovel the identity cache looking for this GUID.
 		 * If we find it, and it is for a user record, return
@@ -3168,10 +3159,10 @@ kauth_cred_ismember_guid(__unused kauth_cred_t cred, guid_t *guidp, int *resultp
 			}
 			if (ki.ki_valid & KI_VALID_UID) {
 				*resultp = 0;
-				return (0);
+				return 0;
 			}
 		}
-#endif /* 6603280 */
+#endif /* CONFIG_EXT_RESOLVER */
 		/*
 		 * Attempt to translate the GUID to a GID.  Even if
 		 * this fails, we will have primed the cache if it is
@@ -3188,26 +3179,25 @@ kauth_cred_ismember_guid(__unused kauth_cred_t cred, guid_t *guidp, int *resultp
 				error = 0;
 			}
 		} else {
- do_check:
+#if CONFIG_EXT_RESOLVER
+do_check:
+#endif /* CONFIG_EXT_RESOLVER */
 			error = kauth_cred_ismember_gid(cred, gid, resultp);
 		}
 	}
-#else	/* CONFIG_EXT_RESOLVER */
-		error = ENOENT;
-#endif	/* CONFIG_EXT_RESOLVER */
-		break;
+	break;
 	}
-	return(error);
+	return error;
 }
 
 /*
  * kauth_cred_gid_subset
  *
- * Description:	Given two credentials, determine if all GIDs associated with 
- * 		the first are also associated with the second
+ * Description:	Given two credentials, determine if all GIDs associated with
+ *              the first are also associated with the second
  *
  * Parameters:	cred1				Credential to check for
- * 		cred2				Credential to check in
+ *              cred2				Credential to check in
  *		resultp				Pointer to int to contain the
  *						result of the call
  *
@@ -3222,7 +3212,7 @@ kauth_cred_ismember_guid(__unused kauth_cred_t cred, guid_t *guidp, int *resultp
  * Notes:	This function guarantees not to modify resultp when returning
  *		an error.
  */
-int	
+int
 kauth_cred_gid_subset(kauth_cred_t cred1, kauth_cred_t cred2, int *resultp)
 {
 	int i, err, res = 1;
@@ -3249,18 +3239,18 @@ kauth_cred_gid_subset(kauth_cred_t cred1, kauth_cred_t cred2, int *resultp)
 	}
 
 	if (!res && pcred1->cr_rgid != pcred2->cr_rgid &&
-			pcred1->cr_rgid != pcred2->cr_svgid) {
+	    pcred1->cr_rgid != pcred2->cr_svgid) {
 		*resultp = 0;
 		return 0;
 	}
 
 	/* Finally, check saved gid */
-	if ((err = kauth_cred_ismember_gid(cred2, pcred1->cr_svgid, &res)) != 0){
+	if ((err = kauth_cred_ismember_gid(cred2, pcred1->cr_svgid, &res)) != 0) {
 		return err;
 	}
 
 	if (!res && pcred1->cr_svgid != pcred2->cr_rgid &&
-			pcred1->cr_svgid != pcred2->cr_svgid) {
+	    pcred1->cr_svgid != pcred2->cr_svgid) {
 		*resultp = 0;
 		return 0;
 	}
@@ -3287,7 +3277,7 @@ kauth_cred_gid_subset(kauth_cred_t cred1, kauth_cred_t cred2, int *resultp)
 int
 kauth_cred_issuser(kauth_cred_t cred)
 {
-	return(kauth_cred_getuid(cred) == 0);
+	return kauth_cred_getuid(cred) == 0;
 }
 
 
@@ -3295,16 +3285,97 @@ kauth_cred_issuser(kauth_cred_t cred)
  * Credential KPI
  */
 
-/* lock protecting credential hash table */
-static lck_mtx_t *kauth_cred_hash_mtx;
-#define KAUTH_CRED_HASH_LOCK()		lck_mtx_lock(kauth_cred_hash_mtx);
-#define KAUTH_CRED_HASH_UNLOCK()	lck_mtx_unlock(kauth_cred_hash_mtx);
-#if KAUTH_CRED_HASH_DEBUG
-#define KAUTH_CRED_HASH_LOCK_ASSERT()	lck_mtx_assert(kauth_cred_hash_mtx, LCK_MTX_ASSERT_OWNED)
-#else	/* !KAUTH_CRED_HASH_DEBUG */
-#define KAUTH_CRED_HASH_LOCK_ASSERT()
-#endif	/* !KAUTH_CRED_HASH_DEBUG */
+static smrh_key_t   kauth_cred_key(kauth_cred_t cred);
+static uint32_t     kauth_cred_key_hash(smrh_key_t key, uint32_t seed);
+static bool         kauth_cred_key_equ(smrh_key_t k1, smrh_key_t k2);
+static uint32_t     kauth_cred_obj_hash(const struct smrq_slink *, uint32_t seed);
+static bool         kauth_cred_obj_equ(const struct smrq_slink *, smrh_key_t);
+static bool         kauth_cred_obj_try_get(void *);
 
+struct ucred_rw {
+	os_ref_atomic_t         crw_weak_ref;
+	struct ucred           *crw_cred;
+	struct smrq_slink       crw_link;
+	struct smr_node         crw_node;
+};
+
+#define KAUTH_CRED_REF_MAX 0x0ffffffful
+
+ZONE_DEFINE_ID(ZONE_ID_KAUTH_CRED, "cred", struct ucred, ZC_READONLY | ZC_ZFREE_CLEARMEM);
+static KALLOC_TYPE_DEFINE(ucred_rw_zone, struct ucred_rw, KT_DEFAULT);
+os_refgrp_decl(static, ucred_ref_grp, "ucred_rw", NULL);
+
+SMRH_TRAITS_DEFINE(kauth_cred_traits, struct ucred_rw, crw_link,
+    .domain      = &smr_proc_task,
+    .key_hash    = kauth_cred_key_hash,
+    .key_equ     = kauth_cred_key_equ,
+    .obj_hash    = kauth_cred_obj_hash,
+    .obj_equ     = kauth_cred_obj_equ,
+    .obj_try_get = kauth_cred_obj_try_get);
+
+static struct smr_shash kauth_cred_hash;
+
+static inline void
+ucred_rw_ref(struct ucred_rw *rw)
+{
+	os_ref_retain_raw(&rw->crw_weak_ref, &ucred_ref_grp);
+}
+
+static inline bool
+ucred_rw_tryref(struct ucred_rw *rw)
+{
+	return os_ref_retain_try_raw(&rw->crw_weak_ref, &ucred_ref_grp);
+}
+
+static inline os_ref_count_t
+ucred_rw_unref(struct ucred_rw *rw)
+{
+	return os_ref_release_raw(&rw->crw_weak_ref, &ucred_ref_grp);
+}
+
+static inline void
+ucred_rw_unref_live(struct ucred_rw *rw)
+{
+	os_ref_release_live_raw(&rw->crw_weak_ref, &ucred_ref_grp);
+}
+
+__abortlike
+static void
+kauth_cred_panic_over_released(kauth_cred_t cred)
+{
+	panic("kauth_cred_unref: cred %p over-released", cred);
+}
+
+__abortlike
+static void
+kauth_cred_panic_over_retain(kauth_cred_t cred)
+{
+	panic("kauth_cred_ref: cred %p over-retained", cred);
+}
+
+static void
+kauth_cred_hold(kauth_cred_t cred)
+{
+	unsigned long ref;
+
+	ref = zalloc_ro_update_field_atomic(ZONE_ID_KAUTH_CRED,
+	    cred, cr_ref, ZRO_ATOMIC_ADD_LONG, 1);
+	if (ref >= KAUTH_CRED_REF_MAX) {
+		kauth_cred_panic_over_retain(cred);
+	}
+}
+
+static void
+kauth_cred_drop(kauth_cred_t cred)
+{
+	unsigned long ref;
+
+	ref = zalloc_ro_update_field_atomic(ZONE_ID_KAUTH_CRED,
+	    cred, cr_ref, ZRO_ATOMIC_ADD_LONG, -1);
+	if (__improbable(ref == 0 || ref > KAUTH_CRED_REF_MAX)) {
+		kauth_cred_panic_over_released(cred);
+	}
+}
 
 /*
  * kauth_cred_init
@@ -3324,397 +3395,448 @@ static lck_mtx_t *kauth_cred_hash_mtx;
  *		so on.  This generally results in savings of 200K or more
  *		(potentially much more on server systems).
  *
- *		The hash cache internally has a reference on the credential
- *		for itself as a means of avoiding a reclaim race for a
- *		credential in the process of having it's last non-hash
- *		reference released.  This would otherwise result in the
- *		possibility of a freed credential that was still in uses due
- *		a race.  This use is protected by the KAUTH_CRED_HASH_LOCK.
+ *		We also create the kernel and init creds before lockdown
+ *		so that vfs_context0 and initcred pointers can be made constant.
  *
- *		On final release, the hash reference is droped, and the
- *		credential is freed back to the system.
- *
- *		This function is called from kauth_init() in the file
- *		kern_authorization.c.
+ *		We do this in the "ZALLOC" stage because we need
+ *		the kauth_cred_hash_mtx to be initialized,
+ *		and to allocate the kernel cred.
  */
-void
+__startup_func
+static void
 kauth_cred_init(void)
 {
-	int		i;
-	
-	kauth_cred_hash_mtx = lck_mtx_alloc_init(kauth_lck_grp, 0/*LCK_ATTR_NULL*/);
-	kauth_cred_table_size = kauth_cred_primes[kauth_cred_primes_index];
+	struct posix_cred kernel_cred_template = {
+		.cr_ngroups = 1,
+		.cr_flags   = CRF_NOMEMBERD,
+	};
 
-	/*allocate credential hash table */
-	MALLOC(kauth_cred_table_anchor, struct kauth_cred_entry_head *, 
-			(sizeof(struct kauth_cred_entry_head) * kauth_cred_table_size), 
-			M_KAUTH, M_WAITOK | M_ZERO);
-	if (kauth_cred_table_anchor == NULL)
-		panic("startup: kauth_cred_init");
-	for (i = 0; i < kauth_cred_table_size; i++) {
-		TAILQ_INIT(&kauth_cred_table_anchor[i]);
-	}
+	smr_shash_init(&kauth_cred_hash, SMRSH_BALANCED, maxproc / 4);
+	vfs_context0.vc_ucred = posix_cred_create(&kernel_cred_template);
 }
+STARTUP(ZALLOC, STARTUP_RANK_LAST, kauth_cred_init);
 
-
-/*
- * kauth_getuid
- *
- * Description:	Get the current thread's effective UID.
- *
- * Parameters:	(void)
- *
- * Returns:	(uid_t)				The effective UID of the
- *						current thread
- */
 uid_t
 kauth_getuid(void)
 {
-	return(kauth_cred_getuid(kauth_cred_get()));
+	return kauth_cred_getuid(kauth_cred_get());
 }
 
-
-/*
- * kauth_getruid
- *
- * Description:	Get the current thread's real UID.
- *
- * Parameters:	(void)
- *
- * Returns:	(uid_t)				The real UID of the current
- *						thread
- */
 uid_t
 kauth_getruid(void)
 {
-	return(kauth_cred_getruid(kauth_cred_get()));
+	return kauth_cred_getruid(kauth_cred_get());
 }
 
-
-/*
- * kauth_getgid
- *
- * Description:	Get the current thread's effective GID.
- *
- * Parameters:	(void)
- *
- * Returns:	(gid_t)				The effective GID of the
- *						current thread
- */
 gid_t
 kauth_getgid(void)
 {
-	return(kauth_cred_getgid(kauth_cred_get()));
+	return kauth_cred_getgid(kauth_cred_get());
 }
 
-
-/*
- * kauth_getgid
- *
- * Description:	Get the current thread's real GID.
- *
- * Parameters:	(void)
- *
- * Returns:	(gid_t)				The real GID of the current
- *						thread
- */
 gid_t
 kauth_getrgid(void)
 {
-	return(kauth_cred_getrgid(kauth_cred_get()));
+	return kauth_cred_getrgid(kauth_cred_get());
 }
 
-
-/*
- * kauth_cred_get
- *
- * Description:	Returns a pointer to the current thread's credential
- *
- * Parameters:	(void)
- *
- * Returns:	(kauth_cred_t)			Pointer to the current thread's
- *						credential
- *
- * Notes:	This function does not take a reference; because of this, the
- *		caller MUST NOT do anything that would let the thread's
- *		credential change while using the returned value, without
- *		first explicitly taking their own reference.
- *
- *		If a caller intends to take a reference on the resulting
- *		credential pointer from calling this function, it is strongly
- *		recommended that the caller use kauth_cred_get_with_ref()
- *		instead, to protect against any future changes to the cred
- *		locking protocols; such changes could otherwise potentially
- *		introduce race windows in the callers code.
- */
 kauth_cred_t
 kauth_cred_get(void)
 {
-	struct proc *p;
-	struct uthread *uthread;
-
-	uthread = get_bsdthread_info(current_thread());
-	/* sanity */
-	if (uthread == NULL)
-		panic("thread wants credential but has no BSD thread info");
-	/*
-	 * We can lazy-bind credentials to threads, as long as their processes
-	 * have them.
-	 *
-	 * XXX If we later inline this function, the code in this block
-	 * XXX should probably be called out in a function.
-	 */
-	if (uthread->uu_ucred == NOCRED) {
-		if ((p = (proc_t) get_bsdtask_info(get_threadtask(current_thread()))) == NULL)
-			panic("thread wants credential but has no BSD process");
-		uthread->uu_ucred = kauth_cred_proc_ref(p);
-	}
-	return(uthread->uu_ucred);
+	return current_thread_ro()->tro_cred;
 }
 
-void
-mach_kauth_cred_uthread_update(void)
+intptr_t
+current_thread_cred_label_get(int slot)
 {
-	uthread_t uthread;
-	proc_t proc;
+#if CONFIG_MACF
+	return mac_label_get(kauth_cred_get()->cr_label, slot);
+#else
+	return 0;
+#endif
+}
 
-	uthread = get_bsdthread_info(current_thread());
-	proc = current_proc();
+__abortlike
+static void
+current_cached_proc_cred_panic(proc_t p)
+{
+	panic("current_cached_proc_cred(%p) called but current_proc() is %p",
+	    p, current_proc());
+}
 
-	kauth_cred_uthread_update(uthread, proc);
+kauth_cred_t
+current_cached_proc_cred(proc_t p)
+{
+	thread_ro_t tro = current_thread_ro();
+
+	if (tro->tro_proc != p && p != PROC_NULL) {
+		current_cached_proc_cred_panic(p);
+	}
+	return tro->tro_realcred;
+}
+
+intptr_t
+current_cached_proc_label_get(int slot)
+{
+#if CONFIG_MACF
+	return mac_label_get(current_cached_proc_cred(PROC_NULL)->cr_label, slot);
+#else
+	return 0;
+#endif
+}
+
+kauth_cred_t
+current_cached_proc_cred_ref(proc_t p)
+{
+	kauth_cred_t cred = current_cached_proc_cred(p);
+
+	kauth_cred_ref(cred);
+	return cred;
+}
+
+__attribute__((noinline))
+static void
+kauth_cred_thread_update_slow(thread_ro_t tro, proc_t proc)
+{
+	struct ucred *cred = kauth_cred_proc_ref(proc);
+	struct thread_ro_creds my_creds = tro->tro_creds;
+
+	if (my_creds.tro_realcred != cred) {
+		if (my_creds.tro_realcred == my_creds.tro_cred) {
+			kauth_cred_set(&my_creds.tro_cred, cred);
+		}
+		kauth_cred_set(&my_creds.tro_realcred, cred);
+		zalloc_ro_update_field(ZONE_ID_THREAD_RO,
+		    tro, tro_creds, &my_creds);
+	}
+	kauth_cred_unref(&cred);
 }
 
 /*
- * kauth_cred_uthread_update
- *
- * Description:	Given a uthread, a proc, and whether or not the proc is locked,
- *		late-bind the uthread cred to the proc cred.
- *
- * Parameters:	uthread_t			The uthread to update
- *		proc_t				The process to update to
- *
- * Returns:	(void)
+ * current_cached_proc_cred_update
  *
  * Notes:	This code is common code called from system call or trap entry
  *		in the case that the process thread may have been changed
- *		since the last time the thread entered the kernel.  It is
- *		generally only called with the current uthread and process as
- *		parameters.
+ *		since the last time the thread entered the kernel.
  */
+__attribute__((always_inline))
 void
-kauth_cred_uthread_update(uthread_t uthread, proc_t proc)
+current_cached_proc_cred_update(void)
 {
-	if (uthread->uu_ucred != proc->p_ucred &&
-	    (uthread->uu_flag & UT_SETUID) == 0) {
-		kauth_cred_t old = uthread->uu_ucred;
-		uthread->uu_ucred = kauth_cred_proc_ref(proc);
-		if (IS_VALID_CRED(old))
-			kauth_cred_unref(&old);
+	thread_ro_t tro  = current_thread_ro();
+	proc_t      proc = tro->tro_proc;
+
+	if (__improbable(tro->tro_task != kernel_task &&
+	    tro->tro_realcred != proc_ucred_unsafe(proc))) {
+		kauth_cred_thread_update_slow(tro, proc);
 	}
 }
 
-
-/*
- * kauth_cred_get_with_ref
- *
- * Description:	Takes a reference on the current thread's credential, and then
- *		returns a pointer to it to the caller.
- *
- * Parameters:	(void)
- *
- * Returns:	(kauth_cred_t)			Pointer to the current thread's
- *						newly referenced credential
- *
- * Notes:	This function takes a reference on the credential before
- *		returning it to the caller.
- *
- *		It is the responsibility of the calling code to release this
- *		reference when the credential is no longer in use.
- *
- *		Since the returned reference may be a persistent reference
- *		(e.g. one cached in another data structure with a lifetime
- *		longer than the calling function), this release may be delayed
- *		until such time as the persistent reference is to be destroyed.
- *		An example of this would be the per vnode credential cache used
- *		to accelerate lookup operations.
- */
 kauth_cred_t
 kauth_cred_get_with_ref(void)
 {
-	struct proc *procp;
-	struct uthread *uthread;
+	struct ucred *ucred = kauth_cred_get();
+	kauth_cred_ref(ucred);
+	return ucred;
+}
 
-	uthread = get_bsdthread_info(current_thread());
-	/* sanity checks */
-	if (uthread == NULL)
-		panic("%s - thread wants credential but has no BSD thread info", __FUNCTION__);
-	if ((procp = (proc_t) get_bsdtask_info(get_threadtask(current_thread()))) == NULL)
-		panic("%s - thread wants credential but has no BSD process", __FUNCTION__);
+__abortlike
+static void
+kauth_cred_verify_panic(kauth_cred_t cred, struct ucred_rw *cred_rw)
+{
+	panic("kauth_cred_t backref mismatch: cred:%p cred->cr_rw:%p "
+	    "cred_rw:%p", cred, cred->cr_rw, cred_rw);
+}
 
-	/*
-	 * We can lazy-bind credentials to threads, as long as their processes
-	 * have them.
-	 *
-	 * XXX If we later inline this function, the code in this block
-	 * XXX should probably be called out in a function.
-	 */
-	if (uthread->uu_ucred == NOCRED) {
-		/* take reference for new cred in thread */
-		uthread->uu_ucred = kauth_cred_proc_ref(procp);
+__pure2
+static struct ucred_rw *
+kauth_cred_rw(kauth_cred_t cred)
+{
+	struct ucred_rw *rw = kauth_cred_require(cred)->cr_rw;
+
+	if (__improbable(rw->crw_cred != cred)) {
+		kauth_cred_verify_panic(cred, rw);
 	}
-	/* take a reference for our caller */
-	kauth_cred_ref(uthread->uu_ucred);
-	return(uthread->uu_ucred);
+
+	return rw;
 }
 
 
-/*
- * kauth_cred_proc_ref
- *
- * Description:	Takes a reference on the current process's credential, and
- *		then returns a pointer to it to the caller.
- *
- * Parameters:	procp				Process whose credential we
- *						intend to take a reference on
- *
- * Returns:	(kauth_cred_t)			Pointer to the process's
- *						newly referenced credential
- *
- * Locks:	PROC_LOCK is held before taking the reference and released
- *		after the refeence is taken to protect the p_ucred field of
- *		the process referred to by procp.
- *
- * Notes:	This function takes a reference on the credential before
- *		returning it to the caller.
- *
- *		It is the responsibility of the calling code to release this
- *		reference when the credential is no longer in use.
- *
- *		Since the returned reference may be a persistent reference
- *		(e.g. one cached in another data structure with a lifetime
- *		longer than the calling function), this release may be delayed
- *		until such time as the persistent reference is to be destroyed.
- *		An example of this would be the per vnode credential cache used
- *		to accelerate lookup operations.
- */
 kauth_cred_t
 kauth_cred_proc_ref(proc_t procp)
 {
-	kauth_cred_t 	cred;
-	
-	proc_lock(procp);
-	cred = proc_ucred(procp);
-	kauth_cred_ref(cred);
-	proc_unlock(procp);
-	return(cred);
+	kauth_cred_t cred;
+
+	smr_proc_task_enter();
+	cred = proc_ucred_smr(procp);
+	if (!ucred_rw_tryref(kauth_cred_rw(cred))) {
+		cred = NOCRED;
+	}
+	smr_proc_task_leave();
+
+	if (__improbable(cred == NOCRED)) {
+		proc_ucred_lock(procp);
+		cred = proc_ucred_locked(procp);
+		kauth_cred_ref(cred);
+		proc_ucred_unlock(procp);
+	}
+	return cred;
 }
 
+static kauth_cred_t
+__kauth_cred_proc_ref_for_pidversion_slow(pid_t pid, uint32_t pidvers, bool dovers)
+{
+	kauth_cred_t cred = NOCRED;
+	proc_t procp;
+
+	procp = proc_find(pid);
+	if (procp == PROC_NULL) {
+		return NOCRED;
+	}
+
+	if (dovers && proc_get_ro(procp)->p_idversion != pidvers) {
+		proc_rele(procp);
+		return NOCRED;
+	}
+
+	cred = kauth_cred_proc_ref(procp);
+	proc_rele(procp);
+
+	return cred;
+}
+
+static inline kauth_cred_t
+__kauth_cred_proc_ref_for_pidversion(pid_t pid, uint32_t pidvers, bool dovers)
+{
+	kauth_cred_t cred = NOCRED;
+	struct proc_ro *pro;
+	proc_t procp;
+	int err;
+
+	smr_proc_task_enter();
+	procp = proc_find_noref_smr(pid);
+	if (procp == PROC_NULL) {
+		err = ESRCH;
+	} else {
+		pro = proc_get_ro(procp);
+		cred = proc_ucred_smr(procp);
+		if (dovers && pro->p_idversion != pidvers) {
+			err = ESRCH;
+		} else if (!ucred_rw_tryref(kauth_cred_rw(cred))) {
+			err = EAGAIN;
+		} else {
+			err = 0;
+		}
+	}
+	smr_proc_task_leave();
+
+	if (__probable(err == 0)) {
+		return cred;
+	}
+
+	if (err == EAGAIN) {
+		return __kauth_cred_proc_ref_for_pidversion_slow(pid, pidvers, dovers);
+	}
+
+	return NOCRED;
+}
+
+kauth_cred_t
+kauth_cred_proc_ref_for_pid(pid_t pid)
+{
+	return __kauth_cred_proc_ref_for_pidversion(pid, 0, false);
+}
+
+kauth_cred_t
+kauth_cred_proc_ref_for_pidversion(pid_t pid, uint32_t pidvers)
+{
+	return __kauth_cred_proc_ref_for_pidversion(pid, pidvers, true);
+}
 
 /*
  * kauth_cred_alloc
  *
- * Description:	Allocate a new credential
+ * Description: Create a deduplicated credential optionally derived
+ *              from a parent credential, according to the specified template.
  *
- * Parameters:	(void)
+ * Parameters:  parent_cred                     the parent cred the model is
+ *                                              derived from (or NOCRED for
+ *                                              a creation)
  *
- * Returns:	!NULL				Newly allocated credential
- *		NULL				Insufficient memory
+ *              model_cred                      the (mutable) template of the
+ *                                              cred to add to the hash table.
  *
- * Notes:	The newly allocated credential is zero'ed as part of the
- *		allocation process, with the exception of the reference
- *		count, which is set to 1 to indicate a single reference
- *		held by the caller.
- *
- *		Since newly allocated credentials have no external pointers
- *		referencing them, prior to making them visible in an externally
- *		visible pointer (e.g. by adding them to the credential hash
- *		cache) is the only legal time in which an existing credential
- *		can be safely iinitialized or modified directly.
- *
- *		After initialization, the caller is expected to call the
- *		function kauth_cred_add() to add the credential to the hash
- *		cache, after which time it's frozen and becomes publically
- *		visible.
- *
- *		The release protocol depends on kauth_hash_add() being called
- *		before kauth_cred_rele() (there is a diagnostic panic which
- *		will trigger if this protocol is not observed).
- *
- * XXX:		This function really ought to be static, rather than being
- *		exported as KPI, since a failure of kauth_cred_add() can only
- *		be handled by an explicit free of the credential; such frees
- *		depend on knowlegdge of the allocation method used, which is
- *		permitted to change between kernel revisions.
- *
- * XXX:		In the insufficient resource case, this code panic's rather
- *		than returning a NULL pointer; the code that calls this
- *		function needs to be audited before this can be changed.
+ * Returns:     (kauth_thread_t)                The inserted cred, or the
+ *                                              collision that was found.
  */
-kauth_cred_t
-kauth_cred_alloc(void)
+static kauth_cred_t
+kauth_cred_alloc(kauth_cred_t parent_cred, kauth_cred_t model_cred)
 {
-	kauth_cred_t newcred;
-	
-	MALLOC_ZONE(newcred, kauth_cred_t, sizeof(*newcred), M_CRED, M_WAITOK);
-	if (newcred != 0) {
-		posix_cred_t newpcred = posix_cred_get(newcred);
-		bzero(newcred, sizeof(*newcred));
-		newcred->cr_ref = 1;
-		newcred->cr_audit.as_aia_p = audit_default_aia_p;
-		/* must do this, or cred has same group membership as uid 0 */
-		newpcred->cr_gmuid = KAUTH_UID_NONE;
-#if CRED_DIAGNOSTIC
-	} else {
-		panic("kauth_cred_alloc: couldn't allocate credential");
-#endif		
+	struct ucred_rw *found_rw;
+	struct ucred_rw *new_rw;
+	struct ucred *newcred;
+
+	/*
+	 * Step 1: find if there's a duplicate entry
+	 */
+
+	found_rw = smr_shash_get(&kauth_cred_hash, kauth_cred_key(model_cred),
+	    &kauth_cred_traits);
+
+	if (found_rw) {
+		/* found a duplicate, free the label if the model owned it */
+#if CONFIG_MACF
+		if (!parent_cred || model_cred->cr_label != parent_cred->cr_label) {
+			mac_cred_label_destroy(model_cred);
+		}
+#endif
+
+		/* smr_hash_get() already did a kauth_cred_ro() */
+		return found_rw->crw_cred;
 	}
 
-#if KAUTH_CRED_HASH_DEBUG
-	kauth_cred_count++;
+	/*
+	 * Step 2: create a fresh new kauth_cred.
+	 *
+	 *         give it ownership of the label and audit session,
+	 *         if it doesn't have it already.
+	 */
+#if CONFIG_MACF
+	if (parent_cred && model_cred->cr_label == parent_cred->cr_label) {
+		mac_cred_label_init(model_cred);
+		mac_cred_label_associate(parent_cred, model_cred);
+	}
+	mac_cred_label_seal(model_cred);
+#else
+	(void)parent_cred;
 #endif
+	AUDIT_SESSION_REF(model_cred);
+
+	new_rw = zalloc_flags(ucred_rw_zone, Z_WAITOK | Z_ZERO | Z_NOFAIL);
+	os_ref_init_raw(&new_rw->crw_weak_ref, &ucred_ref_grp);
+
+	model_cred->cr_rw     = new_rw;
+	model_cred->cr_unused = NULL;
+	model_cred->cr_ref    = 0;
+
+	newcred = zalloc_ro(ZONE_ID_KAUTH_CRED, Z_WAITOK | Z_ZERO | Z_NOFAIL);
+	new_rw->crw_cred = newcred;
+
+#if HAS_APPLE_PAC
+	{
+		void *naked_ptr = model_cred->cr_label;
+		void *signed_ptr;
+		signed_ptr = ptrauth_sign_unauthenticated(naked_ptr,
+		    ptrauth_key_process_independent_data,
+		    ptrauth_blend_discriminator(&newcred->cr_label,
+		    OS_PTRAUTH_DISCRIMINATOR("ucred.cr_label")));
+		memcpy((void *)&model_cred->cr_label, &signed_ptr, sizeof(void *));
+	}
+#endif
+
+	zalloc_ro_update_elem(ZONE_ID_KAUTH_CRED, newcred, model_cred);
+
+	/*
+	 * Step 3: try to insert in the hash table,
+	 *         and deal someone else racing us.
+	 */
+	found_rw = smr_shash_get_or_insert(&kauth_cred_hash,
+	    kauth_cred_key(newcred), &new_rw->crw_link, &kauth_cred_traits);
+	if (__probable(!found_rw)) {
+		return newcred;
+	}
 
 #if CONFIG_MACF
-	mac_cred_label_init(newcred);
+	mac_cred_label_free(newcred->cr_label);
 #endif
+	AUDIT_SESSION_UNREF(newcred);
+	zfree(ucred_rw_zone, new_rw);
+	zfree_ro(ZONE_ID_KAUTH_CRED, newcred);
 
-	return(newcred);
+	/* smr_shash_get_or_insert() already did a kauth_cred_ro() */
+	return found_rw->crw_cred;
 }
 
-
-/*
- * kauth_cred_create
- *
- * Description:	Look to see if we already have a known credential in the hash
- *		cache; if one is found, bump the reference count and return
- *		it.  If there are no credentials that match the given
- *		credential, then allocate a new credential.
- *
- * Parameters:	cred				Template for credential to
- *						be created
- *
- * Returns:	(kauth_cred_t)			The credential that was found
- *						in the hash or created
- *		NULL				kauth_cred_add() failed, or
- *						there was not an egid specified
- *
- * Notes:	The gmuid is hard-defaulted to the UID specified.  Since we
- *		maintain this field, we can't expect callers to know how it
- *		needs to be set.  Callers should be prepared for this field
- *		to be overwritten.
- *
- * XXX:		This code will tight-loop if memory for a new credential is
- *		persistently unavailable; this is perhaps not the wisest way
- *		to handle this condition, but current callers do not expect
- *		a failure.
- */
 kauth_cred_t
-kauth_cred_create(kauth_cred_t cred)
+kauth_cred_require(kauth_cred_t cred)
 {
-	kauth_cred_t 	found_cred, new_cred = NULL;
-	posix_cred_t	pcred = posix_cred_get(cred);
+	zone_require_ro(ZONE_ID_KAUTH_CRED, sizeof(struct ucred), cred);
+	return cred;
+}
+
+__abortlike
+static void
+kauth_cred_rw_verify_panic(const struct ucred_rw *cred_rw, kauth_cred_t cred)
+{
+	panic("ucred_rw backref mismatch: cred_rw:%p cred_rw->crw_cred:%p "
+	    "cred: %p", cred_rw, cred_rw->crw_cred, cred);
+}
+
+__pure2
+static kauth_cred_t
+kauth_cred_ro(const struct ucred_rw *cred_rw)
+{
+	kauth_cred_t cred = kauth_cred_require(cred_rw->crw_cred);
+
+	if (__improbable(cred->cr_rw != cred_rw)) {
+		kauth_cred_rw_verify_panic(cred_rw, cred);
+	}
+
+	return cred;
+}
+
+__attribute__((noinline))
+static void
+kauth_cred_free(struct smr_node *node)
+{
+	struct ucred_rw *rw = __container_of(node, struct ucred_rw, crw_node);
+	struct ucred *cred = kauth_cred_ro(rw);
+
+	if (cred == vfs_context0.vc_ucred) {
+		panic("Over-release of the kernel credentials");
+	}
+	if (os_atomic_load(&cred->cr_ref, relaxed) != 0) {
+		panic("%s: freeing credential with active long-term ref", __func__);
+	}
+
+#if CONFIG_MACF
+	mac_cred_label_free(cred->cr_label);
+#endif
+
+	zfree(ucred_rw_zone, rw);
+	zfree_ro(ZONE_ID_KAUTH_CRED, cred);
+}
+
+__attribute__((noinline))
+static void
+kauth_cred_retire(struct ucred_rw *rw, struct ucred *cred __unused)
+{
+	vm_size_t size = sizeof(struct ucred_rw) +
+#if CONFIG_MACF
+	    sizeof(struct label) +
+#endif
+	    sizeof(struct ucred);
+
+	smr_shash_remove(&kauth_cred_hash, &rw->crw_link, &kauth_cred_traits);
+	AUDIT_SESSION_UNREF(cred); /* uses SMR, safe to do immediately */
+	smr_call(&smr_proc_task, &rw->crw_node, size, kauth_cred_free);
+}
+
+static kauth_cred_t
+posix_cred_create_internal(posix_cred_t pcred, struct au_session audit)
+{
+	struct ucred model = {
+		.cr_posix = *pcred,
+		.cr_label = NULL,
+		.cr_audit = audit,
+	};
 	int is_member = 0;
 
-	KAUTH_CRED_HASH_LOCK_ASSERT();
+	pcred = posix_cred_get(&model);
+
+	if (pcred->cr_ngroups < 1) {
+		return NOCRED;
+	}
 
 	if (pcred->cr_flags & CRF_NOMEMBERD) {
 		pcred->cr_gmuid = KAUTH_UID_NONE;
@@ -3730,7 +3852,7 @@ kauth_cred_create(kauth_cred_t cred)
 		 * trigger additional lookups. This is OK, because we end up
 		 * precatching the information here as a result.
 		 */
-		if (!kauth_cred_ismember_gid(cred, 0, &is_member)) {
+		if (!kauth_cred_ismember_gid(&model, 0, &is_member)) {
 			/*
 			 * It's a recognized value; we don't really care about
 			 * the answer, so long as it's something the external
@@ -3752,75 +3874,119 @@ kauth_cred_create(kauth_cred_t cred)
 		}
 	}
 
-	/* Caller *must* specify at least the egid in cr_groups[0] */
-	if (pcred->cr_ngroups < 1)
-		return(NULL);
-	
-	for (;;) {
-		KAUTH_CRED_HASH_LOCK();
-		found_cred = kauth_cred_find(cred);
-		if (found_cred != NULL) {
-			/*
-			 * Found an existing credential so we'll bump
-			 * reference count and return
-			 */
-			kauth_cred_ref(found_cred);
-			KAUTH_CRED_HASH_UNLOCK();
-			return(found_cred);
-		}
-		KAUTH_CRED_HASH_UNLOCK();
-	
-		/*
-		 * No existing credential found.  Create one and add it to
-		 * our hash table.
-		 */
-		new_cred = kauth_cred_alloc();
-		if (new_cred != NULL) {
-			int		err;
-			posix_cred_t	new_pcred = posix_cred_get(new_cred);
-			new_pcred->cr_uid = pcred->cr_uid;
-			new_pcred->cr_ruid = pcred->cr_ruid;
-			new_pcred->cr_svuid = pcred->cr_svuid;
-			new_pcred->cr_rgid = pcred->cr_rgid;
-			new_pcred->cr_svgid = pcred->cr_svgid;
-			new_pcred->cr_gmuid = pcred->cr_gmuid;
-			new_pcred->cr_ngroups = pcred->cr_ngroups;	
-			bcopy(&pcred->cr_groups[0], &new_pcred->cr_groups[0], sizeof(new_pcred->cr_groups));
-#if CONFIG_AUDIT
-			bcopy(&cred->cr_audit, &new_cred->cr_audit, 
-			    sizeof(new_cred->cr_audit));
-#endif
-			new_pcred->cr_flags = pcred->cr_flags;
-			
-			KAUTH_CRED_HASH_LOCK();
-			err = kauth_cred_add(new_cred);
-			KAUTH_CRED_HASH_UNLOCK();
-			
-			/* Retry if kauth_cred_add returns non zero value */
-			if (err == 0)
-				break;
-#if CONFIG_MACF
-			mac_cred_label_destroy(new_cred);
-#endif
-			AUDIT_SESSION_UNREF(new_cred);
+	mac_cred_label_init(&model);
+	return kauth_cred_alloc(NOCRED, &model);
+}
 
-			FREE_ZONE(new_cred, sizeof(*new_cred), M_CRED);
-			new_cred = NULL;
-		}
+/*
+ * kauth_cred_create
+ *
+ * Description:	Obsolete function that is unfortunately exported,
+ *              but that no one should use directly.
+ *
+ * Parameters:	cred				Template for credential to
+ *						be created
+ *
+ * Returns:	(kauth_cred_t)			The credential that was found
+ *						in the hash or created
+ *		NULL				kauth_cred_add() failed, or
+ *						there was not an egid specified
+ *
+ * Notes:	The gmuid is hard-defaulted to the UID specified.  Since we
+ *		maintain this field, we can't expect callers to know how it
+ *		needs to be set.  Callers should be prepared for this field
+ *		to be overwritten.
+ */
+kauth_cred_t
+kauth_cred_create(kauth_cred_t cred)
+{
+	return posix_cred_create_internal(&cred->cr_posix, cred->cr_audit);
+}
+
+kauth_cred_t
+kauth_cred_derive(kauth_cred_t cred, kauth_cred_derive_t derive_fn)
+{
+	struct ucred model = {
+		.cr_posix = cred->cr_posix,
+		.cr_label = cred->cr_label,
+		.cr_audit = cred->cr_audit,
+	};
+
+	if (derive_fn(cred, &model)) {
+		return kauth_cred_alloc(cred, &model);
 	}
 
-	return(new_cred);
+	kauth_cred_ref(cred);
+	return cred;
+}
+
+
+bool
+kauth_cred_proc_update(
+	proc_t                  p,
+	proc_settoken_t         action,
+	kauth_cred_derive_t     derive_fn)
+{
+	kauth_cred_t cur_cred, free_cred, new_cred;
+
+	cur_cred = kauth_cred_proc_ref(p);
+
+	for (;;) {
+		new_cred = kauth_cred_derive(cur_cred, derive_fn);
+		if (new_cred == cur_cred) {
+			if (action == PROC_SETTOKEN_ALWAYS) {
+				set_security_token(p, cur_cred);
+			}
+			kauth_cred_unref(&new_cred);
+			kauth_cred_unref(&cur_cred);
+			return false;
+		}
+
+		proc_ucred_lock(p);
+		if (__probable(proc_ucred_locked(p) == cur_cred)) {
+			kauth_cred_ref(new_cred);
+			kauth_cred_hold(new_cred);
+
+			zalloc_ro_update_field_atomic(ZONE_ID_PROC_RO, proc_get_ro(p),
+			    p_ucred.__smr_ptr, ZRO_ATOMIC_XCHG_LONG, new_cred);
+
+			kauth_cred_drop(cur_cred);
+			ucred_rw_unref_live(cur_cred->cr_rw);
+
+			proc_update_creds_onproc(p, new_cred);
+			proc_ucred_unlock(p);
+
+			if (action == PROC_SETTOKEN_SETUGID) {
+				OSBitOrAtomic(P_SUGID, &p->p_flag);
+			}
+			if (action != PROC_SETTOKEN_NONE) {
+				set_security_token(p, new_cred);
+			}
+
+			kauth_cred_unref(&new_cred);
+			kauth_cred_unref(&cur_cred);
+			return true;
+		}
+
+		free_cred = cur_cred;
+		cur_cred = proc_ucred_locked(p);
+		kauth_cred_ref(cur_cred);
+		proc_ucred_unlock(p);
+
+		kauth_cred_unref(&free_cred);
+		kauth_cred_unref(&new_cred);
+	}
 }
 
 
 /*
- * kauth_cred_setresuid
+ * kauth_cred_model_setresuid
  *
  * Description:	Update the given credential using the UID arguments.  The given
  *		UIDs are used to set the effective UID, real UID, saved UID,
  *		and GMUID (used for group membership checking).
  *
- * Parameters:	cred				The original credential
+ * Parameters:	model				The model credential
  *		ruid				The new real UID
  *		euid				The new effective UID
  *		svuid				The new saved UID
@@ -3832,155 +3998,113 @@ kauth_cred_create(kauth_cred_t cred)
  * Note:	gmuid is different in that a KAUTH_UID_NONE is a valid
  *		setting, so if you don't want it to change, pass it the
  *		previous value, explicitly.
- *
- * IMPORTANT:	This function is implemented via kauth_cred_update(), which,
- *		if it returns a credential other than the one it is passed,
- *		will have dropped the reference on the passed credential.  All
- *		callers should be aware of this, and treat this function as an
- *		unref + ref, potentially on different credentials.
- *
- *		Because of this, the caller is expected to take its own
- *		reference on the credential passed as the first parameter,
- *		and be prepared to release the reference on the credential
- *		that is returned to them, if it is not intended to be a
- *		persistent reference.
  */
-kauth_cred_t
-kauth_cred_setresuid(kauth_cred_t cred, uid_t ruid, uid_t euid, uid_t svuid, uid_t gmuid)
+bool
+kauth_cred_model_setresuid(
+	kauth_cred_t            model,
+	uid_t                   ruid,
+	uid_t                   euid,
+	uid_t                   svuid,
+	uid_t                   gmuid)
 {
-	struct ucred temp_cred;
-	posix_cred_t temp_pcred = posix_cred_get(&temp_cred);
-	posix_cred_t pcred = posix_cred_get(cred);
-
-	NULLCRED_CHECK(cred);
+	posix_cred_t pcred = posix_cred_get(model);
+	bool updated = false;
 
 	/*
 	 * We don't need to do anything if the UIDs we are changing are
 	 * already the same as the UIDs passed in
 	 */
-	if ((euid == KAUTH_UID_NONE || pcred->cr_uid == euid) &&
-	    (ruid == KAUTH_UID_NONE || pcred->cr_ruid == ruid) &&
-	    (svuid == KAUTH_UID_NONE || pcred->cr_svuid == svuid) &&
-	    (pcred->cr_gmuid == gmuid)) {
-		/* no change needed */
-		return(cred);
+	if (euid != KAUTH_UID_NONE && pcred->cr_uid != euid) {
+		pcred->cr_uid = euid;
+		updated = true;
 	}
 
-	/*
-	 * Look up in cred hash table to see if we have a matching credential
-	 * with the new values; this is done by calling kauth_cred_update().
-	 */
-	bcopy(cred, &temp_cred, sizeof(temp_cred));
-	if (euid != KAUTH_UID_NONE) {
-		temp_pcred->cr_uid = euid;
-	}
-	if (ruid != KAUTH_UID_NONE) {
-		temp_pcred->cr_ruid = ruid;
-	}
-	if (svuid != KAUTH_UID_NONE) {
-		temp_pcred->cr_svuid = svuid;
+	if (ruid != KAUTH_UID_NONE && pcred->cr_ruid != ruid) {
+		pcred->cr_ruid = ruid;
+		updated = true;
 	}
 
-	/*
-	 * If we are setting the gmuid to KAUTH_UID_NONE, then we want to
-	 * opt out of participation in external group resolution, unless we
-	 * unless we explicitly opt back in later.
-	 */
-	if ((temp_pcred->cr_gmuid = gmuid) == KAUTH_UID_NONE) {
-		temp_pcred->cr_flags |= CRF_NOMEMBERD;
+	if (svuid != KAUTH_UID_NONE && pcred->cr_svuid != svuid) {
+		pcred->cr_svuid = svuid;
+		updated = true;
 	}
 
-	return(kauth_cred_update(cred, &temp_cred, TRUE));
+	if (pcred->cr_gmuid != gmuid) {
+		/*
+		 * If we are setting the gmuid to KAUTH_UID_NONE, then we want
+		 * to opt out of participation in external group resolution,
+		 * unless we explicitly opt back in later.
+		 */
+		pcred->cr_gmuid = gmuid;
+		if (gmuid == KAUTH_UID_NONE) {
+			pcred->cr_flags |= CRF_NOMEMBERD;
+		}
+		updated = true;
+	}
+
+	return updated;
 }
 
 
 /*
- * kauth_cred_setresgid
+ * kauth_cred_model_setresgid
  *
  * Description:	Update the given credential using the GID arguments.  The given
  *		GIDs are used to set the effective GID, real GID, and saved
  *		GID.
  *
- * Parameters:	cred				The original credential
+ * Parameters:	model				The model credential
  *		rgid				The new real GID
  *		egid				The new effective GID
  *		svgid				The new saved GID
  *
  * Returns:	(kauth_cred_t)			The updated credential
- *
- * IMPORTANT:	This function is implemented via kauth_cred_update(), which,
- *		if it returns a credential other than the one it is passed,
- *		will have dropped the reference on the passed credential.  All
- *		callers should be aware of this, and treat this function as an
- *		unref + ref, potentially on different credentials.
- *
- *		Because of this, the caller is expected to take its own
- *		reference on the credential passed as the first parameter,
- *		and be prepared to release the reference on the credential
- *		that is returned to them, if it is not intended to be a
- *		persistent reference.
  */
-kauth_cred_t
-kauth_cred_setresgid(kauth_cred_t cred, gid_t rgid, gid_t egid, gid_t svgid)
+bool
+kauth_cred_model_setresgid(
+	kauth_cred_t            model,
+	gid_t                   rgid,
+	gid_t                   egid,
+	gid_t                   svgid)
 {
-	struct ucred 	temp_cred;
-	posix_cred_t temp_pcred = posix_cred_get(&temp_cred);
-	posix_cred_t pcred = posix_cred_get(cred);
+	posix_cred_t pcred = posix_cred_get(model);
+	bool updated = false;
 
-	NULLCRED_CHECK(cred);
-	DEBUG_CRED_ENTER("kauth_cred_setresgid %p %d %d %d\n", cred, rgid, egid, svgid);
-
-	/*
-	 * We don't need to do anything if the given GID are already the 
-	 * same as the GIDs in the credential.
-	 */
-	if (pcred->cr_groups[0] == egid &&
-	    pcred->cr_rgid == rgid &&
-	    pcred->cr_svgid == svgid) {
-		/* no change needed */
-		return(cred);
-	}
-
-	/*
-	 * Look up in cred hash table to see if we have a matching credential
-	 * with the new values; this is done by calling kauth_cred_update().
-	 */
-	bcopy(cred, &temp_cred, sizeof(temp_cred));
-	if (egid != KAUTH_GID_NONE) {
-		/* displacing a supplementary group opts us out of memberd */
-		if (kauth_cred_change_egid(&temp_cred, egid)) {
-			DEBUG_CRED_CHANGE("displaced!\n");
-			temp_pcred->cr_flags |= CRF_NOMEMBERD;
-			temp_pcred->cr_gmuid = KAUTH_UID_NONE;
-		} else {
-			DEBUG_CRED_CHANGE("not displaced\n");
+	if (egid != KAUTH_GID_NONE && pcred->cr_gid != egid) {
+		if (kauth_cred_change_egid(model, egid)) {
+			pcred->cr_flags |= CRF_NOMEMBERD;
+			pcred->cr_gmuid = KAUTH_UID_NONE;
 		}
-	}
-	if (rgid != KAUTH_GID_NONE) {
-		temp_pcred->cr_rgid = rgid;
-	}
-	if (svgid != KAUTH_GID_NONE) {
-		temp_pcred->cr_svgid = svgid;
+		updated = true;
 	}
 
-	return(kauth_cred_update(cred, &temp_cred, TRUE));
+	if (rgid != KAUTH_GID_NONE && pcred->cr_rgid != rgid) {
+		pcred->cr_rgid = rgid;
+		updated = true;
+	}
+	if (svgid != KAUTH_GID_NONE && pcred->cr_svgid != svgid) {
+		pcred->cr_svgid = svgid;
+		updated = true;
+	}
+
+	return updated;
 }
 
 
 /*
- * Update the given credential with the given groups.  We only allocate a new 
- *	credential when the given gid actually results in changes to the existing 
+ * Update the given credential with the given groups.  We only allocate a new
+ *	credential when the given gid actually results in changes to the existing
  *	credential.
  *	The gmuid argument supplies a new uid (or KAUTH_UID_NONE to opt out)
  *	which will be used for group membership checking.
  */
 /*
- * kauth_cred_setgroups
+ * kauth_cred_model_setgroups
  *
  * Description:	Update the given credential using the provide supplementary
  *		group list and group membership UID
  *
- * Parameters:	cred				The original credential
+ * Parameters:	cred				The model credential
  *		groups				Pointer to gid_t array which
  *						contains the new group list
  *		groupcount			The count of valid groups which
@@ -3994,18 +4118,6 @@ kauth_cred_setresgid(kauth_cred_t cred, gid_t rgid, gid_t egid, gid_t svgid)
  *		setting, so if you don't want it to change, pass it the
  *		previous value, explicitly.
  *
- * IMPORTANT:	This function is implemented via kauth_cred_update(), which,
- *		if it returns a credential other than the one it is passed,
- *		will have dropped the reference on the passed credential.  All
- *		callers should be aware of this, and treat this function as an
- *		unref + ref, potentially on different credentials.
- *
- *		Because of this, the caller is expected to take its own
- *		reference on the credential passed as the first parameter,
- *		and be prepared to release the reference on the credential
- *		that is returned to them, if it is not intended to be a
- *		persistent reference.
- *
  * XXX:		Changes are determined in ordinal order - if the caller passes
  *		in the same groups list that is already present in the
  *		credential, but the members are in a different order, even if
@@ -4016,50 +4128,37 @@ kauth_cred_setresgid(kauth_cred_t cred, gid_t rgid, gid_t egid, gid_t svgid)
  *		This should perhaps be better optimized, but it is considered
  *		to be the caller's problem.
  */
-kauth_cred_t
-kauth_cred_setgroups(kauth_cred_t cred, gid_t *groups, int groupcount, uid_t gmuid)
+bool
+kauth_cred_model_setgroups(
+	kauth_cred_t            model,
+	gid_t                  *groups,
+	size_t                  groupcount,
+	uid_t                   gmuid)
 {
-	int		i;
-	struct ucred temp_cred;
-	posix_cred_t temp_pcred = posix_cred_get(&temp_cred);
-	posix_cred_t pcred;
+	posix_cred_t pcred = posix_cred_get(model);
 
-	NULLCRED_CHECK(cred);
-
-	pcred = posix_cred_get(cred);
+	assert(groupcount <= NGROUPS);
+	groupcount = MIN(groupcount, NGROUPS);
 
 	/*
 	 * We don't need to do anything if the given list of groups does not
 	 * change.
 	 */
-	if ((pcred->cr_gmuid == gmuid) && (pcred->cr_ngroups == groupcount)) {
-		for (i = 0; i < groupcount; i++) {
-			if (pcred->cr_groups[i] != groups[i])
-				break;
-		}
-		if (i == groupcount) {
-			/* no change needed */
-			return(cred);
-		}
+	if (pcred->cr_gmuid == gmuid &&
+	    pcred->cr_ngroups == groupcount &&
+	    memcmp(pcred->cr_groups, groups, groupcount * sizeof(gid_t)) == 0) {
+		return false;
 	}
 
-	/*
-	 * Look up in cred hash table to see if we have a matching credential
-	 * with new values.  If we are setting or clearing the gmuid, then
-	 * update the cr_flags, since clearing it is sticky.  This permits an
-	 * opt-out of memberd processing using setgroups(), and an opt-in
-	 * using initgroups().  This is required for POSIX conformance.
-	 */
-	bcopy(cred, &temp_cred, sizeof(temp_cred));
-	temp_pcred->cr_ngroups = groupcount;
-	bcopy(groups, temp_pcred->cr_groups, sizeof(temp_pcred->cr_groups));
-	temp_pcred->cr_gmuid = gmuid;
-	if (gmuid == KAUTH_UID_NONE)
-		temp_pcred->cr_flags |= CRF_NOMEMBERD;
-	else
-		temp_pcred->cr_flags &= ~CRF_NOMEMBERD;
-
-	return(kauth_cred_update(cred, &temp_cred, TRUE));
+	pcred->cr_gmuid = gmuid;
+	pcred->cr_ngroups = (short)groupcount;
+	memcpy(pcred->cr_groups, groups, groupcount * sizeof(gid_t));
+	if (gmuid == KAUTH_UID_NONE) {
+		pcred->cr_flags |= CRF_NOMEMBERD;
+	} else {
+		pcred->cr_flags &= ~CRF_NOMEMBERD;
+	}
+	return true;
 }
 
 /*
@@ -4074,26 +4173,37 @@ SYSCTL_INT(_kern, OID_AUTO, ds_supgroups_supported, CTLFLAG_RW | CTLFLAG_LOCKED,
 #endif
 
 int
-kauth_cred_getgroups(kauth_cred_t cred, gid_t *grouplist, int *countp)
+kauth_cred_getgroups(kauth_cred_t cred, gid_t *grouplist, size_t *countp)
 {
-	int limit = NGROUPS;
+	size_t limit = NGROUPS;
 	posix_cred_t pcred;
-	
+
+	if (cred == NULL) {
+		KAUTH_DEBUG("kauth_cred_getgroups got NULL credential");
+		return EINVAL;
+	}
+
+	if (grouplist == NULL) {
+		KAUTH_DEBUG("kauth_cred_getgroups got NULL group list");
+		return EINVAL;
+	}
+
 	pcred = posix_cred_get(cred);
 
-#if CONFIG_EXT_RESOLVER  
+#if CONFIG_EXT_RESOLVER
 	/*
 	 * If we've not opted out of using the resolver, then convert the cred to a list
 	 * of supplemental groups. We do this only if there has been a resolver to talk to,
 	 * since we may be too early in boot, or in an environment that isn't using DS.
 	 */
-	if (kauth_identitysvc_has_registered && kauth_external_supplementary_groups_supported && (pcred->cr_flags & CRF_NOMEMBERD) == 0) {		
+	if (kauth_identitysvc_has_registered && kauth_external_supplementary_groups_supported && (pcred->cr_flags & CRF_NOMEMBERD) == 0) {
 		uid_t uid = kauth_cred_getuid(cred);
 		int err;
-		
+
 		err = kauth_cred_uid2groups(&uid, grouplist, countp);
-		if (!err)
+		if (!err) {
 			return 0;
+		}
 
 		/* On error just fall through */
 		KAUTH_DEBUG("kauth_cred_getgroups failed %d\n", err);
@@ -4118,14 +4228,14 @@ kauth_cred_getgroups(kauth_cred_t cred, gid_t *grouplist, int *countp)
 
 
 /*
- * kauth_cred_setuidgid
+ * kauth_cred_model_setuidgid
  *
  * Description:	Update the given credential using the UID and GID arguments.
  *		The given UID is used to set the effective UID, real UID, and
  *		saved UID.  The given GID is used to set the effective GID,
  *		real GID, and saved GID.
  *
- * Parameters:	cred				The original credential
+ * Parameters:	model				The model credential
  *		uid				The new UID to use
  *		gid				The new GID to use
  *
@@ -4139,331 +4249,90 @@ kauth_cred_getgroups(kauth_cred_t cred, gid_t *grouplist, int *countp)
  *		code path in the "set per thread credential" case; and in
  *		posix_spawn() in the case that the POSIX_SPAWN_RESETIDS
  *		flag is set.
- *
- * IMPORTANT:	This function is implemented via kauth_cred_update(), which,
- *		if it returns a credential other than the one it is passed,
- *		will have dropped the reference on the passed credential.  All
- *		callers should be aware of this, and treat this function as an
- *		unref + ref, potentially on different credentials.
- *
- *		Because of this, the caller is expected to take its own
- *		reference on the credential passed as the first parameter,
- *		and be prepared to release the reference on the credential
- *		that is returned to them, if it is not intended to be a
- *		persistent reference.
  */
-kauth_cred_t
-kauth_cred_setuidgid(kauth_cred_t cred, uid_t uid, gid_t gid)
+bool
+kauth_cred_model_setuidgid(kauth_cred_t model, uid_t uid, gid_t gid)
 {
-	struct ucred temp_cred;
-	posix_cred_t temp_pcred = posix_cred_get(&temp_cred);
-	posix_cred_t pcred;
+	struct posix_cred pcred = {
+		.cr_uid     = uid,
+		.cr_ruid    = uid,
+		.cr_svuid   = uid,
 
-	NULLCRED_CHECK(cred);
+		.cr_ngroups = 1,
+		.cr_gid     = gid,
+		.cr_rgid    = gid,
+		.cr_svgid   = gid,
 
-	pcred = posix_cred_get(cred);
+		.cr_flags   = model->cr_posix.cr_flags,
+	};
 
-	/*
-	 * We don't need to do anything if the effective, real and saved
-	 * user IDs are already the same as the user ID passed into us.
-	 */
-	if (pcred->cr_uid == uid && pcred->cr_ruid == uid && pcred->cr_svuid == uid &&
-		pcred->cr_gid == gid && pcred->cr_rgid == gid && pcred->cr_svgid == gid) {
-		/* no change needed */
-		return(cred);
-	}
-
-	/*
-	 * Look up in cred hash table to see if we have a matching credential
-	 * with the new values.
-	 */
-	bzero(&temp_cred, sizeof(temp_cred));
-	temp_pcred->cr_uid = uid;
-	temp_pcred->cr_ruid = uid;
-	temp_pcred->cr_svuid = uid;
-	temp_pcred->cr_flags = pcred->cr_flags;
 	/* inherit the opt-out of memberd */
-	if (pcred->cr_flags & CRF_NOMEMBERD) {
-		temp_pcred->cr_gmuid = KAUTH_UID_NONE;
-		temp_pcred->cr_flags |= CRF_NOMEMBERD;
+	if (pcred.cr_flags & CRF_NOMEMBERD) {
+		pcred.cr_gmuid = KAUTH_UID_NONE;
 	} else {
-		temp_pcred->cr_gmuid = uid;
-		temp_pcred->cr_flags &= ~CRF_NOMEMBERD;
+		pcred.cr_gmuid = uid;
 	}
-	temp_pcred->cr_ngroups = 1;
-	/* displacing a supplementary group opts us out of memberd */
-	if (kauth_cred_change_egid(&temp_cred, gid)) {
-		temp_pcred->cr_gmuid = KAUTH_UID_NONE;
-		temp_pcred->cr_flags |= CRF_NOMEMBERD;
-	}
-	temp_pcred->cr_rgid = gid;
-	temp_pcred->cr_svgid = gid;
-#if CONFIG_MACF
-	temp_cred.cr_label = cred->cr_label;
-#endif
 
-	return(kauth_cred_update(cred, &temp_cred, TRUE));
+	if (memcmp(&model->cr_posix, &pcred, sizeof(struct posix_cred)) != 0) {
+		model->cr_posix = pcred;
+		return true;
+	}
+
+	return false;
 }
 
 
 /*
- * kauth_cred_setsvuidgid
+ * kauth_cred_model_setauditinfo
  *
- * Description:	Function used by execve to set the saved uid and gid values
- *		for suid/sgid programs
- *
- * Parameters:	cred				The credential to update
- *		uid				The saved uid to set
- *		gid				The saved gid to set
- *
- * Returns:	(kauth_cred_t)			The updated credential
- *
- * IMPORTANT:	This function is implemented via kauth_cred_update(), which,
- *		if it returns a credential other than the one it is passed,
- *		will have dropped the reference on the passed credential.  All
- *		callers should be aware of this, and treat this function as an
- *		unref + ref, potentially on different credentials.
- *
- *		Because of this, the caller is expected to take its own
- *		reference on the credential passed as the first parameter,
- *		and be prepared to release the reference on the credential
- *		that is returned to them, if it is not intended to be a
- *		persistent reference.
- */
-kauth_cred_t
-kauth_cred_setsvuidgid(kauth_cred_t cred, uid_t uid, gid_t gid)
-{
-	struct ucred temp_cred;
-	posix_cred_t temp_pcred = posix_cred_get(&temp_cred);
-	posix_cred_t pcred;
-
-	NULLCRED_CHECK(cred);
-
-	pcred = posix_cred_get(cred);
-
-	DEBUG_CRED_ENTER("kauth_cred_setsvuidgid: %p u%d->%d g%d->%d\n", cred, cred->cr_svuid, uid, cred->cr_svgid, gid);
-
-	/*
-	 * We don't need to do anything if the effective, real and saved
-	 * uids are already the same as the uid provided.  This check is
-	 * likely insufficient.
-	 */
-	if (pcred->cr_svuid == uid && pcred->cr_svgid == gid) {
-		/* no change needed */
-		return(cred);
-	}
-	DEBUG_CRED_CHANGE("kauth_cred_setsvuidgid: cred change\n");
-
-	/* look up in cred hash table to see if we have a matching credential
-	 * with new values.
-	 */
-	bcopy(cred, &temp_cred, sizeof(temp_cred));
-	temp_pcred->cr_svuid = uid;
-	temp_pcred->cr_svgid = gid;
-
-	return(kauth_cred_update(cred, &temp_cred, TRUE));
-}
-
-
-/*
- * kauth_cred_setauditinfo
- * 
  * Description:	Update the given credential using the given au_session_t.
  *
- * Parameters:	cred				The original credential
+ * Parameters:	model				The model credential
  *		auditinfo_p			Pointer to ne audit information
  *
  * Returns:	(kauth_cred_t)			The updated credential
- *
- * IMPORTANT:	This function is implemented via kauth_cred_update(), which,
- *		if it returns a credential other than the one it is passed,
- *		will have dropped the reference on the passed credential.  All
- *		callers should be aware of this, and treat this function as an
- *		unref + ref, potentially on different credentials.
- *
- *		Because of this, the caller is expected to take its own
- *		reference on the credential passed as the first parameter,
- *		and be prepared to release the reference on the credential
- *		that is returned to them, if it is not intended to be a
- *		persistent reference.
  */
-kauth_cred_t
-kauth_cred_setauditinfo(kauth_cred_t cred, au_session_t *auditinfo_p)
+bool
+kauth_cred_model_setauditinfo(kauth_cred_t model, au_session_t *auditinfo_p)
 {
-	struct ucred temp_cred;
-
-	NULLCRED_CHECK(cred);
-
-	/*
-	 * We don't need to do anything if the audit info is already the
-	 * same as the audit info in the credential provided.
-	 */
-	if (bcmp(&cred->cr_audit, auditinfo_p, sizeof(cred->cr_audit)) == 0) {
-		/* no change needed */
-		return(cred);
+	if (memcmp(&model->cr_audit, auditinfo_p, sizeof(model->cr_audit)) != 0) {
+		model->cr_audit = *auditinfo_p;
+		return true;
 	}
 
-	bcopy(cred, &temp_cred, sizeof(temp_cred));
-	bcopy(auditinfo_p, &temp_cred.cr_audit, sizeof(temp_cred.cr_audit));
 
-	return(kauth_cred_update(cred, &temp_cred, FALSE));
+	return false;
 }
 
 #if CONFIG_MACF
-/*
- * kauth_cred_label_update
- * 
- * Description:	Update the MAC label associated with a credential
- *
- * Parameters:	cred				The original credential
- *		label				The MAC label to set
- *
- * Returns:	(kauth_cred_t)			The updated credential
- *
- * IMPORTANT:	This function is implemented via kauth_cred_update(), which,
- *		if it returns a credential other than the one it is passed,
- *		will have dropped the reference on the passed credential.  All
- *		callers should be aware of this, and treat this function as an
- *		unref + ref, potentially on different credentials.
- *
- *		Because of this, the caller is expected to take its own
- *		reference on the credential passed as the first parameter,
- *		and be prepared to release the reference on the credential
- *		that is returned to them, if it is not intended to be a
- *		persistent reference.
- */
 kauth_cred_t
 kauth_cred_label_update(kauth_cred_t cred, struct label *label)
 {
-	kauth_cred_t newcred;
-	struct ucred temp_cred;
+	kauth_cred_t new_cred;
 
-	bcopy(cred, &temp_cred, sizeof(temp_cred));
+	new_cred = kauth_cred_derive(cred,
+	    ^bool (kauth_cred_t parent, kauth_cred_t model) {
+		mac_cred_label_init(model);
+		mac_cred_label_associate(parent, model);
+		mac_cred_label_update(model, label);
+		return true;
+	});
 
-	mac_cred_label_init(&temp_cred);
-	mac_cred_label_associate(cred, &temp_cred);
-	mac_cred_label_update(&temp_cred, label);
-
-	newcred = kauth_cred_update(cred, &temp_cred, TRUE);
-	mac_cred_label_destroy(&temp_cred);
-	return (newcred);
+	kauth_cred_unref(&cred);
+	return new_cred;
 }
 
-/*
- * kauth_cred_label_update_execve
- * 
- * Description:	Update the MAC label associated with a credential as
- *		part of exec
- *
- * Parameters:	cred				The original credential
- *		vp				The exec vnode
- *		scriptl				The script MAC label
- *		execl				The executable MAC label
- *		disjointp			Pointer to flag to set if old
- *						and returned credentials are
- *						disjoint
- *
- * Returns:	(kauth_cred_t)			The updated credential
- *
- * Implicit returns:
- *		*disjointp			Set to 1 for disjoint creds
- *
- * IMPORTANT:	This function is implemented via kauth_cred_update(), which,
- *		if it returns a credential other than the one it is passed,
- *		will have dropped the reference on the passed credential.  All
- *		callers should be aware of this, and treat this function as an
- *		unref + ref, potentially on different credentials.
- *
- *		Because of this, the caller is expected to take its own
- *		reference on the credential passed as the first parameter,
- *		and be prepared to release the reference on the credential
- *		that is returned to them, if it is not intended to be a
- *		persistent reference.
- */
-static
-kauth_cred_t
-kauth_cred_label_update_execve(kauth_cred_t cred, vfs_context_t ctx,
-	struct vnode *vp, struct vnode *scriptvp, struct label *scriptl,
-	struct label *execl, void *macextensions, int *disjointp)
+int
+kauth_proc_label_update(struct proc *p, struct label *label)
 {
-	kauth_cred_t newcred;
-	struct ucred temp_cred;
-
-	bcopy(cred, &temp_cred, sizeof(temp_cred));
-
-	mac_cred_label_init(&temp_cred);
-	mac_cred_label_associate(cred, &temp_cred);
-	*disjointp = mac_cred_label_update_execve(ctx, &temp_cred, 
-						  vp, scriptvp, scriptl, execl,
-						  macextensions);
-
-	newcred = kauth_cred_update(cred, &temp_cred, TRUE);
-	mac_cred_label_destroy(&temp_cred);
-	return (newcred);
-}
-
-/*
- *  kauth_proc_label_update
- *
- * Description:  Update the label inside the credential associated with the process.
- *
- * Parameters:	p			The process to modify
- *				label		The label to place in the process credential
- *
- * Notes:		The credential associated with the process may change as a result
- *				of this call.  The caller should not assume the process reference to
- *				the old credential still exists.
- */
-int kauth_proc_label_update(struct proc *p, struct label *label)
-{
-	kauth_cred_t my_cred, my_new_cred;
-
-	my_cred = kauth_cred_proc_ref(p);
-
-	DEBUG_CRED_ENTER("kauth_proc_label_update: %p\n", my_cred);
-
-	/* get current credential and take a reference while we muck with it */
-	for (;;) {
-
-  		/* 
-		 * Set the credential with new info.  If there is no change,
-		 * we get back the same credential we passed in; if there is
-		 * a change, we drop the reference on the credential we
-		 * passed in.  The subsequent compare is safe, because it is
-		 * a pointer compare rather than a contents compare.
-  		 */
-		my_new_cred = kauth_cred_label_update(my_cred, label);
-		if (my_cred != my_new_cred) {
-
-			DEBUG_CRED_CHANGE("kauth_proc_setlabel_unlocked CH(%d): %p/0x%08x -> %p/0x%08x\n", p->p_pid, my_cred, my_cred->cr_flags, my_new_cred, my_new_cred->cr_flags);
-
-			proc_lock(p);
-			/*
-			 * We need to protect for a race where another thread
-			 * also changed the credential after we took our
-			 * reference.  If p_ucred has changed then we should
-			 * restart this again with the new cred.
-			 */
-			if (p->p_ucred != my_cred) {
-				proc_unlock(p);
-				kauth_cred_unref(&my_new_cred);
-				my_cred = kauth_cred_proc_ref(p);
-				/* try again */
-				continue;
-			}
-			p->p_ucred = my_new_cred;
-			/* update cred on proc */
-			PROC_UPDATE_CREDS_ONPROC(p);
-
-			mac_proc_set_enforce(p, MAC_ALL_ENFORCE);
-			proc_unlock(p);
-		}
-		break;
-	}
-	/* Drop old proc reference or our extra reference */
-	kauth_cred_unref(&my_cred);
-	
-	return (0);
+	kauth_cred_proc_update(p, PROC_SETTOKEN_NONE,
+	    ^bool (kauth_cred_t parent, kauth_cred_t model) {
+		mac_cred_label_init(model);
+		mac_cred_label_associate(parent, model);
+		mac_cred_label_update(model, label);
+		return true;
+	});
+	return 0;
 }
 
 /*
@@ -4479,6 +4348,8 @@ int kauth_proc_label_update(struct proc *p, struct label *label)
  *		vp			The vnode being exec'ed
  *		scriptl			The script MAC label
  *		execl			The executable MAC label
+ *		lupdateerror	The error place holder for MAC label authority
+ *						to update about possible termination
  *
  * Returns:	0			Label update did not make credential
  *					disjoint
@@ -4489,363 +4360,96 @@ int kauth_proc_label_update(struct proc *p, struct label *label)
  *		result of this call.  The caller should not assume the process
  *		reference to the old credential still exists.
  */
-int
+
+void
 kauth_proc_label_update_execve(struct proc *p, vfs_context_t ctx,
-	struct vnode *vp, struct vnode *scriptvp, struct label *scriptl,
-	struct label *execl, void *macextensions)
+    struct vnode *vp, off_t offset, struct vnode *scriptvp, struct label *scriptl,
+    struct label *execl, unsigned int *csflags, void *macextensions, int *disjoint, int *update_return)
 {
-	kauth_cred_t my_cred, my_new_cred;
-	int disjoint = 0;
-
-	my_cred = kauth_cred_proc_ref(p);
-
-	DEBUG_CRED_ENTER("kauth_proc_label_update_execve: %p\n", my_cred);
-
-	/* get current credential and take a reference while we muck with it */
-	for (;;) {
-
-  		/* 
-		 * Set the credential with new info.  If there is no change,
-		 * we get back the same credential we passed in; if there is
-		 * a change, we drop the reference on the credential we
-		 * passed in.  The subsequent compare is safe, because it is
-		 * a pointer compare rather than a contents compare.
-  		 */
-		my_new_cred = kauth_cred_label_update_execve(my_cred, ctx, vp, scriptvp, scriptl, execl, macextensions, &disjoint);
-		if (my_cred != my_new_cred) {
-
-			DEBUG_CRED_CHANGE("kauth_proc_label_update_execve_unlocked CH(%d): %p/0x%08x -> %p/0x%08x\n", p->p_pid, my_cred, my_cred->cr_flags, my_new_cred, my_new_cred->cr_flags);
-
-			proc_lock(p);
-			/*
-			 * We need to protect for a race where another thread
-			 * also changed the credential after we took our
-			 * reference.  If p_ucred has changed then we should
-			 * restart this again with the new cred.
-			 */
-			if (p->p_ucred != my_cred) {
-				proc_unlock(p);
-				kauth_cred_unref(&my_new_cred);
-				my_cred = kauth_cred_proc_ref(p);
-				/* try again */
-				continue;
-			}
-			p->p_ucred = my_new_cred;
-			/* update cred on proc */
-			PROC_UPDATE_CREDS_ONPROC(p);
-			mac_proc_set_enforce(p, MAC_ALL_ENFORCE);
-			proc_unlock(p);
-		}
-		break;
-	}
-	/* Drop old proc reference or our extra reference */
-	kauth_cred_unref(&my_cred);
-	
-	return (disjoint);
+	kauth_cred_proc_update(p, PROC_SETTOKEN_NONE,
+	    ^bool (kauth_cred_t parent, kauth_cred_t model) {
+		mac_cred_label_init(model);
+		mac_cred_label_associate(parent, model);
+		mac_cred_label_update_execve(ctx, model,
+		vp, offset, scriptvp, scriptl, execl, csflags,
+		macextensions, disjoint, update_return);
+		return true;
+	});
 }
-
-#if 1
-/*
- * for temporary binary compatibility
- */
-kauth_cred_t	kauth_cred_setlabel(kauth_cred_t cred, struct label *label);
-kauth_cred_t
-kauth_cred_setlabel(kauth_cred_t cred, struct label *label)
-{
-	return kauth_cred_label_update(cred, label);
-}
-
-int kauth_proc_setlabel(struct proc *p, struct label *label);
-int
-kauth_proc_setlabel(struct proc *p, struct label *label)
-{
-	return kauth_proc_label_update(p, label);
-}
-#endif
-
 #else
-
-/* this is a temp hack to cover us when MACF is not built in a kernel configuration. 
- * Since we cannot build our export lists based on the kernel configuration we need
- * to define a stub. 
- */
 kauth_cred_t
-kauth_cred_label_update(__unused kauth_cred_t cred, __unused void *label)
-{
-	return(NULL);
-}
-
-int
-kauth_proc_label_update(__unused struct proc *p, __unused void *label)
-{
-	return (0);
-}
-
-#if 1
-/*
- * for temporary binary compatibility
- */
-kauth_cred_t	kauth_cred_setlabel(kauth_cred_t cred, void *label);
-kauth_cred_t
-kauth_cred_setlabel(__unused kauth_cred_t cred, __unused void *label)
+kauth_cred_label_update(__unused kauth_cred_t cred, __unused struct label *label)
 {
 	return NULL;
 }
 
-int kauth_proc_setlabel(struct proc *p, void *label);
 int
-kauth_proc_setlabel(__unused struct proc *p, __unused void *label)
+kauth_proc_label_update(__unused struct proc *p, __unused struct label *label)
 {
-	return (0);
+	return 0;
 }
 #endif
-#endif
 
-/*
- * kauth_cred_ref
- *
- * Description:	Add a reference to the passed credential
- *
- * Parameters:	cred				The credential to reference
- *
- * Returns:	(void)
- *
- * Notes:	This function adds a reference to the provided credential;
- *		the existing reference on the credential is assumed to be
- *		held stable over this operation by taking the appropriate
- *		lock to protect the pointer from which it is being referenced,
- *		if necessary (e.g. the proc lock is held over the call if the
- *		credential being referenced is from p_ucred, the vnode lock
- *		if from the per vnode name cache cred cache, and so on).
- *
- *		This is safe from the kauth_cred_unref() path, since an atomic
- *		add is used, and the unref path specifically checks to see that
- *		the value has not been changed to add a reference between the
- *		time the credential is unreferenced by another pointer and the
- *		time it is unreferenced from the cred hash cache.
- */
+
 void
 kauth_cred_ref(kauth_cred_t cred)
 {
-	int		old_value;
-	
-	NULLCRED_CHECK(cred);
-
-	old_value = OSAddAtomicLong(1, (long*)&cred->cr_ref);
-
-	if (old_value < 1)
-		panic("kauth_cred_ref: trying to take a reference on a cred with no references");
-
-#if 0 // use this to watch a specific credential
-	if ( is_target_cred( cred ) != 0 ) {
- 		get_backtrace( );
-	}
-#endif
-		
-	return;
+	ucred_rw_ref(kauth_cred_rw(cred));
 }
 
-
-/*
- * kauth_cred_unref_hashlocked
- *
- * Description:	release a credential reference; when the last reference is
- *		released, the credential will be freed.
- *
- * Parameters:	credp				Pointer to address containing
- *						credential to be freed
- *
- * Returns:	TRUE if the credential must be destroyed by the caller.
- *		FALSE otherwise.
- *
- * Implicit returns:
- *		*credp				Set to NOCRED
- *
- * Notes:	This function assumes the credential hash lock is held.
- *
- *		This function is internal use only, since the hash lock is
- *		scoped to this compilation unit.
- *
- *		This function destroys the contents of the pointer passed by
- *		the caller to prevent the caller accidentally attempting to
- *		release a given reference twice in error.
- *
- *		The last reference is considered to be released when a release
- *		of a credential of a reference count of 2 occurs; this is an
- *		intended effect, to take into account the reference held by
- *		the credential hash, which is released at the same time.
- */
-static boolean_t
-kauth_cred_unref_hashlocked(kauth_cred_t *credp)
+void
+(kauth_cred_unref)(kauth_cred_t * credp)
 {
-	int		old_value;
-	boolean_t	destroy_it = FALSE;
+	struct ucred    *cred = *credp;
+	struct ucred_rw *rw   = kauth_cred_rw(cred);
 
-	KAUTH_CRED_HASH_LOCK_ASSERT();
-	NULLCRED_CHECK(*credp);
+	*credp = NOCRED;
 
-	old_value = OSAddAtomicLong(-1, (long*)&(*credp)->cr_ref);
-
-#if DIAGNOSTIC
-	if (old_value == 0)
-		panic("%s:0x%08x kauth_cred_unref_hashlocked: dropping a reference on a cred with no references", current_proc()->p_comm, *credp);
-	if (old_value == 1)
-		panic("%s:0x%08x kauth_cred_unref_hashlocked: dropping a reference on a cred with no hash entry", current_proc()->p_comm, *credp);
-#endif
-
-#if 0 // use this to watch a specific credential
-	if ( is_target_cred( *credp ) != 0 ) {
-		get_backtrace( );
+	if (ucred_rw_unref(rw) == 0) {
+		kauth_cred_retire(rw, cred);
 	}
-#endif
-
-	/*
-	 * If the old_value is 2, then we have just released the last external
-	 * reference to this credential
-	 */
-	if (old_value < 3) {
-		/* The last absolute reference is our credential hash table */
-		destroy_it = kauth_cred_remove(*credp);
-	}
-
-	if (destroy_it == FALSE) {
-		*credp = NOCRED;
-	}
-
-	return (destroy_it);
 }
 
-
 /*
- * kauth_cred_unref
+ * kauth_cred_set
  *
- * Description:	Release a credential reference while holding the credential
- *		hash lock; when the last reference is released, the credential
- *		will be freed.
+ * Description:	Store a long-term credential reference to a credential pointer,
+ *		dropping the long-term reference on any previous credential held
+ *		at the address.
  *
- * Parameters:	credp				Pointer to address containing
- *						credential to be freed
+ * Parameters:	credp				Pointer to the credential
+ *						storage field.  If *credp points
+ *						to a valid credential before
+ *						this call, its long-term
+ *						reference will be dropped.
+ *		new_cred			The new credential to take a
+ *						long-term reference to and
+ *						assign to *credp.  May be
+ *						NOCRED.
  *
  * Returns:	(void)
  *
- * Implicit returns:
- *		*credp				Set to NOCRED
- *
- * Notes:	See kauth_cred_unref_hashlocked() for more information.
- *
+ * Notes:	Taking/dropping a long-term reference is costly in terms of
+ *		performance.
  */
 void
-kauth_cred_unref(kauth_cred_t *credp)
+(kauth_cred_set)(kauth_cred_t * credp, kauth_cred_t new_cred)
 {
-	boolean_t destroy_it;
+	kauth_cred_t old_cred = *credp;
 
-	KAUTH_CRED_HASH_LOCK();
-	destroy_it = kauth_cred_unref_hashlocked(credp);
-	KAUTH_CRED_HASH_UNLOCK();
+	if (old_cred != new_cred) {
+		if (IS_VALID_CRED(new_cred)) {
+			kauth_cred_ref(new_cred);
+			kauth_cred_hold(new_cred);
+		}
 
-	if (destroy_it == TRUE) {
-		assert(*credp != NOCRED);
-#if CONFIG_MACF
-		mac_cred_label_destroy(*credp);
-#endif
-		AUDIT_SESSION_UNREF(*credp);
+		*credp = new_cred;
 
-		(*credp)->cr_ref = 0;
-		FREE_ZONE(*credp, sizeof(*(*credp)), M_CRED);
-		*credp = NOCRED;
+		if (IS_VALID_CRED(old_cred)) {
+			kauth_cred_drop(old_cred);
+			kauth_cred_unref(&old_cred);
+		}
 	}
-}
-
-
-#ifndef __LP64__
-/*
- * kauth_cred_rele
- *
- * Description:	release a credential reference; when the last reference is
- *		released, the credential will be freed
- *
- * Parameters:	cred				Credential to release
- *
- * Returns:	(void)
- *
- * DEPRECATED:	This interface is obsolete due to a failure to clear out the
- *		clear the pointer in the caller to avoid multiple releases of
- *		the same credential.  The currently recommended interface is
- *		kauth_cred_unref().
- */
-void
-kauth_cred_rele(kauth_cred_t cred)
-{
-	kauth_cred_unref(&cred);
-}
-#endif /* !__LP64__ */
-
-
-/*
- * kauth_cred_dup
- *
- * Description:	Duplicate a credential via alloc and copy; the new credential
- *		has only it's own
- *
- * Parameters:	cred				The credential to duplicate
- *
- * Returns:	(kauth_cred_t)			The duplicate credential
- *
- * Notes:	The typical value to calling this routine is if you are going
- *		to modify an existing credential, and expect to need a new one
- *		from the hash cache.
- *
- *		This should probably not be used in the majority of cases;
- *		if you are using it instead of kauth_cred_create(), you are
- *		likely making a mistake.
- *
- *		The newly allocated credential is copied as part of the
- *		allocation process, with the exception of the reference
- *		count, which is set to 1 to indicate a single reference
- *		held by the caller.
- *
- *		Since newly allocated credentials have no external pointers
- *		referencing them, prior to making them visible in an externally
- *		visible pointer (e.g. by adding them to the credential hash
- *		cache) is the only legal time in which an existing credential
- *		can be safely initialized or modified directly.
- *
- *		After initialization, the caller is expected to call the
- *		function kauth_cred_add() to add the credential to the hash
- *		cache, after which time it's frozen and becomes publicly
- *		visible.
- *
- *		The release protocol depends on kauth_hash_add() being called
- *		before kauth_cred_rele() (there is a diagnostic panic which
- *		will trigger if this protocol is not observed).
- *
- */
-kauth_cred_t
-kauth_cred_dup(kauth_cred_t cred)
-{
-	kauth_cred_t newcred;
-#if CONFIG_MACF
-	struct label *temp_label;
-#endif
-	
-#if CRED_DIAGNOSTIC
-	if (cred == NOCRED || cred == FSCRED)
-		panic("kauth_cred_dup: bad credential");
-#endif
-	newcred = kauth_cred_alloc();
-	if (newcred != NULL) {
-#if CONFIG_MACF
-		temp_label = newcred->cr_label;
-#endif
-		bcopy(cred, newcred, sizeof(*newcred));
-#if CONFIG_MACF
-		newcred->cr_label = temp_label;
-		mac_cred_label_associate(cred, newcred);
-#endif
-		AUDIT_SESSION_REF(cred);
-		newcred->cr_ref = 1;
-	}
-	return(newcred);
 }
 
 /*
@@ -4868,765 +4472,125 @@ kauth_cred_dup(kauth_cred_t cred)
 kauth_cred_t
 kauth_cred_copy_real(kauth_cred_t cred)
 {
-	kauth_cred_t newcred = NULL, found_cred;
-	struct ucred temp_cred;
-	posix_cred_t temp_pcred = posix_cred_get(&temp_cred);
-	posix_cred_t pcred = posix_cred_get(cred);
+	kauth_cred_derive_t fn = ^bool (kauth_cred_t parent __unused, kauth_cred_t model) {
+		posix_cred_t pcred = posix_cred_get(model);
 
-	/* if the credential is already 'real', just take a reference */
-	if ((pcred->cr_ruid == pcred->cr_uid) &&
-	    (pcred->cr_rgid == pcred->cr_gid)) {
-		kauth_cred_ref(cred);
-		return(cred);
+		/* if the credential is already 'real', just take a reference */
+		if ((pcred->cr_ruid == pcred->cr_uid) &&
+		    (pcred->cr_rgid == pcred->cr_gid)) {
+			return false;
+		}
+
+		pcred->cr_uid = pcred->cr_ruid;
+		/* displacing a supplementary group opts us out of memberd */
+		if (kauth_cred_change_egid(model, pcred->cr_rgid)) {
+			pcred->cr_flags |= CRF_NOMEMBERD;
+			pcred->cr_gmuid = KAUTH_UID_NONE;
+		}
+		/*
+		 * If the cred is not opted out, make sure we are using the r/euid
+		 * for group checks
+		 */
+		if (pcred->cr_gmuid != KAUTH_UID_NONE) {
+			pcred->cr_gmuid = pcred->cr_ruid;
+		}
+		return true;
+	};
+
+	return kauth_cred_derive(cred, fn);
+}
+
+/*
+ * Hash table traits methods
+ */
+static smrh_key_t
+kauth_cred_key(kauth_cred_t cred)
+{
+	return (smrh_key_t){ .smrk_opaque = cred };
+}
+
+static uint32_t
+kauth_cred_ro_hash(const struct ucred *cred, uint32_t seed)
+{
+	uint32_t hash = seed;
+
+	hash = os_hash_jenkins_update(&cred->cr_posix,
+	    sizeof(struct posix_cred), hash);
+	hash = os_hash_jenkins_update(&cred->cr_audit,
+	    sizeof(struct au_session), hash);
+#if CONFIG_MACF
+	if (cred->cr_posix.cr_flags & CRF_MAC_ENFORCE) {
+		hash = mac_cred_label_hash_update(cred->cr_label, hash);
 	}
+#endif /* CONFIG_MACF */
+
+	return hash;
+}
+static uint32_t
+kauth_cred_key_hash(smrh_key_t key, uint32_t seed)
+{
+	return kauth_cred_ro_hash(key.smrk_opaque, seed);
+}
+static uint32_t
+kauth_cred_obj_hash(const struct smrq_slink *link, uint32_t seed)
+{
+	const struct ucred_rw *rw;
+
+	rw = __container_of(link, struct ucred_rw, crw_link);
+	/* this is used during rehash, re-auth the objects as we do */
+	return kauth_cred_ro_hash(kauth_cred_ro(rw), seed);
+}
+
+static bool
+kauth_cred_key_equ(smrh_key_t k1, smrh_key_t k2)
+{
+	const struct ucred *cred1 = k1.smrk_opaque;
+	const struct ucred *cred2 = k2.smrk_opaque;
+	const struct posix_cred *pcred1 = &cred1->cr_posix;
+	const struct posix_cred *pcred2 = &cred2->cr_posix;
 
 	/*
-	 * Look up in cred hash table to see if we have a matching credential
-	 * with the new values.
+	 * don't worry about the label unless the flags in
+	 * either credential tell us to.
 	 */
-	bcopy(cred, &temp_cred, sizeof(temp_cred));
-	temp_pcred->cr_uid = pcred->cr_ruid;
-	/* displacing a supplementary group opts us out of memberd */
-	if (kauth_cred_change_egid(&temp_cred, pcred->cr_rgid)) {
-		temp_pcred->cr_flags |= CRF_NOMEMBERD;
-		temp_pcred->cr_gmuid = KAUTH_UID_NONE;
+	if (memcmp(pcred1, pcred2, sizeof(*pcred1))) {
+		return false;
 	}
-	/*
-	 * If the cred is not opted out, make sure we are using the r/euid
-	 * for group checks
-	 */
-	if (temp_pcred->cr_gmuid != KAUTH_UID_NONE)
-		temp_pcred->cr_gmuid = pcred->cr_ruid;
-
-	for (;;) {
-		int		err;
-		
-		KAUTH_CRED_HASH_LOCK();
-		found_cred = kauth_cred_find(&temp_cred);
-		if (found_cred == cred) {
-			/* same cred so just bail */
-			KAUTH_CRED_HASH_UNLOCK();
-			return(cred); 
-		}
-		if (found_cred != NULL) {
-			/*
-			 * Found a match so we bump reference count on new
-			 * one.  We leave the old one alone.
-			 */
-			kauth_cred_ref(found_cred);
-			KAUTH_CRED_HASH_UNLOCK();
-			return(found_cred);
-		}
-	
-		/*
-		 * Must allocate a new credential, copy in old credential
-		 * data and update the real user and group IDs.
-		 */
-		newcred = kauth_cred_dup(&temp_cred);
-		err = kauth_cred_add(newcred);
-		KAUTH_CRED_HASH_UNLOCK();
-
-		/* Retry if kauth_cred_add() fails */
-		if (err == 0)
-			break;
+	if (memcmp(&cred1->cr_audit, &cred2->cr_audit, sizeof(cred1->cr_audit))) {
+		return false;
+	}
 #if CONFIG_MACF
-		mac_cred_label_destroy(newcred);
-#endif
-		AUDIT_SESSION_UNREF(newcred);
-
-		FREE_ZONE(newcred, sizeof(*newcred), M_CRED);
-		newcred = NULL;
-	}
-	
-	return(newcred);
-}
-
-
-/*
- * kauth_cred_update
- *
- * Description:	Common code to update a credential
- *
- * Parameters:	old_cred			Reference counted credential
- *						to update
- *		model_cred			Non-reference counted model
- *						credential to apply to the
- *						credential to be updated
- *		retain_auditinfo		Flag as to whether or not the
- *						audit information should be
- *						copied from the old_cred into
- *						the model_cred
- *
- * Returns:	(kauth_cred_t)			The updated credential
- *
- * IMPORTANT:	This function will potentially return a credential other than
- *		the one it is passed, and if so, it will have dropped the
- *		reference on the passed credential.  All callers should be
- *		aware of this, and treat this function as an unref + ref,
- *		potentially on different credentials.
- *
- *		Because of this, the caller is expected to take its own
- *		reference on the credential passed as the first parameter,
- *		and be prepared to release the reference on the credential
- *		that is returned to them, if it is not intended to be a
- *		persistent reference.
- */
-static kauth_cred_t
-kauth_cred_update(kauth_cred_t old_cred, kauth_cred_t model_cred,
-	boolean_t retain_auditinfo)
-{	
-	kauth_cred_t found_cred, new_cred = NULL;
-	
-	/*
-	 * Make sure we carry the auditinfo forward to the new credential
-	 * unless we are actually updating the auditinfo.
-	 */
-	if (retain_auditinfo) {
-		bcopy(&old_cred->cr_audit, &model_cred->cr_audit, 
-		    sizeof(model_cred->cr_audit));
-	}
-	
-	for (;;) {
-		int		err;
-
-		KAUTH_CRED_HASH_LOCK();
-		found_cred = kauth_cred_find(model_cred);
-		if (found_cred == old_cred) {
-			/* same cred so just bail */
-			KAUTH_CRED_HASH_UNLOCK();
-			return(old_cred); 
+	/* Note: we know the flags are equal, so we only need to test one */
+	if (pcred1->cr_flags & CRF_MAC_ENFORCE) {
+		if (!mac_cred_label_is_equal(cred1->cr_label, cred2->cr_label)) {
+			return false;
 		}
-		if (found_cred != NULL) {
-			boolean_t destroy_it;
-
-			DEBUG_CRED_CHANGE("kauth_cred_update(cache hit): %p -> %p\n", old_cred, found_cred);
-			/*
-			 * Found a match so we bump reference count on new
-			 * one and decrement reference count on the old one.
-			 */
-			kauth_cred_ref(found_cred);
-			destroy_it = kauth_cred_unref_hashlocked(&old_cred);
-			KAUTH_CRED_HASH_UNLOCK();
-			if (destroy_it == TRUE) {
-				assert(old_cred != NOCRED);
-#if CONFIG_MACF
-				mac_cred_label_destroy(old_cred);
-#endif
-				AUDIT_SESSION_UNREF(old_cred);
-
-				old_cred->cr_ref = 0;
-				FREE_ZONE(old_cred, sizeof(*old_cred), M_CRED);
-				old_cred = NOCRED;
-
-			}
-			return(found_cred);
-		}
-
-		/*
-		 * Must allocate a new credential using the model.  also
-		 * adds the new credential to the credential hash table.
-		 */
-		new_cred = kauth_cred_dup(model_cred);
-		err = kauth_cred_add(new_cred);
-		KAUTH_CRED_HASH_UNLOCK();
-
-		/* retry if kauth_cred_add returns non zero value */
-		if (err == 0)
-			break;
-#if CONFIG_MACF
-		mac_cred_label_destroy(new_cred);
-#endif
-		AUDIT_SESSION_UNREF(new_cred);
-
-		FREE_ZONE(new_cred, sizeof(*new_cred), M_CRED);
-		new_cred = NULL;
-	}
-
-	DEBUG_CRED_CHANGE("kauth_cred_update(cache miss): %p -> %p\n", old_cred, new_cred);
-	kauth_cred_unref(&old_cred);
-	return(new_cred);
-}
-
-
-/*
- * kauth_cred_add
- *
- * Description:	Add the given credential to our credential hash table and
- *		take an additional reference to account for our use of the
- *		credential in the hash table
- *
- * Parameters:	new_cred			Credential to insert into cred
- *						hash cache
- *
- * Returns:	0				Success
- *		-1				Hash insertion failed: caller
- *						should retry
- *
- * Locks:	Caller is expected to hold KAUTH_CRED_HASH_LOCK
- *
- * Notes:	The 'new_cred' MUST NOT already be in the cred hash cache
- */
-static int
-kauth_cred_add(kauth_cred_t new_cred)
-{
-	u_long			hash_key;
-
-	KAUTH_CRED_HASH_LOCK_ASSERT();
-
-	hash_key = kauth_cred_get_hashkey(new_cred);
-	hash_key %= kauth_cred_table_size;
-
-	/* race fix - there is a window where another matching credential 
-	 * could have been inserted between the time this one was created and we
-	 * got the hash lock.  If we find a match return an error and have the 
-	 * the caller retry.
-	 */
-	if (kauth_cred_find(new_cred) != NULL) {
-		return(-1);
-	}
-	
-	/* take a reference for our use in credential hash table */ 
-	kauth_cred_ref(new_cred);
-
-	/* insert the credential into the hash table */
-	TAILQ_INSERT_HEAD(&kauth_cred_table_anchor[hash_key], new_cred, cr_link);
-	
-	return(0);
-}
-
-
-/* 
- * kauth_cred_remove
- *
- * Description:	Remove the given credential from our credential hash table
- *
- * Parameters:	cred				Credential to remove from cred
- *						hash cache
- *
- * Returns:	TRUE if the cred was found & removed from the hash; FALSE if not.
- *
- * Locks:	Caller is expected to hold KAUTH_CRED_HASH_LOCK
- *
- * Notes:	The check for the reference increment after entry is generally
- *		agree to be safe, since we use atomic operations, and the
- *		following code occurs with the hash lock held; in theory, this
- *		protects us from the 2->1 reference that gets us here.
- */
-static boolean_t
-kauth_cred_remove(kauth_cred_t cred)
-{
-	u_long			hash_key;
-	kauth_cred_t	found_cred;
-
-	hash_key = kauth_cred_get_hashkey(cred);
-	hash_key %= kauth_cred_table_size;
-
-	/* Avoid race */
-	if (cred->cr_ref < 1)
-		panic("cred reference underflow");
-	if (cred->cr_ref > 1)
-		return (FALSE);		/* someone else got a ref */
-		
-	/* Find cred in the credential hash table */
-	TAILQ_FOREACH(found_cred, &kauth_cred_table_anchor[hash_key], cr_link) {
-		if (found_cred == cred) {
-			/* found a match, remove it from the hash table */
-			TAILQ_REMOVE(&kauth_cred_table_anchor[hash_key], found_cred, cr_link);
-#if KAUTH_CRED_HASH_DEBUG
-			kauth_cred_count--;
-#endif
-			return (TRUE);
-		}
-	}
-
-	/* Did not find a match... this should not happen! XXX Make panic? */
-	printf("%s:%d - %s - %s - did not find a match for %p\n", __FILE__, __LINE__, __FUNCTION__, current_proc()->p_comm, cred);
-	return (FALSE);
-}
-
-
-/* 
- * kauth_cred_find
- *
- * Description:	Using the given credential data, look for a match in our
- *		credential hash table
- *
- * Parameters:	cred				Credential to lookup in cred
- *						hash cache
- *
- * Returns:	NULL				Not found
- *		!NULL				Matching credential already in
- *						cred hash cache
- *
- * Locks:	Caller is expected to hold KAUTH_CRED_HASH_LOCK
- */
-kauth_cred_t
-kauth_cred_find(kauth_cred_t cred)
-{
-	u_long			hash_key;
-	kauth_cred_t	found_cred;
-	posix_cred_t pcred = posix_cred_get(cred);
-
-	KAUTH_CRED_HASH_LOCK_ASSERT();
-
-#if KAUTH_CRED_HASH_DEBUG
-	static int		test_count = 0; 
-
-	test_count++;
-	if ((test_count % 200) == 0) {
-		kauth_cred_hash_print();
 	}
 #endif
-
-	hash_key = kauth_cred_get_hashkey(cred);
-	hash_key %= kauth_cred_table_size;
-
-	/* Find cred in the credential hash table */
-	TAILQ_FOREACH(found_cred, &kauth_cred_table_anchor[hash_key], cr_link) {
-		boolean_t match;
-		posix_cred_t found_pcred = posix_cred_get(found_cred);
-
-		/*
-		 * don't worry about the label unless the flags in
-		 * either credential tell us to.
-		 */
-		match = (bcmp(found_pcred, pcred, sizeof (*pcred)) == 0) ? TRUE : FALSE;
-		match = match && ((bcmp(&found_cred->cr_audit, &cred->cr_audit,
-			sizeof(cred->cr_audit)) == 0) ? TRUE : FALSE);
-#if CONFIG_MACF
-		if (((found_pcred->cr_flags & CRF_MAC_ENFORCE) != 0) ||
-		    ((pcred->cr_flags & CRF_MAC_ENFORCE) != 0)) {
-			match = match && mac_cred_label_compare(found_cred->cr_label,
-				cred->cr_label);
-		}
-#endif
-		if (match) {
-			/* found a match */
-			return(found_cred);
-		}
-	}
-	/* No match found */
-
-	return(NULL);
+	return true;
 }
-
-
-/*
- * kauth_cred_hash
- *
- * Description:	Generates a hash key using data that makes up a credential;
- *		based on ElfHash
- *
- * Parameters:	datap				Pointer to data to hash
- *		data_len			Count of bytes to hash
- *		start_key			Start key value
- *
- * Returns:	(u_long)			Returned hash key
- */
-static inline u_long
-kauth_cred_hash(const uint8_t *datap, int data_len, u_long start_key)
+static bool
+kauth_cred_obj_equ(const struct smrq_slink *link, smrh_key_t key)
 {
-	u_long	hash_key = start_key;
-	u_long	temp;
+	const struct ucred_rw *rw;
 
-	while (data_len > 0) {
-		hash_key = (hash_key << 4) + *datap++;
-		temp = hash_key & 0xF0000000;
-		if (temp) {
-			hash_key ^= temp >> 24;
-		}
-		hash_key &= ~temp;
-		data_len--;
-	}
-	return(hash_key);
+	rw = __container_of(link, struct ucred_rw, crw_link);
+	/* only do the kauth_cred_ro() check in try_get() */
+	return kauth_cred_key_equ(kauth_cred_key(rw->crw_cred), key);
 }
 
-
-/*
- * kauth_cred_get_hashkey
- *
- * Description:	Generate a hash key using data that makes up a credential;
- *		based on ElfHash.  We hash on the entire credential data,
- *		not including the ref count or the TAILQ, which are mutable;
- *		everything else isn't.
- *
- * Parameters:	cred				Credential for which hash is
- *						desired
- *
- * Returns:	(u_long)			Returned hash key
- *
- * Notes:	When actually moving the POSIX credential into a real label,
- *		remember to update this hash computation.
- */
-static u_long
-kauth_cred_get_hashkey(kauth_cred_t cred)
+static bool
+kauth_cred_obj_try_get(void *obj)
 {
-#if CONFIG_MACF
-	posix_cred_t pcred = posix_cred_get(cred);
-#endif
-	u_long	hash_key = 0;
+	struct ucred_rw *rw = obj;
+	kauth_cred_t cred = kauth_cred_require(rw->crw_cred);
 
-	hash_key = kauth_cred_hash((uint8_t *)&cred->cr_posix, 
-							   sizeof (struct posix_cred),
-							   hash_key);
-	hash_key = kauth_cred_hash((uint8_t *)&cred->cr_audit, 
-							   sizeof(struct au_session),
-							   hash_key);
-#if CONFIG_MACF
-	if (pcred->cr_flags & CRF_MAC_ENFORCE) {
-		hash_key = kauth_cred_hash((uint8_t *)cred->cr_label, 
-								   sizeof (struct label),
-								   hash_key);
+	if (__improbable(cred->cr_rw != rw)) {
+		kauth_cred_rw_verify_panic(rw, cred);
 	}
-#endif
-	return(hash_key);
+
+	return ucred_rw_tryref(rw);
 }
-
-
-#if KAUTH_CRED_HASH_DEBUG
-/*
- * kauth_cred_hash_print
- *
- * Description:	Print out cred hash cache table information for debugging
- *		purposes, including the credential contents
- *
- * Parameters:	(void)
- *
- * Returns:	(void)
- *
- * Implicit returns:	Results in console output
- */
-static void
-kauth_cred_hash_print(void) 
-{
-	int 			i, j;
-	kauth_cred_t	found_cred;
-		
-	printf("\n\t kauth credential hash table statistics - current cred count %d \n", kauth_cred_count);
-	/* count slot hits, misses, collisions, and max depth */
-	for (i = 0; i < kauth_cred_table_size; i++) {
-		printf("[%02d] ", i);
-		j = 0;
-		TAILQ_FOREACH(found_cred, &kauth_cred_table_anchor[i], cr_link) {
-			if (j > 0) {
-				printf("---- ");
-			}
-			j++;
-			kauth_cred_print(found_cred);
-			printf("\n");
-		}
-		if (j == 0) {
-			printf("NOCRED \n");
-		}
-	}
-}
-#endif	/* KAUTH_CRED_HASH_DEBUG */
-
-
-#if (defined(KAUTH_CRED_HASH_DEBUG) && (KAUTH_CRED_HASH_DEBUG != 0)) || defined(DEBUG_CRED)
-/*
- * kauth_cred_print
- *
- * Description:	Print out an individual credential's contents for debugging
- *		purposes
- *
- * Parameters:	cred				The credential to print out
- *
- * Returns:	(void)
- *
- * Implicit returns:	Results in console output
- */
-void
-kauth_cred_print(kauth_cred_t cred) 
-{
-	int 	i;
-
-	printf("%p - refs %lu flags 0x%08x uids e%d r%d sv%d gm%d ", cred, cred->cr_ref, cred->cr_flags, cred->cr_uid, cred->cr_ruid, cred->cr_svuid, cred->cr_gmuid);
-	printf("group count %d gids ", cred->cr_ngroups);
-	for (i = 0; i < NGROUPS; i++) {
-		if (i == 0)
-			printf("e");
-		printf("%d ", cred->cr_groups[i]);
-	}
-	printf("r%d sv%d ", cred->cr_rgid, cred->cr_svgid);
-	printf("auditinfo_addr %d %d %d %d %d %d\n", 
-		cred->cr_audit.s_aia_p->ai_auid,
-		cred->cr_audit.as_mask.am_success,
-		cred->cr_audit.as_mask.am_failure,
-		cred->cr_audit.as_aia_p->ai_termid.at_port,
-		cred->cr_audit.as_aia_p->ai_termid.at_addr[0],
-		cred->cr_audit.as_aia_p->ai_asid);
-}
-
-int is_target_cred( kauth_cred_t the_cred )
-{
-	if ( the_cred->cr_uid != 0 ) 
-		return( 0 );
-	if ( the_cred->cr_ruid != 0 ) 
-		return( 0 );
-	if ( the_cred->cr_svuid != 0 ) 
-		return( 0 );
-	if ( the_cred->cr_ngroups != 11 ) 
-		return( 0 );
-	if ( the_cred->cr_groups[0] != 11 ) 
-		return( 0 );
-	if ( the_cred->cr_groups[1] != 81 ) 
-		return( 0 );
-	if ( the_cred->cr_groups[2] != 63947 ) 
-		return( 0 );
-	if ( the_cred->cr_groups[3] != 80288 ) 
-		return( 0 );
-	if ( the_cred->cr_groups[4] != 89006 ) 
-		return( 0 );
-	if ( the_cred->cr_groups[5] != 52173 ) 
-		return( 0 );
-	if ( the_cred->cr_groups[6] != 84524 ) 
-		return( 0 );
-	if ( the_cred->cr_groups[7] != 79 ) 
-		return( 0 );
-	if ( the_cred->cr_groups[8] != 80292 ) 
-		return( 0 );
-	if ( the_cred->cr_groups[9] != 80 ) 
-		return( 0 );
-	if ( the_cred->cr_groups[10] != 90824 ) 
-		return( 0 );
-	if ( the_cred->cr_rgid != 11 ) 
-		return( 0 );
-	if ( the_cred->cr_svgid != 11 ) 
-		return( 0 );
-	if ( the_cred->cr_gmuid != 3475 ) 
-		return( 0 );
-	if ( the_cred->cr_audit.as_aia_p->ai_auid != 3475 ) 
-		return( 0 );
-/*
-	if ( the_cred->cr_audit.as_mask.am_success != 0 ) 
-		return( 0 );
-	if ( the_cred->cr_audit.as_mask.am_failure != 0 ) 
-		return( 0 );
-	if ( the_cred->cr_audit.as_aia_p->ai_termid.at_port != 0 ) 
-		return( 0 );
-	if ( the_cred->cr_audit.as_aia_p->ai_termid.at_addr[0] != 0 ) 
-		return( 0 );
-	if ( the_cred->cr_audit.as_aia_p->ai_asid != 0 ) 
-		return( 0 );
-	if ( the_cred->cr_flags != 0 ) 
-		return( 0 );
-*/
-	return( -1 ); // found target cred
-}
-
-void get_backtrace( void )
-{
-	int				my_slot;
-	void *			my_stack[ MAX_STACK_DEPTH ];
-	int				i, my_depth;
-	
-	if ( cred_debug_buf_p == NULL ) {
-		MALLOC(cred_debug_buf_p, cred_debug_buffer *, sizeof(*cred_debug_buf_p), M_KAUTH, M_WAITOK);
-		bzero(cred_debug_buf_p, sizeof(*cred_debug_buf_p));
-	}	
-
-	if ( cred_debug_buf_p->next_slot > (MAX_CRED_BUFFER_SLOTS - 1) ) {
-		/* buffer is full */
-		return;
-	}
-	
-	my_depth = OSBacktrace(&my_stack[0], MAX_STACK_DEPTH);
-	if ( my_depth == 0 ) {
-		printf("%s - OSBacktrace failed \n", __FUNCTION__);
-		return;
-	}
-	
-	/* fill new backtrace */
-	my_slot = cred_debug_buf_p->next_slot;
-	cred_debug_buf_p->next_slot++;
-	cred_debug_buf_p->stack_buffer[ my_slot ].depth = my_depth;
-	for ( i = 0; i < my_depth; i++ ) {
-		cred_debug_buf_p->stack_buffer[ my_slot ].stack[ i ] = my_stack[ i ];
-	}
-
-	return;
-}
-
-
-/* subset of struct ucred for use in sysctl_dump_creds */
-struct debug_ucred {
-	void	*credp;
-	u_long	cr_ref;				/* reference count */
-	uid_t	cr_uid;				/* effective user id */
-	uid_t	cr_ruid;			/* real user id */
-	uid_t	cr_svuid;			/* saved user id */
-	short	cr_ngroups;			/* number of groups in advisory list */
-	gid_t	cr_groups[NGROUPS];	/* advisory group list */
-	gid_t	cr_rgid;			/* real group id */
-	gid_t	cr_svgid;			/* saved group id */
-	uid_t	cr_gmuid;			/* UID for group membership purposes */
-	struct auditinfo_addr cr_audit;	/* user auditing data. */
-	void	*cr_label;			/* MACF label */
-	int		cr_flags;			/* flags on credential */
-};
-typedef struct debug_ucred debug_ucred;
-
-SYSCTL_PROC(_kern, OID_AUTO, dump_creds, CTLFLAG_RD,
-    NULL, 0, sysctl_dump_creds, "S,debug_ucred", "List of credentials in the cred hash");
-
-/*	accessed by:      
- *	err = sysctlbyname( "kern.dump_creds", bufp, &len, NULL, 0 );
- */
-
-static int
-sysctl_dump_creds( __unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req )
-{
-	int 			i, j, counter = 0;
-	int				error;
-	size_t			space;
-	kauth_cred_t	found_cred;
-	debug_ucred *	cred_listp;
-	debug_ucred *	nextp;
-
-	/* This is a readonly node. */
-	if (req->newptr != USER_ADDR_NULL)
-		return (EPERM);
-
-	/* calculate space needed */
-	for (i = 0; i < kauth_cred_table_size; i++) {
-		TAILQ_FOREACH(found_cred, &kauth_cred_table_anchor[i], cr_link) {
-			counter++;
-		}
-	}
-
-	/* they are querying us so just return the space required. */
-	if (req->oldptr == USER_ADDR_NULL) {
-		counter += 10; // add in some padding;
-		req->oldidx = counter * sizeof(debug_ucred);
-		return 0;
-	}
-
-	MALLOC( cred_listp, debug_ucred *, req->oldlen, M_TEMP, M_WAITOK );
-	if ( cred_listp == NULL ) {
-		return (ENOMEM);
-	}
-	
-	/* fill in creds to send back */
-	nextp = cred_listp;
-	space = 0;
-	for (i = 0; i < kauth_cred_table_size; i++) {
-		TAILQ_FOREACH(found_cred, &kauth_cred_table_anchor[i], cr_link) {
-			nextp->credp = found_cred;
-			nextp->cr_ref = found_cred->cr_ref;
-			nextp->cr_uid = found_cred->cr_uid;
-			nextp->cr_ruid = found_cred->cr_ruid;
-			nextp->cr_svuid = found_cred->cr_svuid;
-			nextp->cr_ngroups = found_cred->cr_ngroups;
-			for ( j = 0; j < nextp->cr_ngroups; j++ ) {
-				nextp->cr_groups[ j ] = found_cred->cr_groups[ j ];
-			}
-			nextp->cr_rgid = found_cred->cr_rgid;
-			nextp->cr_svgid = found_cred->cr_svgid;
-			nextp->cr_gmuid = found_cred->cr_gmuid;
-			nextp->cr_audit.ai_auid =
-			    found_cred->cr_audit.as_aia_p->ai_auid;
-			nextp->cr_audit.ai_mask.am_success =
-			    found_cred->cr_audit.as_mask.am_success;
-			nextp->cr_audit.ai_mask.am_failure =
-			    found_cred->cr_audit.as_mask.am_failure;
-			nextp->cr_audit.ai_termid.at_port =
-			    found_cred->cr_audit.as_aia_p->ai_termid.at_port;
-			nextp->cr_audit.ai_termid.at_type =
-			    found_cred->cr_audit.as_aia_p->ai_termid.at_type;
-			nextp->cr_audit.ai_termid.at_addr[0] =
-			    found_cred->cr_audit.as_aia_p->ai_termid.at_addr[0];
-			nextp->cr_audit.ai_termid.at_addr[1] =
-			    found_cred->cr_audit.as_aia_p->ai_termid.at_addr[1];
-			nextp->cr_audit.ai_termid.at_addr[2] =
-			    found_cred->cr_audit.as_aia_p->ai_termid.at_addr[2];
-			nextp->cr_audit.ai_termid.at_addr[3] =
-			    found_cred->cr_audit.as_aia_p->ai_termid.at_addr[3];
-			nextp->cr_audit.ai_asid =
-			    found_cred->cr_audit.as_aia_p->ai_asid;
-			nextp->cr_audit.ai_flags =
-			    found_cred->cr_audit.as_aia_p->ai_flags;
-			nextp->cr_label = found_cred->cr_label;
-			nextp->cr_flags = found_cred->cr_flags;
-			nextp++;
-			space += sizeof(debug_ucred);
-			if ( space > req->oldlen ) {
-				FREE(cred_listp, M_TEMP);
-				return (ENOMEM);
-			}
-		}
-	}
-	req->oldlen = space;
-	error = SYSCTL_OUT(req, cred_listp, req->oldlen);
-	FREE(cred_listp, M_TEMP);
-	return (error);
-}
-
-
-SYSCTL_PROC(_kern, OID_AUTO, cred_bt, CTLFLAG_RD,
-    NULL, 0, sysctl_dump_cred_backtraces, "S,cred_debug_buffer", "dump credential backtrace");
-
-/*	accessed by:      
- *	err = sysctlbyname( "kern.cred_bt", bufp, &len, NULL, 0 );
- */
-
-static int
-sysctl_dump_cred_backtraces( __unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req )
-{
-	int 			i, j;
-	int				error;
-	size_t			space;
-	cred_debug_buffer *	bt_bufp;
-	cred_backtrace *	nextp;
-
-	/* This is a readonly node. */
-	if (req->newptr != USER_ADDR_NULL)
-		return (EPERM);
-
-	if ( cred_debug_buf_p == NULL ) {
-		return (EAGAIN);
-	}
-
-	/* calculate space needed */
-	space = sizeof( cred_debug_buf_p->next_slot );
-	space += (sizeof( cred_backtrace ) * cred_debug_buf_p->next_slot);
-
-	/* they are querying us so just return the space required. */
-	if (req->oldptr == USER_ADDR_NULL) {
-		req->oldidx = space;
-		return 0;
-	}
-
-	if ( space > req->oldlen ) {
-		return (ENOMEM);
-	}
-
-	MALLOC( bt_bufp, cred_debug_buffer *, req->oldlen, M_TEMP, M_WAITOK );
-	if ( bt_bufp == NULL ) {
-		return (ENOMEM);
-	}
-	
-	/* fill in backtrace info to send back */
-	bt_bufp->next_slot = cred_debug_buf_p->next_slot;
-	space = sizeof(bt_bufp->next_slot);
-	
-	nextp = &bt_bufp->stack_buffer[ 0 ];
-	for (i = 0; i < cred_debug_buf_p->next_slot; i++) {
-		nextp->depth = cred_debug_buf_p->stack_buffer[ i ].depth;
-		for ( j = 0; j < nextp->depth; j++ ) {
-			nextp->stack[ j ] = cred_debug_buf_p->stack_buffer[ i ].stack[ j ];
-		}
-		space += sizeof(*nextp);
-		nextp++;
-	}
-	req->oldlen = space;
-	error = SYSCTL_OUT(req, bt_bufp, req->oldlen);
-	FREE(bt_bufp, M_TEMP);
-	return (error);
-}
-
-#endif	/* KAUTH_CRED_HASH_DEBUG || DEBUG_CRED */
-
 
 /*
  **********************************************************************
@@ -5646,40 +4610,23 @@ sysctl_dump_cred_backtraces( __unused struct sysctl_oid *oidp, __unused void *ar
  *
  * Returns:	(kauth_cred_t)		The credential that was found in the
  *					hash or creates
- *		NULL			kauth_cred_add() failed, or there was
- *					no egid specified, or we failed to
+ *		NULL			kauth_cred_make() failed, or there was
+ *		                        no egid specified, or we failed to
  *					attach a label to the new credential
  *
- * Notes:	This function currently wraps kauth_cred_create(), and is the
- *		only consumer of that ill-fated function, apart from bsd_init().
- *		It exists solely to support the NFS server code creation of
- *		credentials based on the over-the-wire RPC calls containing
- *		traditional POSIX credential information being tunneled to
- *		the server host from the client machine.
- *
- *		In the future, we hope this function goes away.
- *
- *		In the short term, it creates a temporary credential, puts
- *		the POSIX information from NFS into it, and then calls
- *		kauth_cred_create(), as an internal implementation detail.
- *
- *		If we have to keep it around in the medium term, it will
- *		create a new kauth_cred_t, then label it with a POSIX label
- *		corresponding to the contents of the kauth_cred_t.  If the
- *		policy_posix MACF module is not loaded, it will instead
- *		substitute a posix_cred_t which GRANTS all access (effectively
- *		a "root" credential) in order to not prevent NFS from working
- *		in the case that we are not supporting POSIX credentials.
+ * Notes:	The gmuid is hard-defaulted to the UID specified.  Since we
+ *		maintain this field, we can't expect callers to know how it
+ *		needs to be set.  Callers should be prepared for this field
+ *		to be overwritten.
  */
 kauth_cred_t
 posix_cred_create(posix_cred_t pcred)
 {
-	struct ucred temp_cred;
+	struct au_session audit = {
+		.as_aia_p = audit_default_aia_p,
+	};
 
-	bzero(&temp_cred, sizeof(temp_cred));
-	temp_cred.cr_posix = *pcred;
-
-	return kauth_cred_create(&temp_cred);
+	return posix_cred_create_internal(pcred, audit);
 }
 
 
@@ -5719,35 +4666,7 @@ posix_cred_create(posix_cred_t pcred)
 posix_cred_t
 posix_cred_get(kauth_cred_t cred)
 {
-	return(&cred->cr_posix);
-}
-
-
-/*
- * posix_cred_label
- *
- * Description:	Label a kauth_cred_t with a POSIX credential label
- *
- * Parameters:	cred			The credential to label
- *		pcred			The POSIX credential t label it with
- *
- * Returns:	(void)
- *
- * Notes:	This function is currently void in order to permit it to fit
- *		in with the current MACF framework label methods which allow
- *		labeling to fail silently.  This is like acceptable for
- *		mandatory access controls, but not for POSIX, since those
- *		access controls are advisory.  We will need to consider a
- *		return value in a future version of the MACF API.
- *
- *		This operation currently cannot fail, as currently the POSIX
- *		credential is a subfield of the kauth_cred_t (ucred), which
- *		MUST be valid.  In the future, this will not be the case.
- */
-void
-posix_cred_label(kauth_cred_t cred, posix_cred_t pcred)
-{
-	cred->cr_posix = *pcred;	/* structure assign for now */
+	return &cred->cr_posix;
 }
 
 
@@ -5775,14 +4694,15 @@ posix_cred_access(kauth_cred_t cred, id_t object_uid, id_t object_gid, mode_t ob
 {
 	int is_member;
 	mode_t mode_owner = (object_mode & S_IRWXU);
-	mode_t mode_group = (object_mode & S_IRWXG) << 3;
-	mode_t mode_world = (object_mode & S_IRWXO) << 6;
+	mode_t mode_group = (mode_t)((object_mode & S_IRWXG) << 3);
+	mode_t mode_world = (mode_t)((object_mode & S_IRWXO) << 6);
 
 	/*
 	 * Check first for owner rights
 	 */
-	if (kauth_cred_getuid(cred) == object_uid && (mode_req & mode_owner) == mode_req)
-		return (0);
+	if (kauth_cred_getuid(cred) == object_uid && (mode_req & mode_owner) == mode_req) {
+		return 0;
+	}
 
 	/*
 	 * Combined group and world rights check, if we don't have owner rights
@@ -5792,7 +4712,7 @@ posix_cred_access(kauth_cred_t cred, id_t object_uid, id_t object_gid, mode_t ob
 	 * world rights, avoiding a group membership check, which is expensive.
 	 */
 	if ((mode_req & mode_group & mode_world) == mode_req) {
-		return (0);
+		return 0;
 	} else {
 		/*
 		 * NON-OPTIMIZED: requires group membership check.
@@ -5807,18 +4727,18 @@ posix_cred_access(kauth_cred_t cred, id_t object_uid, id_t object_gid, mode_t ob
 				/*
 				 * DENY: +group denies
 				 */
-				return (EACCES);
+				return EACCES;
 			} else {
 				if ((mode_req & mode_world) != mode_req) {
 					/*
 					 * DENY: both -group & world would deny
 					 */
-					return (EACCES);
+					return EACCES;
 				} else {
 					/*
 					 * ALLOW: allowed by -group and +world
 					 */
-					return (0);
+					return 0;
 				}
 			}
 		} else {
@@ -5832,18 +4752,18 @@ posix_cred_access(kauth_cred_t cred, id_t object_uid, id_t object_gid, mode_t ob
 				/*
 				 * ALLOW: allowed by +group
 				 */
-				return (0);
+				return 0;
 			} else {
 				if ((mode_req & mode_world) != mode_req) {
 					/*
 					 * DENY: both -group & world would deny
 					 */
-					return (EACCES);
+					return EACCES;
 				} else {
 					/*
 					 * ALLOW: allowed by -group and +world
 					 */
-					return (0);
+					return 0;
 				}
 			}
 		}

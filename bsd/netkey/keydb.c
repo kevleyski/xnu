@@ -1,3 +1,31 @@
+/*
+ * Copyright (c) 2016 Apple Inc. All rights reserved.
+ *
+ * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
+ *
+ * This file contains Original Code and/or Modifications of Original Code
+ * as defined in and that are subject to the Apple Public Source License
+ * Version 2.0 (the 'License'). You may not use this file except in
+ * compliance with the License. The rights granted to you under the License
+ * may not be used to create, or enable the creation or redistribution of,
+ * unlawful or unlicensed copies of an Apple operating system, or to
+ * circumvent, violate, or enable the circumvention or violation of, any
+ * terms of an Apple operating system software license agreement.
+ *
+ * Please obtain a copy of the License at
+ * http://www.opensource.apple.com/apsl/ and read it before using this file.
+ *
+ * The Original Code and all software distributed under the License are
+ * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
+ * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
+ * INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
+ * Please see the License for the specific language governing rights and
+ * limitations under the License.
+ *
+ * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
+ */
+
 /*	$KAME: keydb.c,v 1.61 2000/03/25 07:24:13 sumikawa Exp $	*/
 
 /*
@@ -44,14 +72,11 @@
 #include <netinet/in.h>
 
 #include <net/pfkeyv2.h>
+#include <netkey/key.h>
 #include <netkey/keydb.h>
 #include <netinet6/ipsec.h>
 
 #include <net/net_osdep.h>
-
-extern lck_mtx_t  *sadb_mutex;
-
-MALLOC_DEFINE(M_SECA, "key mgmt", "security associations, key management");
 
 // static void keydb_delsecasvar(struct secasvar *); // not used
 
@@ -59,184 +84,78 @@ MALLOC_DEFINE(M_SECA, "key mgmt", "security associations, key management");
  * secpolicy management
  */
 struct secpolicy *
-keydb_newsecpolicy()
+keydb_newsecpolicy(void)
 {
-	struct secpolicy *p;
+	LCK_MTX_ASSERT(sadb_mutex, LCK_MTX_ASSERT_NOTOWNED);
 
-	lck_mtx_assert(sadb_mutex, LCK_MTX_ASSERT_NOTOWNED);
-
-	p = (struct secpolicy *)_MALLOC(sizeof(*p), M_SECA, M_WAITOK);
-	if (!p)
-		return p;
-	bzero(p, sizeof(*p));
-	return p;
+	return kalloc_type(struct secpolicy, Z_WAITOK | Z_ZERO);
 }
 
 void
-keydb_delsecpolicy(p)
-	struct secpolicy *p;
+keydb_delsecpolicy(struct secpolicy *p)
 {
-
-	_FREE(p, M_SECA);
+	kfree_type(struct secpolicy, p);
 }
 
 /*
  * secashead management
  */
 struct secashead *
-keydb_newsecashead()
+keydb_newsecashead(void)
 {
 	struct secashead *p;
-	int i;
 
-	lck_mtx_assert(sadb_mutex, LCK_MTX_ASSERT_OWNED);
+	LCK_MTX_ASSERT(sadb_mutex, LCK_MTX_ASSERT_OWNED);
 
-	p = (struct secashead *)_MALLOC(sizeof(*p), M_SECA, M_NOWAIT);
+	p = kalloc_type(struct secashead, Z_NOWAIT | Z_ZERO);
 	if (!p) {
 		lck_mtx_unlock(sadb_mutex);
-		p = (struct secashead *)_MALLOC(sizeof(*p), M_SECA, M_WAITOK);
+		p = kalloc_type(struct secashead, Z_WAITOK | Z_ZERO | Z_NOFAIL);
 		lck_mtx_lock(sadb_mutex);
 	}
-	if (!p) 
-		return p;
-	bzero(p, sizeof(*p));
-	for (i = 0; i < sizeof(p->savtree)/sizeof(p->savtree[0]); i++)
+	for (size_t i = 0; i < ARRAY_COUNT(p->savtree); i++) {
 		LIST_INIT(&p->savtree[i]);
+	}
 	return p;
 }
-
-#if 0
-void
-keydb_delsecashead(p)
-	struct secashead *p;
-{
-
-	_FREE(p, M_SECA);
-}
-
-
-
-/* 
- * secasvar management (reference counted)
- */
-struct secasvar *
-keydb_newsecasvar()
-{
-	struct secasvar *p;
-
-	lck_mtx_assert(sadb_mutex, LCK_MTX_ASSERT_NOTOWNED);
-
-	p = (struct secasvar *)_MALLOC(sizeof(*p), M_SECA, M_WAITOK);
-	if (!p)
-		return p;
-	bzero(p, sizeof(*p));
-	p->refcnt = 1;
-	return p;
-}
-
-void
-keydb_refsecasvar(p)
-	struct secasvar *p;
-{
-
-	lck_mtx_assert(sadb_mutex, LCK_MTX_ASSERT_OWNED);
-
-	p->refcnt++;
-}
-
-void
-keydb_freesecasvar(p)
-	struct secasvar *p;
-{
-
-	lck_mtx_assert(sadb_mutex, LCK_MTX_ASSERT_OWNED);
-
-	p->refcnt--;
-	/* negative refcnt will cause panic intentionally */
-	if (p->refcnt <= 0)
-		keydb_delsecasvar(p);
-}
-
-static void
-keydb_delsecasvar(p)
-	struct secasvar *p;
-{
-
-	if (p->refcnt)
-		panic("keydb_delsecasvar called with refcnt != 0");
-
-	_FREE(p, M_SECA);
-}
-#endif
 
 /*
  * secreplay management
  */
 struct secreplay *
-keydb_newsecreplay(wsize)
-	size_t wsize;
+keydb_newsecreplay(u_int8_t wsize)
 {
 	struct secreplay *p;
-	
-	lck_mtx_assert(sadb_mutex, LCK_MTX_ASSERT_OWNED);
+	caddr_t tmp_bitmap = NULL;
 
-	p = (struct secreplay *)_MALLOC(sizeof(*p), M_SECA, M_NOWAIT);
+	LCK_MTX_ASSERT(sadb_mutex, LCK_MTX_ASSERT_OWNED);
+
+	p = kalloc_type(struct secreplay, Z_NOWAIT | Z_ZERO);
 	if (!p) {
 		lck_mtx_unlock(sadb_mutex);
-		p = (struct secreplay *)_MALLOC(sizeof(*p), M_SECA, M_WAITOK);
+		p = kalloc_type(struct secreplay, Z_WAITOK | Z_ZERO | Z_NOFAIL);
 		lck_mtx_lock(sadb_mutex);
 	}
-	if (!p)
-		return p;
 
-	bzero(p, sizeof(*p));
 	if (wsize != 0) {
-		p->bitmap = (caddr_t)_MALLOC(wsize, M_SECA, M_NOWAIT);
-		if (!p->bitmap) {
+		tmp_bitmap = (caddr_t)kalloc_data(wsize, Z_NOWAIT | Z_ZERO);
+		if (!tmp_bitmap) {
 			lck_mtx_unlock(sadb_mutex);
-			p->bitmap = (caddr_t)_MALLOC(wsize, M_SECA, M_WAITOK);
+			tmp_bitmap = (caddr_t)kalloc_data(wsize, Z_WAITOK | Z_ZERO | Z_NOFAIL);
 			lck_mtx_lock(sadb_mutex);
-			if (!p->bitmap) {
-				_FREE(p, M_SECA);
-				return NULL;
-			}
 		}
-		bzero(p->bitmap, wsize);
+
+		p->bitmap = tmp_bitmap;
+		p->wsize = wsize;
 	}
-	p->wsize = wsize;
 	return p;
 }
 
 void
-keydb_delsecreplay(p)
-	struct secreplay *p;
+keydb_delsecreplay(struct secreplay *p)
 {
-
-	if (p->bitmap)
-		_FREE(p->bitmap, M_SECA);
-	_FREE(p, M_SECA);
+	if (p->bitmap) {
+		kfree_data_sized_by(p->bitmap, p->wsize);
+	}
+	kfree_type(struct secreplay, p);
 }
-
-#if 0
-/*	NOT USED
- * secreg management
- */
-struct secreg *
-keydb_newsecreg()
-{
-	struct secreg *p;
-
-	p = (struct secreg *)_MALLOC(sizeof(*p), M_SECA, M_WAITOK);
-	if (p)
-		bzero(p, sizeof(*p));
-	return p;
-}
-
-void
-keydb_delsecreg(p)
-	struct secreg *p;
-{
-
-	_FREE(p, M_SECA);
-}
-#endif

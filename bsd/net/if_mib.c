@@ -1,8 +1,8 @@
 /*
- * Copyright (c) 2000-2013 Apple Inc. All rights reserved.
+ * Copyright (c) 2000-2021 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
- * 
+ *
  * This file contains Original Code and/or Modifications of Original Code
  * as defined in and that are subject to the Apple Public Source License
  * Version 2.0 (the 'License'). You may not use this file except in
@@ -11,10 +11,10 @@
  * unlawful or unlicensed copies of an Apple operating system, or to
  * circumvent, violate, or enable the circumvention or violation of, any
  * terms of an Apple operating system software license agreement.
- * 
+ *
  * Please obtain a copy of the License at
  * http://www.opensource.apple.com/apsl/ and read it before using this file.
- * 
+ *
  * The Original Code and all software distributed under the License are
  * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
@@ -22,7 +22,7 @@
  * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
  * Please see the License for the specific language governing rights and
  * limitations under the License.
- * 
+ *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
 /*
@@ -39,7 +39,7 @@
  * no representations about the suitability of this software for any
  * purpose.  It is provided "as is" without express or implied
  * warranty.
- * 
+ *
  * THIS SOFTWARE IS PROVIDED BY M.I.T. ``AS IS''.  M.I.T. DISCLAIMS
  * ALL EXPRESS OR IMPLIED WARRANTIES WITH REGARD TO THIS SOFTWARE,
  * INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
@@ -60,12 +60,14 @@
 #include <sys/systm.h>
 #include <sys/kernel.h>
 #include <sys/socket.h>
-#include <sys/sysctl.h>
 #include <sys/systm.h>
 
 #include <net/if.h>
 #include <net/if_mib.h>
 #include <net/if_var.h>
+#include <net/net_sysctl.h>
+
+#include <os/log.h>
 
 /*
  * A sysctl(3) MIB for generic interface information.  This information
@@ -92,29 +94,25 @@
 
 SYSCTL_DECL(_net_link_generic);
 
-SYSCTL_NODE(_net_link_generic, IFMIB_SYSTEM, system, CTLFLAG_RD|CTLFLAG_LOCKED, 0,
-	    "Variables global to all interfaces");
-
-SYSCTL_INT(_net_link_generic_system, IFMIB_IFCOUNT, ifcount, CTLFLAG_RD | CTLFLAG_LOCKED,
-	   &if_index, 0, "Number of configured interfaces");
+SYSCTL_NODE(_net_link_generic, IFMIB_SYSTEM, system, CTLFLAG_RD | CTLFLAG_LOCKED, 0,
+    "Variables global to all interfaces");
 
 static int sysctl_ifdata SYSCTL_HANDLER_ARGS;
 SYSCTL_NODE(_net_link_generic, IFMIB_IFDATA, ifdata, CTLFLAG_RD | CTLFLAG_LOCKED,
-            sysctl_ifdata, "Interface table");
+    sysctl_ifdata, "Interface table");
 
 static int sysctl_ifalldata SYSCTL_HANDLER_ARGS;
 SYSCTL_NODE(_net_link_generic, IFMIB_IFALLDATA, ifalldata, CTLFLAG_RD | CTLFLAG_LOCKED,
-            sysctl_ifalldata, "Interface table");
+    sysctl_ifalldata, "Interface table");
 
-static int make_ifmibdata(struct ifnet *, int *, struct sysctl_req *);
-
+static int make_ifmibdata(struct ifnet *, int *__counted_by(2), struct sysctl_req *);
 int
-make_ifmibdata(struct ifnet *ifp, int *name, struct sysctl_req *req)
+make_ifmibdata(struct ifnet *ifp, int *__counted_by(2) name, struct sysctl_req *req)
 {
-	struct ifmibdata	ifmd;
+	struct ifmibdata        ifmd;
 	int error = 0;
 
-	switch(name[1]) {
+	switch (name[1]) {
 	default:
 		error = ENOENT;
 		break;
@@ -126,25 +124,28 @@ make_ifmibdata(struct ifnet *ifp, int *name, struct sysctl_req *req)
 		 */
 		if (ifnet_is_attached(ifp, 0)) {
 			snprintf(ifmd.ifmd_name, sizeof(ifmd.ifmd_name), "%s",
-				if_name(ifp));
+			    if_name(ifp));
 
 #define COPY(fld) ifmd.ifmd_##fld = ifp->if_##fld
 			COPY(pcount);
 			COPY(flags);
 			if_data_internal_to_if_data64(ifp, &ifp->if_data, &ifmd.ifmd_data);
 #undef COPY
-			ifmd.ifmd_snd_len = IFCQ_LEN(&ifp->if_snd);
-			ifmd.ifmd_snd_maxlen = IFCQ_MAXLEN(&ifp->if_snd);
-			ifmd.ifmd_snd_drops = ifp->if_snd.ifcq_dropcnt.packets;
+			ifmd.ifmd_snd_len = IFCQ_LEN(ifp->if_snd);
+			ifmd.ifmd_snd_maxlen = IFCQ_MAXLEN(ifp->if_snd);
+			ifmd.ifmd_snd_drops =
+			    (unsigned int)ifp->if_snd->ifcq_dropcnt.packets;
 		}
 		error = SYSCTL_OUT(req, &ifmd, sizeof ifmd);
-		if (error || !req->newptr)
+		if (error || !req->newptr) {
 			break;
+		}
 
 #ifdef IF_MIB_WR
 		error = SYSCTL_IN(req, &ifmd, sizeof ifmd);
-		if (error)
+		if (error) {
 			break;
+		}
 
 #define DONTCOPY(fld) ifmd.ifmd_data.ifi_##fld = ifp->if_data.ifi_##fld
 		DONTCOPY(type);
@@ -157,45 +158,70 @@ make_ifmibdata(struct ifnet *ifp, int *name, struct sysctl_req *req)
 #undef DONTCOPY
 #define COPY(fld) ifp->if_##fld = ifmd.ifmd_##fld
 		COPY(data);
-		ifp->if_snd.ifq_maxlen = ifmd.ifmd_snd_maxlen;
-		ifp->if_snd.ifq_drops = ifmd.ifmd_snd_drops;
+		ifp->if_snd->ifq_maxlen = ifmd.ifmd_snd_maxlen;
+		ifp->if_snd->ifq_drops = ifmd.ifmd_snd_drops;
 #undef COPY
 #endif /* IF_MIB_WR */
 		break;
 
 	case IFDATA_LINKSPECIFIC:
 		error = SYSCTL_OUT(req, ifp->if_linkmib, ifp->if_linkmiblen);
-		if (error || !req->newptr)
+		if (error || !req->newptr) {
 			break;
+		}
 
 #ifdef IF_MIB_WR
 		error = SYSCTL_IN(req, ifp->if_linkmib, ifp->if_linkmiblen);
-		if (error)
+		if (error) {
 			break;
+		}
 #endif /* IF_MIB_WR */
 		break;
 
 	case IFDATA_SUPPLEMENTAL: {
 		struct ifmibdata_supplemental *ifmd_supp;
 
-		if ((ifmd_supp = _MALLOC(sizeof (*ifmd_supp), M_TEMP,
-		    M_NOWAIT | M_ZERO)) == NULL) {
-			error = ENOMEM;
-			break;
-		}
-
+		ifmd_supp = kalloc_type(struct ifmibdata_supplemental,
+		    Z_WAITOK_ZERO_NOFAIL);
 		if_copy_traffic_class(ifp, &ifmd_supp->ifmd_traffic_class);
 		if_copy_data_extended(ifp, &ifmd_supp->ifmd_data_extended);
 		if_copy_packet_stats(ifp, &ifmd_supp->ifmd_packet_stats);
 		if_copy_rxpoll_stats(ifp, &ifmd_supp->ifmd_rxpoll_stats);
+		if_copy_netif_stats(ifp, &ifmd_supp->ifmd_netif_stats);
 
-		if (req->oldptr == USER_ADDR_NULL)
-			req->oldlen = sizeof (*ifmd_supp);
+		if (req->oldptr == USER_ADDR_NULL) {
+			req->oldlen = sizeof(*ifmd_supp);
+		}
 
-		error = SYSCTL_OUT(req, ifmd_supp, MIN(sizeof (*ifmd_supp),
+		error = SYSCTL_OUT(req, ifmd_supp, MIN(sizeof(*ifmd_supp),
+		    req->oldlen));
+#if DEVELOPMENT || DEBUG
+		if (error != 0) {
+			os_log(OS_LOG_DEFAULT, "%s: IFDATA_SUPPLEMENTAL SYSCTL_OUT(MIN(%lu, %lu) failed with error %d",
+			    __func__, sizeof(*ifmd_supp), req->oldlen, error);
+		}
+#endif /* DEVELOPMENT || DEBUG */
+
+		kfree_type(struct ifmibdata_supplemental, ifmd_supp);
+		break;
+	}
+
+	case IFDATA_LINKHEURISTICS: {
+		struct if_linkheuristics *ifmd_lh;
+
+		ifmd_lh = kalloc_type(struct if_linkheuristics,
+		    Z_WAITOK_ZERO_NOFAIL);
+
+		if_copy_link_heuristics_stats(ifp, ifmd_lh);
+
+		if (req->oldptr == USER_ADDR_NULL) {
+			req->oldlen = sizeof(struct if_linkheuristics);
+		}
+
+		error = SYSCTL_OUT(req, ifmd_lh, MIN(sizeof(struct if_linkheuristics),
 		    req->oldlen));
 
-		_FREE(ifmd_supp, M_TEMP);
+		kfree_type(struct if_linkheuristics, ifmd_lh);
 		break;
 	}
 	}
@@ -207,19 +233,15 @@ int
 sysctl_ifdata SYSCTL_HANDLER_ARGS /* XXX bad syntax! */
 {
 #pragma unused(oidp)
-	int *name = (int *)arg1;
+	DECLARE_SYSCTL_HANDLER_ARG_ARRAY(int, 2, name, namelen);
 	int error = 0;
-	u_int namelen = arg2;
 	struct ifnet *ifp;
-
-	if (namelen != 2)
-		return (EINVAL);
 
 	ifnet_head_lock_shared();
 	if (name[0] <= 0 || name[0] > if_index ||
 	    (ifp = ifindex2ifnet[name[0]]) == NULL) {
 		ifnet_head_done();
-		return (ENOENT);
+		return ENOENT;
 	}
 	ifnet_reference(ifp);
 	ifnet_head_done();
@@ -230,20 +252,16 @@ sysctl_ifdata SYSCTL_HANDLER_ARGS /* XXX bad syntax! */
 
 	ifnet_release(ifp);
 
-	return (error);
+	return error;
 }
 
 int
 sysctl_ifalldata SYSCTL_HANDLER_ARGS /* XXX bad syntax! */
 {
 #pragma unused(oidp)
-	int *name = (int *)arg1;
+	DECLARE_SYSCTL_HANDLER_ARG_ARRAY(int, 2, name, namelen);
 	int error = 0;
-	u_int namelen = arg2;
 	struct ifnet *ifp;
-
-	if (namelen != 2)
-		return (EINVAL);
 
 	ifnet_head_lock_shared();
 	TAILQ_FOREACH(ifp, &ifnet_head, if_link) {
@@ -252,9 +270,28 @@ sysctl_ifalldata SYSCTL_HANDLER_ARGS /* XXX bad syntax! */
 		error = make_ifmibdata(ifp, name, req);
 
 		ifnet_lock_done(ifp);
-		if (error != 0)
+		if (error != 0) {
 			break;
+		}
 	}
 	ifnet_head_done();
 	return error;
 }
+
+static int
+sysctl_ifindex SYSCTL_HANDLER_ARGS
+{
+	int error, val = if_index;
+
+	error = sysctl_handle_int(oidp, &val, 0, req);
+	if (error || !req->newptr) {
+		return error;
+	}
+
+	return 0;
+}
+
+SYSCTL_PROC( _net_link_generic_system, IFMIB_IFCOUNT, ifcount,
+    CTLFLAG_RD | CTLFLAG_LOCKED,
+    NULL, 0, sysctl_ifindex, "Number of configured interfaces",
+    "");

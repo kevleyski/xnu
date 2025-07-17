@@ -13,22 +13,23 @@ MIG_DEFS = \
 	UNDRequest.defs \
 	UNDReply.defs
 
-DATAFILES = \
+PRIVATE_DATAFILES = \
 	UNDTypes.h \
 	${MIG_TYPES} \
 	${MIG_DEFS}
 
-INSTALL_MI_LIST =
+KERNELFILES = \
+	KUNCUserNotifications.h \
+	${PRIVATE_DATAFILES}
 
-INSTALL_MI_LCL_LIST	= ${DATAFILES} 
+INSTALL_MI_LIST =
+INSTALL_SF_MI_LCL_LIST = ${PRIVATE_DATAFILES}
 
 INSTALL_MI_GEN_LIST =
 
 INSTALL_MI_DIR = UserNotification
 
-EXPORT_MI_LIST	= \
-	KUNCUserNotifications.h \
-	${DATAFILES}
+EXPORT_MI_LIST = ${KERNELFILES}
 
 EXPORT_MI_GEN_LIST =
 
@@ -36,11 +37,8 @@ EXPORT_MI_DIR = UserNotification
 
 #
 # Build path
-#       
+#
 INCFLAGS_MAKEFILE= -I..
-
-MIGKSFLAGS	= -DMACH_KERNEL_PRIVATE -DKERNEL_SERVER=1
-MIGKUFLAGS	= -DMACH_KERNEL_PRIVATE -DKERNEL_USER=1 -maxonstack 1024
 
 MIG_KUHDRS = \
 	UNDRequest.h
@@ -54,7 +52,7 @@ MIG_KSHDRS = \
 MIG_KSSRC = \
 	UNDReplyServer.c
 
-COMP_FILES = ${MIG_KUSRC} ${MIG_KSSRC} 
+COMP_FILES = ${MIG_KUSRC} ${MIG_KSSRC}
 
 do_build_all:: $(COMP_FILES)
 
@@ -62,7 +60,7 @@ ${COMP_FILES} : ${MIG_TYPES}
 
 ${MIG_KUSRC} : \
 	%.c : %.defs
-	@echo MIG $@
+	@$(LOG_MIG) "$@"
 	$(_v)${MIG} ${MIGFLAGS} ${MIGKUFLAGS}        \
 		-user    $*.c              \
 		-header  $*.h              \
@@ -72,7 +70,7 @@ ${MIG_KUSRC} : \
 
 ${MIG_KSSRC}: \
 	%Server.c : %.defs
-	@echo MIG $@
+	@$(LOG_MIG) "$@"
 	$(_v)${MIG} ${MIGFLAGS} ${MIGKSFLAGS}        \
 		-user    /dev/null              \
 		-header  /dev/null              \

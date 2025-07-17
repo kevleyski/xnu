@@ -10,15 +10,15 @@ DATAFILES = \
 		kdp_callout.h \
 		kdp_en_debugger.h
 
-EXPORT_MI_LIST	= ${DATAFILES} kdp_dyld.h
+PRIVATE_KERNELFILES = processor_core.h core_exclude.h
+
+EXPORT_MI_LIST	= ${DATAFILES} kdp_dyld.h core_notes.h sk_core.h
 
 INSTALL_KF_MI_LIST = ${DATAFILES}
 
-INSTALL_KF_MI_LCL_LIST = ${DATAFILES}
+INSTALL_KF_MI_LCL_LIST = ${DATAFILES} ${PRIVATE_KERNELFILES}
 
 EXPORT_MI_DIR = kdp
 
 include $(MakeInc_rule)
 include $(MakeInc_dir)
-
-

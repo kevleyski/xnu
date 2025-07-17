@@ -2,7 +2,7 @@
  * Copyright (c) 2000-2012 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
- * 
+ *
  * This file contains Original Code and/or Modifications of Original Code
  * as defined in and that are subject to the Apple Public Source License
  * Version 2.0 (the 'License'). You may not use this file except in
@@ -11,10 +11,10 @@
  * unlawful or unlicensed copies of an Apple operating system, or to
  * circumvent, violate, or enable the circumvention or violation of, any
  * terms of an Apple operating system software license agreement.
- * 
+ *
  * Please obtain a copy of the License at
  * http://www.opensource.apple.com/apsl/ and read it before using this file.
- * 
+ *
  * The Original Code and all software distributed under the License are
  * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
@@ -22,40 +22,38 @@
  * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
  * Please see the License for the specific language governing rights and
  * limitations under the License.
- * 
+ *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
 /*
  * @OSF_COPYRIGHT@
  */
-/* 
+/*
  * Mach Operating System
  * Copyright (c) 1991,1990,1989 Carnegie Mellon University
  * All Rights Reserved.
- * 
+ *
  * Permission to use, copy, modify and distribute this software and its
  * documentation is hereby granted, provided that both the copyright
  * notice and this permission notice appear in all copies of the
  * software, derivative works or modified versions, and any portions
  * thereof, and that both notices appear in supporting documentation.
- * 
+ *
  * CARNEGIE MELLON ALLOWS FREE USE OF THIS SOFTWARE IN ITS "AS IS"
  * CONDITION.  CARNEGIE MELLON DISCLAIMS ANY LIABILITY OF ANY KIND FOR
  * ANY DAMAGES WHATSOEVER RESULTING FROM THE USE OF THIS SOFTWARE.
- * 
+ *
  * Carnegie Mellon requests users of this software to return to
- * 
+ *
  *  Software Distribution Coordinator  or  Software.Distribution@CS.CMU.EDU
  *  School of Computer Science
  *  Carnegie Mellon University
  *  Pittsburgh PA 15213-3890
- * 
+ *
  * any improvements or extensions that they make and grant Carnegie Mellon
  * the rights to redistribute these changes.
  */
 
-#include <mach_rt.h>
-#include <mach_debug.h>
 #include <mach_ldebug.h>
 
 #include <sys/kdebug.h>
@@ -64,7 +62,6 @@
 #include <mach/thread_status.h>
 #include <mach/vm_param.h>
 
-#include <kern/counters.h>
 #include <kern/mach_param.h>
 #include <kern/task.h>
 #include <kern/thread.h>
@@ -93,11 +90,19 @@
  */
 void
 pmap_zero_page(
-       ppnum_t pn)
+	ppnum_t pn)
 {
 	assert(pn != vm_page_fictitious_addr);
 	assert(pn != vm_page_guard_addr);
 	bzero_phys((addr64_t)i386_ptob(pn), PAGE_SIZE);
+}
+
+void
+pmap_zero_page_with_options(
+	ppnum_t pn,
+	__unused int options)
+{
+	pmap_zero_page(pn);
 }
 
 /*
@@ -121,13 +126,13 @@ pmap_zero_part_page(
  */
 void
 pmap_copy_part_page(
-	ppnum_t 	psrc,
-	vm_offset_t	src_offset,
-	ppnum_t	        pdst,
-	vm_offset_t	dst_offset,
-	vm_size_t	len)
+	ppnum_t         psrc,
+	vm_offset_t     src_offset,
+	ppnum_t         pdst,
+	vm_offset_t     dst_offset,
+	vm_size_t       len)
 {
-        pmap_paddr_t src, dst;
+	pmap_paddr_t src, dst;
 
 	assert(psrc != vm_page_fictitious_addr);
 	assert(pdst != vm_page_fictitious_addr);
@@ -141,44 +146,40 @@ pmap_copy_part_page(
 	assert((((uintptr_t)src & PAGE_MASK) + src_offset + len) <= PAGE_SIZE);
 
 	bcopy_phys((addr64_t)src + (src_offset & INTEL_OFFMASK),
-		   (addr64_t)dst + (dst_offset & INTEL_OFFMASK),
-		   len);
+	    (addr64_t)dst + (dst_offset & INTEL_OFFMASK),
+	    len);
 }
 
 /*
- *      pmap_copy_part_lpage copies part of a virtually addressed page 
+ *      pmap_copy_part_lpage copies part of a virtually addressed page
  *      to a physically addressed page.
  */
 void
 pmap_copy_part_lpage(
-	__unused vm_offset_t 	src,
-	__unused ppnum_t 	pdst,
-	__unused vm_offset_t	dst_offset,
-	__unused vm_size_t	len)
+	__unused vm_offset_t    src,
+	__unused ppnum_t        pdst,
+	__unused vm_offset_t    dst_offset,
+	__unused vm_size_t      len)
 {
-
 	assert(pdst != vm_page_fictitious_addr);
 	assert(pdst != vm_page_guard_addr);
 	assert((dst_offset + len) <= PAGE_SIZE);
-
 }
 
 /*
- *      pmap_copy_part_rpage copies part of a physically addressed page 
+ *      pmap_copy_part_rpage copies part of a physically addressed page
  *      to a virtually addressed page.
  */
 void
 pmap_copy_part_rpage(
-	__unused ppnum_t	        psrc,
-	__unused vm_offset_t	src_offset,
-	__unused vm_offset_t	dst,
-	__unused vm_size_t	len)
+	__unused ppnum_t                psrc,
+	__unused vm_offset_t    src_offset,
+	__unused vm_offset_t    dst,
+	__unused vm_size_t      len)
 {
-
 	assert(psrc != vm_page_fictitious_addr);
 	assert(psrc != vm_page_guard_addr);
 	assert((src_offset + len) <= PAGE_SIZE);
-
 }
 
 /*
@@ -193,32 +194,27 @@ kvtophys(
 	pmap_paddr_t pa;
 
 	pa = ((pmap_paddr_t)pmap_find_phys(kernel_pmap, addr)) << INTEL_PGSHIFT;
-	if (pa)
+	if (pa) {
 		pa |= (addr & INTEL_OFFMASK);
+	}
 
-	return ((addr64_t)pa);
+	return (addr64_t)pa;
 }
 
 extern pt_entry_t *debugger_ptep;
-extern vm_map_offset_t debugger_window_kva;
+extern vm_offset_t debugger_window_kva;
 extern int _bcopy(const void *, void *, vm_size_t);
 extern int _bcopy2(const void *, void *);
 extern int _bcopy4(const void *, void *);
 extern int _bcopy8(const void *, void *);
 
-__private_extern__ int ml_copy_phys(addr64_t src64, addr64_t dst64, vm_size_t bytes) {
+__private_extern__ int
+ml_copy_phys(addr64_t src64, addr64_t dst64, vm_size_t bytes)
+{
 	void *src, *dst;
 	int err = 0;
 
 	mp_disable_preemption();
-#if NCOPY_WINDOWS > 0
-	mapwindow_t *src_map, *dst_map;
-	/* We rely on MTRRs here */
-	src_map = pmap_get_mapwindow((pt_entry_t)(INTEL_PTE_VALID | ((pmap_paddr_t)src64 & PG_FRAME) | INTEL_PTE_REF));
-	dst_map = pmap_get_mapwindow((pt_entry_t)(INTEL_PTE_VALID | INTEL_PTE_RW | ((pmap_paddr_t)dst64 & PG_FRAME) | INTEL_PTE_REF | INTEL_PTE_MOD));
-	src = (void *) ((uintptr_t)src_map->prv_CADDR | ((uint32_t)src64 & INTEL_OFFMASK));
-	dst = (void *) ((uintptr_t)dst_map->prv_CADDR | ((uint32_t)dst64 & INTEL_OFFMASK));
-#elif defined(__x86_64__)
 	addr64_t debug_pa = 0;
 
 	/* If either destination or source are outside the
@@ -242,21 +238,21 @@ __private_extern__ int ml_copy_phys(addr64_t src64, addr64_t dst64, vm_size_t by
 	 * identical mapping.
 	 */
 	if (debug_pa) {
-		if (debugger_window_kva == 0)
+		if (debugger_window_kva == 0) {
 			panic("%s: invoked in non-debug mode", __FUNCTION__);
+		}
 		/* Establish a cache-inhibited physical window; some platforms
 		 * may not cover arbitrary ranges with MTRRs
 		 */
-		pmap_store_pte(debugger_ptep, debug_pa | INTEL_PTE_NCACHE | INTEL_PTE_RW | INTEL_PTE_REF| INTEL_PTE_MOD | INTEL_PTE_VALID);
-		flush_tlb_raw();
-#if	DEBUG
+		pmap_store_pte(FALSE, debugger_ptep, debug_pa | INTEL_PTE_NCACHE | INTEL_PTE_RW | INTEL_PTE_REF | INTEL_PTE_MOD | INTEL_PTE_VALID);
+		pmap_tlbi_range(0, ~0ULL, true, 0);
+#if     DEBUG
 		kprintf("Remapping debugger physical window at %p to 0x%llx\n", (void *)debugger_window_kva, debug_pa);
 #endif
 	}
-#endif
 	/* ensure we stay within a page */
-	if (((((uint32_t)src64 & (I386_PGBYTES-1)) + bytes) > I386_PGBYTES) || ((((uint32_t)dst64 & (I386_PGBYTES-1)) + bytes) > I386_PGBYTES) ) {
-	        panic("ml_copy_phys spans pages, src: 0x%llx, dst: 0x%llx", src64, dst64);
+	if (((((uint32_t)src64 & (I386_PGBYTES - 1)) + bytes) > I386_PGBYTES) || ((((uint32_t)dst64 & (I386_PGBYTES - 1)) + bytes) > I386_PGBYTES)) {
+		panic("ml_copy_phys spans pages, src: 0x%llx, dst: 0x%llx", src64, dst64);
 	}
 
 	/*
@@ -281,10 +277,6 @@ __private_extern__ int ml_copy_phys(addr64_t src64, addr64_t dst64, vm_size_t by
 		break;
 	}
 
-#if NCOPY_WINDOWS > 0
-	pmap_put_mapwindow(src_map);
-	pmap_put_mapwindow(dst_map);
-#endif
 	mp_enable_preemption();
 
 	return err;

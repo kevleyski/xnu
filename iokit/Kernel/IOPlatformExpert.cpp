@@ -1,8 +1,8 @@
 /*
- * Copyright (c) 1998-2010 Apple Inc. All rights reserved.
+ * Copyright (c) 1998-2022 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
- * 
+ *
  * This file contains Original Code and/or Modifications of Original Code
  * as defined in and that are subject to the Apple Public Source License
  * Version 2.0 (the 'License'). You may not use this file except in
@@ -11,10 +11,10 @@
  * unlawful or unlicensed copies of an Apple operating system, or to
  * circumvent, violate, or enable the circumvention or violation of, any
  * terms of an Apple operating system software license agreement.
- * 
+ *
  * Please obtain a copy of the License at
  * http://www.opensource.apple.com/apsl/ and read it before using this file.
- * 
+ *
  * The Original Code and all software distributed under the License are
  * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
@@ -22,11 +22,12 @@
  * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
  * Please see the License for the specific language governing rights and
  * limitations under the License.
- * 
+ *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
- 
+
 #include <IOKit/IOCPU.h>
+#include <IOKit/IOPlatformActions.h>
 #include <IOKit/IODeviceTreeSupport.h>
 #include <IOKit/IOKitDebug.h>
 #include <IOKit/IOMapper.h>
@@ -39,21 +40,51 @@
 #include <IOKit/IOKitKeys.h>
 #include <IOKit/IOTimeStamp.h>
 #include <IOKit/IOUserClient.h>
+#include <IOKit/IOKitDiagnosticsUserClient.h>
+#include <IOKit/IOUserServer.h>
+
+#include "IOKitKernelInternal.h"
 
 #include <IOKit/system.h>
+#include <sys/csr.h>
 
 #include <libkern/c++/OSContainers.h>
+#include <libkern/c++/OSSharedPtr.h>
 #include <libkern/crypto/sha1.h>
 #include <libkern/OSAtomic.h>
+
+#if defined(__arm64__)
+#include <arm64/tlb.h>
+#endif
 
 extern "C" {
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 #include <uuid/uuid.h>
+#include <sys/sysctl.h>
 }
 
-void printDictionaryKeys (OSDictionary * inDictionary, char * inMsg);
+#define kShutdownTimeout    30 //in secs
+
+#if defined(XNU_TARGET_OS_OSX)
+
+boolean_t coprocessor_cross_panic_enabled = TRUE;
+#define APPLE_VENDOR_VARIABLE_GUID "4d1ede05-38c7-4a6a-9cc6-4bcca8b38c14"
+#endif /* defined(XNU_TARGET_OS_OSX) */
+
+void printDictionaryKeys(OSDictionary * inDictionary, char * inMsg);
 static void getCStringForObject(OSObject *inObj, char *outStr, size_t outStrLen);
+
+/*
+ * There are drivers which take mutexes in the quiesce callout or pass
+ * the quiesce/active action to super.  Even though it sometimes panics,
+ * because it doesn't *always* panic, they get away with it.
+ * We need a chicken bit to diagnose and fix them all before this
+ * can be enabled by default.
+ *
+ * <rdar://problem/33831837> tracks turning this on by default.
+ */
+uint32_t gEnforcePlatformActionSafety = 0;
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
@@ -61,17 +92,17 @@ static void getCStringForObject(OSObject *inObj, char *outStr, size_t outStrLen)
 
 OSDefineMetaClassAndStructors(IOPlatformExpert, IOService)
 
-OSMetaClassDefineReservedUsed(IOPlatformExpert,  0);
+OSMetaClassDefineReservedUsedX86(IOPlatformExpert, 0);
+OSMetaClassDefineReservedUsedX86(IOPlatformExpert, 1);
+OSMetaClassDefineReservedUsedX86(IOPlatformExpert, 2);
+OSMetaClassDefineReservedUsedX86(IOPlatformExpert, 3);
+OSMetaClassDefineReservedUsedX86(IOPlatformExpert, 4);
+OSMetaClassDefineReservedUsedX86(IOPlatformExpert, 5);
+OSMetaClassDefineReservedUsedX86(IOPlatformExpert, 6);
 
-OSMetaClassDefineReservedUsed(IOPlatformExpert,  1);
-OSMetaClassDefineReservedUnused(IOPlatformExpert,  2);
-OSMetaClassDefineReservedUnused(IOPlatformExpert,  3);
-OSMetaClassDefineReservedUnused(IOPlatformExpert,  4);
-OSMetaClassDefineReservedUnused(IOPlatformExpert,  5);
-OSMetaClassDefineReservedUnused(IOPlatformExpert,  6);
-OSMetaClassDefineReservedUnused(IOPlatformExpert,  7);
-OSMetaClassDefineReservedUnused(IOPlatformExpert,  8);
-OSMetaClassDefineReservedUnused(IOPlatformExpert,  9);
+OSMetaClassDefineReservedUnused(IOPlatformExpert, 7);
+OSMetaClassDefineReservedUnused(IOPlatformExpert, 8);
+OSMetaClassDefineReservedUnused(IOPlatformExpert, 9);
 OSMetaClassDefineReservedUnused(IOPlatformExpert, 10);
 OSMetaClassDefineReservedUnused(IOPlatformExpert, 11);
 
@@ -84,283 +115,392 @@ OSSymbol * gPlatformInterruptControllerName;
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
-bool IOPlatformExpert::attach( IOService * provider )
+bool
+IOPlatformExpert::attach( IOService * provider )
 {
-
-    if( !super::attach( provider ))
-	return( false);
-
-    return( true);
-}
-
-bool IOPlatformExpert::start( IOService * provider )
-{
-    IORangeAllocator *	physicalRanges;
-    OSData *		busFrequency;
-    uint32_t		debugFlags;
-    
-    if (!super::start(provider))
-      return false;
-    
-    // Override the mapper present flag is requested by boot arguments.
-    if (PE_parse_boot_argn("dart", &debugFlags, sizeof (debugFlags)) && (debugFlags == 0))
-      removeProperty(kIOPlatformMapperPresentKey);
-    if (PE_parse_boot_argn("-x", &debugFlags, sizeof (debugFlags)))
-      removeProperty(kIOPlatformMapperPresentKey);
-
-    // Register the presence or lack thereof a system 
-    // PCI address mapper with the IOMapper class
-    IOMapper::setMapperRequired(0 != getProperty(kIOPlatformMapperPresentKey));
-    
-    gIOInterruptControllers = OSDictionary::withCapacity(1);
-    gIOInterruptControllersLock = IOLockAlloc();
-    
-    // Correct the bus frequency in the device tree.
-    busFrequency = OSData::withBytesNoCopy((void *)&gPEClockFrequencyInfo.bus_clock_rate_hz, 4);
-    provider->setProperty("clock-frequency", busFrequency);
-    busFrequency->release();
-    
-    gPlatformInterruptControllerName = (OSSymbol *)OSSymbol::withCStringNoCopy("IOPlatformInterruptController");
-    
-    physicalRanges = IORangeAllocator::withRange(0xffffffff, 1, 16,
-						 IORangeAllocator::kLocking);
-    assert(physicalRanges);
-    setProperty("Platform Memory Ranges", physicalRanges);
-    
-    setPlatform( this );
-    gIOPlatform = this;
-    
-    PMInstantiatePowerDomains();
-    
-    // Parse the serial-number data and publish a user-readable string
-    OSData* mydata = (OSData*) (provider->getProperty("serial-number"));
-    if (mydata != NULL) {
-        OSString *serNoString = createSystemSerialNumberString(mydata);
-        if (serNoString != NULL) {
-            provider->setProperty(kIOPlatformSerialNumberKey, serNoString);
-            serNoString->release();
-        }
-    }
-    
-    return( configure(provider) );
-}
-
-bool IOPlatformExpert::configure( IOService * provider )
-{
-    OSSet *		topLevel;
-    OSDictionary *	dict;
-    IOService * 	nub;
-
-    topLevel = OSDynamicCast( OSSet, getProperty("top-level"));
-
-    if( topLevel) {
-        while( (dict = OSDynamicCast( OSDictionary,
-				topLevel->getAnyObject()))) {
-            dict->retain();
-            topLevel->removeObject( dict );
-            nub = createNub( dict );
-            if( 0 == nub)
-                continue;
-            dict->release();
-            nub->attach( this );
-            nub->registerService();
-        }
-    }
-
-    return( true );
-}
-
-IOService * IOPlatformExpert::createNub( OSDictionary * from )
-{
-    IOService *		nub;
-
-    nub = new IOPlatformDevice;
-    if(nub) {
-	if( !nub->init( from )) {
-	    nub->release();
-	    nub = 0;
+	if (!super::attach( provider )) {
+		return false;
 	}
-    }
-    return( nub);
+
+	return true;
 }
 
-bool IOPlatformExpert::compareNubName( const IOService * nub,
-				OSString * name, OSString ** matched ) const
+bool
+IOPlatformExpert::start( IOService * provider )
 {
-    return( nub->IORegistryEntry::compareName( name, matched ));
+	IORangeAllocator *  physicalRanges;
+	OSData *            busFrequency;
+	uint32_t            debugFlags;
+
+
+	if (!super::start(provider)) {
+		return false;
+	}
+
+	// Override the mapper present flag is requested by boot arguments, if SIP disabled.
+#if CONFIG_CSR
+	if (csr_check(CSR_ALLOW_UNRESTRICTED_FS) == 0)
+#endif /* CONFIG_CSR */
+	{
+		if (PE_parse_boot_argn("dart", &debugFlags, sizeof(debugFlags)) && (debugFlags == 0)) {
+			removeProperty(kIOPlatformMapperPresentKey);
+		}
+#if DEBUG || DEVELOPMENT
+		if (PE_parse_boot_argn("-x", &debugFlags, sizeof(debugFlags))) {
+			removeProperty(kIOPlatformMapperPresentKey);
+		}
+#endif /* DEBUG || DEVELOPMENT */
+	}
+
+	// Register the presence or lack thereof a system
+	// PCI address mapper with the IOMapper class
+	IOMapper::setMapperRequired(NULL != getProperty(kIOPlatformMapperPresentKey));
+
+	gIOInterruptControllers = OSDictionary::withCapacity(1);
+	gIOInterruptControllersLock = IOLockAlloc();
+
+	// Correct the bus frequency in the device tree.
+	busFrequency = OSData::withBytesNoCopy((void *)&gPEClockFrequencyInfo.bus_clock_rate_hz, 4);
+	provider->setProperty("clock-frequency", busFrequency);
+	busFrequency->release();
+
+	gPlatformInterruptControllerName = (OSSymbol *)OSSymbol::withCStringNoCopy("IOPlatformInterruptController");
+
+	physicalRanges = IORangeAllocator::withRange(0xffffffff, 1, 16,
+	    IORangeAllocator::kLocking);
+	assert(physicalRanges);
+	setProperty("Platform Memory Ranges", physicalRanges);
+	OSSafeReleaseNULL(physicalRanges);
+
+	setPlatform( this );
+	gIOPlatform = this;
+
+	PMInstantiatePowerDomains();
+
+#if !defined(__x86_64__)
+	publishPlatformUUIDAndSerial();
+#endif /* !defined(__x86_64__) */
+
+#if defined (__x86_64__)
+	if (PEGetCoprocessorVersion() >= kCoprocessorVersion2) {
+		coprocessor_paniclog_flush = TRUE;
+		extended_debug_log_init();
+	}
+#endif
+
+	PE_parse_boot_argn("enforce_platform_action_safety", &gEnforcePlatformActionSafety,
+	    sizeof(gEnforcePlatformActionSafety));
+
+	return configure(provider);
 }
 
-IOReturn IOPlatformExpert::getNubResources( IOService * nub )
+bool
+IOPlatformExpert::configure( IOService * provider )
 {
-    return( kIOReturnSuccess );
+	OSSet *             topLevel;
+	OSDictionary *      dict;
+	IOService *         nub = NULL;
+
+	topLevel = OSDynamicCast( OSSet, getProperty("top-level"));
+
+	if (topLevel) {
+		while ((dict = OSDynamicCast( OSDictionary,
+		    topLevel->getAnyObject()))) {
+			dict->retain();
+			topLevel->removeObject( dict );
+			OSSafeReleaseNULL(nub);
+			nub = createNub( dict );
+			dict->release();
+			if (NULL == nub) {
+				continue;
+			}
+			nub->attach( this );
+			nub->registerService();
+		}
+	}
+	OSSafeReleaseNULL(nub);
+	return true;
 }
 
-long IOPlatformExpert::getBootROMType(void)
+IOService *
+IOPlatformExpert::createNub( OSDictionary * from )
 {
-  return _peBootROMType;
+	IOService *         nub;
+
+	nub = new IOPlatformDevice;
+	if (nub) {
+		if (!nub->init( from )) {
+			nub->release();
+			nub = NULL;
+		}
+	}
+	return nub;
 }
 
-long IOPlatformExpert::getChipSetType(void)
+bool
+IOPlatformExpert::compareNubName( const IOService * nub,
+    OSString * name, OSString ** matched ) const
 {
-  return _peChipSetType;
+	return nub->IORegistryEntry::compareName( name, matched );
 }
 
-long IOPlatformExpert::getMachineType(void)
+bool
+IOPlatformExpert::compareNubName( const IOService * nub,
+    OSString * name, OSSharedPtr<OSString>& matched ) const
 {
-  return _peMachineType;
+	OSString* matchedRaw = NULL;
+	bool result = compareNubName(nub, name, &matchedRaw);
+	matched.reset(matchedRaw, OSNoRetain);
+	return result;
 }
 
-void IOPlatformExpert::setBootROMType(long peBootROMType)
+IOReturn
+IOPlatformExpert::getNubResources( IOService * nub )
 {
-  _peBootROMType = peBootROMType;
+	return kIOReturnSuccess;
 }
 
-void IOPlatformExpert::setChipSetType(long peChipSetType)
+long
+IOPlatformExpert::getBootROMType(void)
 {
-  _peChipSetType = peChipSetType;
+	return _peBootROMType;
 }
 
-void IOPlatformExpert::setMachineType(long peMachineType)
+long
+IOPlatformExpert::getChipSetType(void)
 {
-  _peMachineType = peMachineType;
+	return _peChipSetType;
 }
 
-bool IOPlatformExpert::getMachineName( char * /*name*/, int /*maxLength*/)
+long
+IOPlatformExpert::getMachineType(void)
 {
-    return( false );
+	return _peMachineType;
 }
 
-bool IOPlatformExpert::getModelName( char * /*name*/, int /*maxLength*/)
+void
+IOPlatformExpert::setBootROMType(long peBootROMType)
 {
-    return( false );
+	_peBootROMType = peBootROMType;
 }
 
-OSString* IOPlatformExpert::createSystemSerialNumberString(OSData* myProperty)
+void
+IOPlatformExpert::setChipSetType(long peChipSetType)
 {
-    return NULL;
+	_peChipSetType = peChipSetType;
 }
 
-IORangeAllocator * IOPlatformExpert::getPhysicalRangeAllocator(void)
+void
+IOPlatformExpert::setMachineType(long peMachineType)
 {
-    return(OSDynamicCast(IORangeAllocator,
-			getProperty("Platform Memory Ranges")));
+	_peMachineType = peMachineType;
 }
 
-int (*PE_halt_restart)(unsigned int type) = 0;
-
-int IOPlatformExpert::haltRestart(unsigned int type)
+bool
+IOPlatformExpert::getMachineName( char * /*name*/, int /*maxLength*/)
 {
-  if (type == kPEPanicSync) return 0;
-
-  if (type == kPEHangCPU) while (true) {}
-
-  if (type == kPEUPSDelayHaltCPU) {
-    // RestartOnPowerLoss feature was turned on, proceed with shutdown.
-    type = kPEHaltCPU;
-  }
-
-  // On ARM kPEPanicRestartCPU is supported in the drivers
-  if (type == kPEPanicRestartCPU)
-	  type = kPERestartCPU;
-
-  if (PE_halt_restart) return (*PE_halt_restart)(type);
-  else return -1;
+	return false;
 }
 
-void IOPlatformExpert::sleepKernel(void)
+bool
+IOPlatformExpert::getModelName( char * /*name*/, int /*maxLength*/)
+{
+	return false;
+}
+
+bool
+IOPlatformExpert::getTargetName( char * /*name*/, int /*maxLength*/)
+{
+	return false;
+}
+
+bool
+IOPlatformExpert::getProductName( char * /*name*/, int /*maxLength*/)
+{
+	return false;
+}
+
+OSString*
+IOPlatformExpert::createSystemSerialNumberString(OSData* myProperty)
+{
+	return NULL;
+}
+
+IORangeAllocator *
+IOPlatformExpert::getPhysicalRangeAllocator(void)
+{
+	return OSDynamicCast(IORangeAllocator,
+	           getProperty("Platform Memory Ranges"));
+}
+
+int (*PE_halt_restart)(unsigned int type) = NULL;
+
+int
+IOPlatformExpert::haltRestart(unsigned int type)
+{
+	if (type == kPEPanicSync) {
+		return 0;
+	}
+
+	if (type == kPEHangCPU) {
+		while (true) {
+			asm volatile ("");
+		}
+	}
+
+	if (type == kPEUPSDelayHaltCPU) {
+		// RestartOnPowerLoss feature was turned on, proceed with shutdown.
+		type = kPEHaltCPU;
+	}
+
+#if defined (__x86_64__)
+	// On ARM kPEPanicRestartCPU is supported in the drivers
+	if (type == kPEPanicRestartCPU) {
+		type = kPERestartCPU;
+	}
+#endif
+
+	if (PE_halt_restart) {
+		return (*PE_halt_restart)(type);
+	} else {
+		return -1;
+	}
+}
+
+void
+IOPlatformExpert::sleepKernel(void)
 {
 #if 0
-  long cnt;
-  boolean_t intState;
-  
-  intState = ml_set_interrupts_enabled(false);
-  
-  for (cnt = 0; cnt < 10000; cnt++) {
-    IODelay(1000);
-  }
-  
-  ml_set_interrupts_enabled(intState);
+	long cnt;
+	boolean_t intState;
+
+	intState = ml_set_interrupts_enabled(false);
+
+	for (cnt = 0; cnt < 10000; cnt++) {
+		IODelay(1000);
+	}
+
+	ml_set_interrupts_enabled(intState);
 #else
 //  PE_initialize_console(0, kPEDisableScreen);
-  
-  IOCPUSleepKernel();
-  
+
+	IOCPUSleepKernel();
+
 //  PE_initialize_console(0, kPEEnableScreen);
 #endif
 }
 
-long IOPlatformExpert::getGMTTimeOfDay(void)
+long
+IOPlatformExpert::getGMTTimeOfDay(void)
 {
-    return(0);
+	return 0;
 }
 
-void IOPlatformExpert::setGMTTimeOfDay(long secs)
+void
+IOPlatformExpert::setGMTTimeOfDay(long secs)
 {
-}
-
-
-IOReturn IOPlatformExpert::getConsoleInfo( PE_Video * consoleInfo )
-{
-    return( PE_current_console( consoleInfo));
-}
-
-IOReturn IOPlatformExpert::setConsoleInfo( PE_Video * consoleInfo,
-						unsigned int op)
-{
-    return( PE_initialize_console( consoleInfo, op ));
-}
-
-IOReturn IOPlatformExpert::registerInterruptController(OSSymbol *name, IOInterruptController *interruptController)
-{
-  IOLockLock(gIOInterruptControllersLock);
-  
-  gIOInterruptControllers->setObject(name, interruptController);
-  
-  IOLockWakeup(gIOInterruptControllersLock,
-		gIOInterruptControllers, /* one-thread */ false);
-
-  IOLockUnlock(gIOInterruptControllersLock);
-  
-  return kIOReturnSuccess;
-}
-
-IOInterruptController *IOPlatformExpert::lookUpInterruptController(OSSymbol *name)
-{
-  OSObject              *object;
-  
-  IOLockLock(gIOInterruptControllersLock);
-  while (1) {
-    
-    object = gIOInterruptControllers->getObject(name);
-    
-    if (object != 0)
-	break;
-    
-    IOLockSleep(gIOInterruptControllersLock,
-		gIOInterruptControllers, THREAD_UNINT);
-  }
-  
-  IOLockUnlock(gIOInterruptControllersLock);
-  return OSDynamicCast(IOInterruptController, object);
 }
 
 
-void IOPlatformExpert::setCPUInterruptProperties(IOService *service)
+IOReturn
+IOPlatformExpert::getConsoleInfo( PE_Video * consoleInfo )
 {
-  IOCPUInterruptController *controller;
-  
-  controller = OSDynamicCast(IOCPUInterruptController, waitForService(serviceMatching("IOCPUInterruptController")));
-  if (controller) controller->setCPUInterruptProperties(service);
+	return PE_current_console( consoleInfo);
 }
 
-bool IOPlatformExpert::atInterruptLevel(void)
+IOReturn
+IOPlatformExpert::setConsoleInfo( PE_Video * consoleInfo,
+    unsigned int op)
 {
-  return ml_at_interrupt_context();
+	return PE_initialize_console( consoleInfo, op );
 }
 
-bool IOPlatformExpert::platformAdjustService(IOService */*service*/)
+IOReturn
+IOPlatformExpert::registerInterruptController(OSSymbol *name, IOInterruptController *interruptController)
 {
-  return true;
+	IOLockLock(gIOInterruptControllersLock);
+
+	gIOInterruptControllers->setObject(name, interruptController);
+
+	IOLockWakeup(gIOInterruptControllersLock,
+	    gIOInterruptControllers, /* one-thread */ false);
+
+	IOLockUnlock(gIOInterruptControllersLock);
+
+	return kIOReturnSuccess;
+}
+
+IOReturn
+IOPlatformExpert::deregisterInterruptController(OSSymbol *name)
+{
+	IOLockLock(gIOInterruptControllersLock);
+
+	gIOInterruptControllers->removeObject(name);
+
+	IOLockUnlock(gIOInterruptControllersLock);
+
+	return kIOReturnSuccess;
+}
+
+IOInterruptController *
+IOPlatformExpert::lookUpInterruptController(OSSymbol *name)
+{
+	OSObject              *object;
+
+	IOLockLock(gIOInterruptControllersLock);
+	while (1) {
+		object = gIOInterruptControllers->getObject(name);
+
+		if (object != NULL) {
+			break;
+		}
+
+		IOLockSleep(gIOInterruptControllersLock,
+		    gIOInterruptControllers, THREAD_UNINT);
+	}
+
+	IOLockUnlock(gIOInterruptControllersLock);
+	return OSDynamicCast(IOInterruptController, object);
+}
+
+
+void
+IOPlatformExpert::setCPUInterruptProperties(IOService *service)
+{
+	IOInterruptController *controller;
+
+	OSDictionary *matching = serviceMatching("IOInterruptController");
+	matching = propertyMatching(gPlatformInterruptControllerName, kOSBooleanTrue, matching);
+
+	controller = OSDynamicCast(IOInterruptController, waitForService(matching));
+	if (controller) {
+		controller->setCPUInterruptProperties(service);
+	}
+}
+
+bool
+IOPlatformExpert::atInterruptLevel(void)
+{
+	return ml_at_interrupt_context();
+}
+
+bool
+IOPlatformExpert::platformAdjustService(IOService */*service*/)
+{
+	return true;
+}
+
+void
+IOPlatformExpert::getUTCTimeOfDay(clock_sec_t * secs, clock_nsec_t * nsecs)
+{
+	*secs = getGMTTimeOfDay();
+	*nsecs = 0;
+}
+
+void
+IOPlatformExpert::setUTCTimeOfDay(clock_sec_t secs, __unused clock_nsec_t nsecs)
+{
+	setGMTTimeOfDay(secs);
 }
 
 
@@ -369,18 +509,19 @@ bool IOPlatformExpert::platformAdjustService(IOService */*service*/)
 //
 //*********************************************************************************
 
-void IOPlatformExpert::
+void
+IOPlatformExpert::
 PMLog(const char *who, unsigned long event,
-      unsigned long param1, unsigned long param2)
+    unsigned long param1, unsigned long param2)
 {
 	clock_sec_t nows;
 	clock_usec_t nowus;
 	clock_get_system_microtime(&nows, &nowus);
 	nowus += (nows % 1000) * 1000000;
 
-    kprintf("pm%u %p %.30s %d %lx %lx\n",
-		nowus, current_thread(), who,	// Identity
-		(int) event, (long) param1, (long) param2);			// Args
+	kprintf("pm%u %p %.30s %d %lx %lx\n",
+	    nowus, OBFUSCATE(current_thread()), who,            // Identity
+	    (int) event, (long)OBFUSCATE(param1), (long)OBFUSCATE(param2));                     // Args
 }
 
 
@@ -389,16 +530,17 @@ PMLog(const char *who, unsigned long event,
 //
 // In this vanilla implementation, a Root Power Domain is instantiated.
 // All other objects which register will be children of this Root.
-// Where this is inappropriate, PMInstantiatePowerDomains is overridden 
+// Where this is inappropriate, PMInstantiatePowerDomains is overridden
 // in a platform-specific subclass.
 //*********************************************************************************
 
-void IOPlatformExpert::PMInstantiatePowerDomains ( void )
+void
+IOPlatformExpert::PMInstantiatePowerDomains( void )
 {
-    root = new IOPMrootDomain;
-    root->init();
-    root->attach(this);
-    root->start(this);
+	root = new IOPMrootDomain;
+	root->init();
+	root->attach(this);
+	root->start(this);
 }
 
 
@@ -409,9 +551,10 @@ void IOPlatformExpert::PMInstantiatePowerDomains ( void )
 // Where this is inappropriate, PMRegisterDevice is overridden in a platform-specific subclass.
 //*********************************************************************************
 
-void IOPlatformExpert::PMRegisterDevice(IOService * theNub, IOService * theDevice)
+void
+IOPlatformExpert::PMRegisterDevice(IOService * theNub, IOService * theDevice)
 {
-    root->addPowerChild ( theDevice );
+	root->addPowerChild( theDevice );
 }
 
 //*********************************************************************************
@@ -419,9 +562,10 @@ void IOPlatformExpert::PMRegisterDevice(IOService * theNub, IOService * theDevic
 //
 //*********************************************************************************
 
-bool IOPlatformExpert::hasPMFeature (unsigned long featureMask)
+bool
+IOPlatformExpert::hasPMFeature(unsigned long featureMask)
 {
-  return ((_pePMFeatures & featureMask) != 0);
+	return (_pePMFeatures & featureMask) != 0;
 }
 
 //*********************************************************************************
@@ -429,9 +573,10 @@ bool IOPlatformExpert::hasPMFeature (unsigned long featureMask)
 //
 //*********************************************************************************
 
-bool IOPlatformExpert::hasPrivPMFeature (unsigned long privFeatureMask)
+bool
+IOPlatformExpert::hasPrivPMFeature(unsigned long privFeatureMask)
 {
-  return ((_pePrivPMFeatures & privFeatureMask) != 0);
+	return (_pePrivPMFeatures & privFeatureMask) != 0;
 }
 
 //*********************************************************************************
@@ -439,9 +584,10 @@ bool IOPlatformExpert::hasPrivPMFeature (unsigned long privFeatureMask)
 //
 //*********************************************************************************
 
-int IOPlatformExpert::numBatteriesSupported (void)
+int
+IOPlatformExpert::numBatteriesSupported(void)
 {
-  return (_peNumBatteriesSupported);
+	return _peNumBatteriesSupported;
 }
 
 //*********************************************************************************
@@ -455,99 +601,102 @@ int IOPlatformExpert::numBatteriesSupported (void)
 // registered for the given service.
 //*********************************************************************************
 
-bool IOPlatformExpert::CheckSubTree (OSArray * inSubTree, IOService * theNub, IOService * theDevice, OSDictionary * theParent)
+bool
+IOPlatformExpert::CheckSubTree(OSArray * inSubTree, IOService * theNub, IOService * theDevice, OSDictionary * theParent)
 {
-  unsigned int    i;
-  unsigned int    numPowerTreeNodes;
-  OSDictionary *  entry;
-  OSDictionary *  matchingDictionary;
-  OSDictionary *  providerDictionary;
-  OSDictionary *  deviceDictionary;
-  OSDictionary *  nubDictionary;
-  OSArray *       children;
-  bool            nodeFound            = false;
-  bool            continueSearch       = false;
-  bool            deviceMatch          = false;
-  bool            providerMatch        = false;
-  bool            multiParentMatch     = false;
+	unsigned int    i;
+	unsigned int    numPowerTreeNodes;
+	OSDictionary *  entry;
+	OSDictionary *  matchingDictionary;
+	OSDictionary *  providerDictionary;
+	OSDictionary *  deviceDictionary;
+	OSDictionary *  nubDictionary;
+	OSArray *       children;
+	bool            nodeFound            = false;
+	bool            continueSearch       = false;
+	bool            deviceMatch          = false;
+	bool            providerMatch        = false;
+	bool            multiParentMatch     = false;
 
-  if ( (NULL == theDevice) || (NULL == inSubTree) )
-    return false;
+	if ((NULL == theDevice) || (NULL == inSubTree)) {
+		return false;
+	}
 
-  numPowerTreeNodes = inSubTree->getCount ();
+	numPowerTreeNodes = inSubTree->getCount();
 
-  // iterate through the power tree to find a home for this device
+	// iterate through the power tree to find a home for this device
 
-  for ( i = 0; i < numPowerTreeNodes; i++ ) {
+	for (i = 0; i < numPowerTreeNodes; i++) {
+		entry =  (OSDictionary *) inSubTree->getObject(i);
 
-    entry =  (OSDictionary *) inSubTree->getObject (i);
+		matchingDictionary = (OSDictionary *) entry->getObject("device");
+		providerDictionary = (OSDictionary *) entry->getObject("provider");
 
-    matchingDictionary = (OSDictionary *) entry->getObject ("device");
-    providerDictionary = (OSDictionary *) entry->getObject ("provider");
+		deviceMatch = true; // if no matching dictionary, this is not a criteria and so must match
+		if (matchingDictionary) {
+			deviceMatch = false;
+			if (NULL != (deviceDictionary = theDevice->dictionaryWithProperties())) {
+				deviceMatch = deviceDictionary->isEqualTo( matchingDictionary, matchingDictionary );
+				deviceDictionary->release();
+			}
+		}
 
-    deviceMatch = true; // if no matching dictionary, this is not a criteria and so must match
-    if ( matchingDictionary ) {
-      deviceMatch = false;
-      if ( NULL != (deviceDictionary = theDevice->dictionaryWithProperties ())) {
-        deviceMatch = deviceDictionary->isEqualTo ( matchingDictionary, matchingDictionary );
-        deviceDictionary->release ();
-      }
-    }
+		providerMatch = true; // we indicate a match if there is no nub or provider
+		if (theNub && providerDictionary) {
+			providerMatch = false;
+			if (NULL != (nubDictionary = theNub->dictionaryWithProperties())) {
+				providerMatch = nubDictionary->isEqualTo( providerDictionary, providerDictionary );
+				nubDictionary->release();
+			}
+		}
 
-    providerMatch = true; // we indicate a match if there is no nub or provider
-    if ( theNub && providerDictionary ) {
-      providerMatch = false;
-      if ( NULL != (nubDictionary = theNub->dictionaryWithProperties ()) ) {
-        providerMatch = nubDictionary->isEqualTo ( providerDictionary,  providerDictionary );
-        nubDictionary->release ();
-      }
-    }
+		multiParentMatch = true; // again we indicate a match if there is no multi-parent node
+		if (deviceMatch && providerMatch) {
+			if (NULL != multipleParentKeyValue) {
+				OSNumber * aNumber = (OSNumber *) entry->getObject("multiple-parent");
+				multiParentMatch   = (NULL != aNumber) ? multipleParentKeyValue->isEqualTo(aNumber) : false;
+			}
+		}
 
-    multiParentMatch = true; // again we indicate a match if there is no multi-parent node
-    if (deviceMatch && providerMatch) {
-      if (NULL != multipleParentKeyValue) {
-        OSNumber * aNumber = (OSNumber *) entry->getObject ("multiple-parent");
-        multiParentMatch   = (NULL != aNumber) ? multipleParentKeyValue->isEqualTo (aNumber) : false;
-      }
-    }
+		nodeFound = (deviceMatch && providerMatch && multiParentMatch);
 
-    nodeFound = (deviceMatch && providerMatch && multiParentMatch);
+		// if the power tree specifies a provider dictionary but theNub is
+		// NULL then we cannot match with this entry.
 
-    // if the power tree specifies a provider dictionary but theNub is
-    // NULL then we cannot match with this entry.
+		if (theNub == NULL && providerDictionary != NULL) {
+			nodeFound = false;
+		}
 
-    if ( theNub == NULL && providerDictionary != NULL )
-      nodeFound = false;
-  
-    // if this node is THE ONE...then register the device
+		// if this node is THE ONE...then register the device
 
-    if ( nodeFound ) {
-      if (RegisterServiceInTree (theDevice, entry, theParent, theNub) ) {
+		if (nodeFound) {
+			if (RegisterServiceInTree(theDevice, entry, theParent, theNub)) {
+				if (kIOLogPower & gIOKitDebug) {
+					IOLog("PMRegisterDevice/CheckSubTree - service registered!\n");
+				}
 
-        if ( kIOLogPower & gIOKitDebug)
-          IOLog ("PMRegisterDevice/CheckSubTree - service registered!\n");
+				numInstancesRegistered++;
 
-	numInstancesRegistered++;
+				// determine if we need to search for additional nodes for this item
+				multipleParentKeyValue = (OSNumber *) entry->getObject("multiple-parent");
+			} else {
+				nodeFound = false;
+			}
+		}
 
-	// determine if we need to search for additional nodes for this item
-	multipleParentKeyValue = (OSNumber *) entry->getObject ("multiple-parent");
-      }
-      else
-	nodeFound = false;
-    }
+		continueSearch = ((false == nodeFound) || (NULL != multipleParentKeyValue));
 
-    continueSearch = ( (false == nodeFound) || (NULL != multipleParentKeyValue) );
+		if (continueSearch && (NULL != (children = (OSArray *) entry->getObject("children")))) {
+			nodeFound = CheckSubTree( children, theNub, theDevice, entry );
+			continueSearch = ((false == nodeFound) || (NULL != multipleParentKeyValue));
+		}
 
-    if ( continueSearch && (NULL != (children = (OSArray *) entry->getObject ("children"))) ) {
-      nodeFound = CheckSubTree ( children, theNub, theDevice, entry );
-      continueSearch = ( (false == nodeFound) || (NULL != multipleParentKeyValue) );
-    }
+		if (false == continueSearch) {
+			break;
+		}
+	}
 
-    if ( false == continueSearch )
-      break;
-  }
-
-  return ( nodeFound );
+	return nodeFound;
 }
 
 //*********************************************************************************
@@ -556,51 +705,53 @@ bool IOPlatformExpert::CheckSubTree (OSArray * inSubTree, IOService * theNub, IO
 // Register a device at the specified node of our power tree.
 //*********************************************************************************
 
-bool IOPlatformExpert::RegisterServiceInTree (IOService * theService, OSDictionary * theTreeNode, OSDictionary * theTreeParentNode, IOService * theProvider)
+bool
+IOPlatformExpert::RegisterServiceInTree(IOService * theService, OSDictionary * theTreeNode, OSDictionary * theTreeParentNode, IOService * theProvider)
 {
-  IOService *    aService;
-  bool           registered = false;
-  OSArray *      children;
-  unsigned int   numChildren;
-  OSDictionary * child;
+	IOService *    aService;
+	bool           registered = false;
+	OSArray *      children;
+	unsigned int   numChildren;
+	OSDictionary * child;
 
-  // make sure someone is not already registered here
+	// make sure someone is not already registered here
 
-  if ( NULL == theTreeNode->getObject ("service") ) {
+	if (NULL == theTreeNode->getObject("service")) {
+		if (theTreeNode->setObject("service", OSDynamicCast( OSObject, theService))) {
+			// 1. CHILDREN ------------------
 
-    if ( theTreeNode->setObject ("service", OSDynamicCast ( OSObject, theService)) ) {
+			// we registered the node in the tree...now if the node has children
+			// registered we must tell this service to add them.
 
-      // 1. CHILDREN ------------------
+			if (NULL != (children = (OSArray *) theTreeNode->getObject("children"))) {
+				numChildren = children->getCount();
+				for (unsigned int i = 0; i < numChildren; i++) {
+					if (NULL != (child = (OSDictionary *) children->getObject(i))) {
+						if (NULL != (aService = (IOService *) child->getObject("service"))) {
+							theService->addPowerChild(aService);
+						}
+					}
+				}
+			}
 
-      // we registered the node in the tree...now if the node has children
-      // registered we must tell this service to add them.
+			// 2. PARENT --------------------
 
-      if ( NULL != (children = (OSArray *) theTreeNode->getObject ("children")) ) {
-        numChildren = children->getCount ();
-        for ( unsigned int i = 0; i < numChildren; i++ ) {
-          if ( NULL != (child = (OSDictionary *) children->getObject (i)) ) {
-            if ( NULL != (aService = (IOService *) child->getObject ("service")) )
-              theService->addPowerChild (aService);
-          }
-        }
-      }
+			// also we must notify the parent of this node (if a registered service
+			// exists there) of a new child.
 
-      // 2. PARENT --------------------
+			if (theTreeParentNode) {
+				if (NULL != (aService = (IOService *) theTreeParentNode->getObject("service"))) {
+					if (aService != theProvider) {
+						aService->addPowerChild(theService);
+					}
+				}
+			}
 
-      // also we must notify the parent of this node (if a registered service
-      // exists there) of a new child.
+			registered = true;
+		}
+	}
 
-      if ( theTreeParentNode ) {
-        if ( NULL != (aService = (IOService *) theTreeParentNode->getObject ("service")) )
-          if (aService != theProvider)
-            aService->addPowerChild (theService);
-      }
-
-      registered = true;
-    }
-  }
-
-  return registered;
+	return registered;
 }
 
 //*********************************************************************************
@@ -608,428 +759,825 @@ bool IOPlatformExpert::RegisterServiceInTree (IOService * theService, OSDictiona
 //
 // Print the keys for the given dictionary and selected contents.
 //*********************************************************************************
-void printDictionaryKeys (OSDictionary * inDictionary, char * inMsg)
+void
+printDictionaryKeys(OSDictionary * inDictionary, char * inMsg)
 {
-  OSCollectionIterator * mcoll = OSCollectionIterator::withCollection (inDictionary);
-  OSSymbol * mkey;
-  OSString * ioClass;
-  unsigned int i = 0;
- 
-  mcoll->reset ();
+	OSCollectionIterator * mcoll = OSCollectionIterator::withCollection(inDictionary);
+	OSSymbol * mkey;
+	OSString * ioClass;
+	unsigned int i = 0;
 
-  mkey = OSDynamicCast (OSSymbol, mcoll->getNextObject ());
+	mcoll->reset();
 
-  while (mkey) {
+	mkey = OSDynamicCast(OSSymbol, mcoll->getNextObject());
 
-    // kprintf ("dictionary key #%d: %s\n", i, mkey->getCStringNoCopy () );
+	while (mkey) {
+		// kprintf ("dictionary key #%d: %s\n", i, mkey->getCStringNoCopy () );
 
-    // if this is the IOClass key, print it's contents
+		// if this is the IOClass key, print it's contents
 
-    if ( mkey->isEqualTo ("IOClass") ) {
-      ioClass = (OSString *) inDictionary->getObject ("IOClass");
-      if ( ioClass ) IOLog ("%s IOClass is %s\n", inMsg, ioClass->getCStringNoCopy () );
-    }
+		if (mkey->isEqualTo("IOClass")) {
+			ioClass = (OSString *) inDictionary->getObject("IOClass");
+			if (ioClass) {
+				IOLog("%s IOClass is %s\n", inMsg, ioClass->getCStringNoCopy());
+			}
+		}
 
-    // if this is an IOProviderClass key print it
+		// if this is an IOProviderClass key print it
 
-    if ( mkey->isEqualTo ("IOProviderClass") ) {
-      ioClass = (OSString *) inDictionary->getObject ("IOProviderClass");
-      if ( ioClass ) IOLog ("%s IOProviderClass is %s\n", inMsg, ioClass->getCStringNoCopy () );
+		if (mkey->isEqualTo("IOProviderClass")) {
+			ioClass = (OSString *) inDictionary->getObject("IOProviderClass");
+			if (ioClass) {
+				IOLog("%s IOProviderClass is %s\n", inMsg, ioClass->getCStringNoCopy());
+			}
+		}
 
-    }
+		// also print IONameMatch keys
+		if (mkey->isEqualTo("IONameMatch")) {
+			ioClass = (OSString *) inDictionary->getObject("IONameMatch");
+			if (ioClass) {
+				IOLog("%s IONameMatch is %s\n", inMsg, ioClass->getCStringNoCopy());
+			}
+		}
 
-    // also print IONameMatch keys
-    if ( mkey->isEqualTo ("IONameMatch") ) {
-      ioClass = (OSString *) inDictionary->getObject ("IONameMatch");
-      if ( ioClass ) IOLog ("%s IONameMatch is %s\n", inMsg, ioClass->getCStringNoCopy () );
-    }
+		// also print IONameMatched keys
 
-    // also print IONameMatched keys
-
-    if ( mkey->isEqualTo ("IONameMatched") ) {
-      ioClass = (OSString *) inDictionary->getObject ("IONameMatched");
-      if ( ioClass ) IOLog ("%s IONameMatched is %s\n", inMsg, ioClass->getCStringNoCopy () );
-    }
+		if (mkey->isEqualTo("IONameMatched")) {
+			ioClass = (OSString *) inDictionary->getObject("IONameMatched");
+			if (ioClass) {
+				IOLog("%s IONameMatched is %s\n", inMsg, ioClass->getCStringNoCopy());
+			}
+		}
 
 #if 0
-    // print clock-id
+		// print clock-id
 
-    if ( mkey->isEqualTo ("AAPL,clock-id") ) {
-      char * cstr;
-      cstr = getCStringForObject (inDictionary->getObject ("AAPL,clock-id"));
-      if (cstr)
-        kprintf (" ===> AAPL,clock-id is %s\n", cstr );
-    }
+		if (mkey->isEqualTo("AAPL,clock-id")) {
+			char * cstr;
+			cstr = getCStringForObject(inDictionary->getObject("AAPL,clock-id"));
+			if (cstr) {
+				kprintf(" ===> AAPL,clock-id is %s\n", cstr );
+			}
+		}
 #endif
 
-    // print name
+		// print name
 
-    if ( mkey->isEqualTo ("name") ) {
-      char nameStr[64];
-      nameStr[0] = 0;
-      getCStringForObject(inDictionary->getObject("name"), nameStr,
-		      sizeof(nameStr));
-      if (strlen(nameStr) > 0)
-        IOLog ("%s name is %s\n", inMsg, nameStr);
-    }
+		if (mkey->isEqualTo("name")) {
+			char nameStr[64];
+			nameStr[0] = 0;
+			getCStringForObject(inDictionary->getObject("name"), nameStr,
+			    sizeof(nameStr));
+			if (strlen(nameStr) > 0) {
+				IOLog("%s name is %s\n", inMsg, nameStr);
+			}
+		}
 
-    mkey = (OSSymbol *) mcoll->getNextObject ();
+		mkey = (OSSymbol *) mcoll->getNextObject();
 
-    i++;
-  }
+		i++;
+	}
 
-  mcoll->release ();
+	mcoll->release();
 }
 
 static void
 getCStringForObject(OSObject *inObj, char *outStr, size_t outStrLen)
 {
-   char * buffer;
-   unsigned int    len, i;
+	char * buffer;
+	unsigned int    len, i;
 
-   if ( (NULL == inObj) || (NULL == outStr))
-     return;
+	if ((NULL == inObj) || (NULL == outStr)) {
+		return;
+	}
 
-   char * objString = (char *) (inObj->getMetaClass())->getClassName();
+	char * objString = (char *) (inObj->getMetaClass())->getClassName();
 
-   if ((0 == strncmp(objString, "OSString", sizeof("OSString"))) ||
-		   (0 == strncmp(objString, "OSSymbol", sizeof("OSSymbol"))))
-     strlcpy(outStr, ((OSString *)inObj)->getCStringNoCopy(), outStrLen);
-
-   else if (0 == strncmp(objString, "OSData", sizeof("OSData"))) {
-     len = ((OSData *)inObj)->getLength();
-     buffer = (char *)((OSData *)inObj)->getBytesNoCopy();
-     if (buffer && (len > 0)) {
-       for (i=0; i < len; i++) {
-         outStr[i] = buffer[i];
-       }
-       outStr[len] = 0;
-     }
-   }
+	if ((0 == strncmp(objString, "OSString", sizeof("OSString"))) ||
+	    (0 == strncmp(objString, "OSSymbol", sizeof("OSSymbol")))) {
+		strlcpy(outStr, ((OSString *)inObj)->getCStringNoCopy(), outStrLen);
+	} else if (0 == strncmp(objString, "OSData", sizeof("OSData"))) {
+		len = ((OSData *)inObj)->getLength();
+		buffer = (char *)((OSData *)inObj)->getBytesNoCopy();
+		if (buffer && (len > 0)) {
+			for (i = 0; i < len; i++) {
+				outStr[i] = buffer[i];
+			}
+			outStr[len] = 0;
+		}
+	}
 }
 
 /* IOShutdownNotificationsTimedOut
  * - Called from a timer installed by PEHaltRestart
  */
-static void IOShutdownNotificationsTimedOut(
-    thread_call_param_t p0, 
-    thread_call_param_t p1)
+#if !defined(__x86_64)
+__abortlike
+#endif
+static void
+IOShutdownNotificationsTimedOut(
+	thread_call_param_t p0,
+	thread_call_param_t p1)
 {
-    int type = (int)(long)p0;
+#if !defined(__x86_64__)
+	/* 30 seconds has elapsed - panic */
+	panic("Halt/Restart Timed Out");
 
-    /* 30 seconds has elapsed - resume shutdown */
-    if(gIOPlatform) gIOPlatform->haltRestart(type);
+#else /* !defined(__x86_64__) */
+	int type = (int)(long)p0;
+	uint32_t timeout = (uint32_t)(uintptr_t)p1;
+
+	IOPMrootDomain *pmRootDomain = IOService::getPMRootDomain();
+	if (pmRootDomain) {
+		if ((PEGetCoprocessorVersion() >= kCoprocessorVersion2) || pmRootDomain->checkShutdownTimeout()) {
+			pmRootDomain->panicWithShutdownLog(timeout * 1000);
+		}
+	}
+
+	/* 30 seconds has elapsed - resume shutdown */
+	if (gIOPlatform) {
+		gIOPlatform->haltRestart(type);
+	}
+#endif /* defined(__x86_64__) */
 }
 
 
 extern "C" {
-
 /*
  * Callouts from BSD for machine name & model
- */ 
+ */
 
-boolean_t PEGetMachineName( char * name, int maxLength )
+/*
+ * PEGetMachineName() and PEGetModelName() are inconsistent across
+ * architectures, and considered deprecated. Use PEGetTargetName() and
+ * PEGetProductName() instead.
+ */
+boolean_t
+PEGetMachineName( char * name, int maxLength )
 {
-    if( gIOPlatform)
-	return( gIOPlatform->getMachineName( name, maxLength ));
-    else
-	return( false );
+	if (gIOPlatform) {
+		return gIOPlatform->getMachineName( name, maxLength );
+	} else {
+		return false;
+	}
 }
 
-boolean_t PEGetModelName( char * name, int maxLength )
+/*
+ * PEGetMachineName() and PEGetModelName() are inconsistent across
+ * architectures, and considered deprecated. Use PEGetTargetName() and
+ * PEGetProductName() instead.
+ */
+boolean_t
+PEGetModelName( char * name, int maxLength )
 {
-    if( gIOPlatform)
-	return( gIOPlatform->getModelName( name, maxLength ));
-    else
-	return( false );
+	if (gIOPlatform) {
+		return gIOPlatform->getModelName( name, maxLength );
+	} else {
+		return false;
+	}
 }
 
-int PEGetPlatformEpoch(void)
+boolean_t
+PEGetTargetName( char * name, int maxLength )
 {
-    if( gIOPlatform)
-	return( gIOPlatform->getBootROMType());
-    else
-	return( -1 );
+	if (gIOPlatform) {
+		return gIOPlatform->getTargetName( name, maxLength );
+	} else {
+		return false;
+	}
 }
 
-int PEHaltRestart(unsigned int type)
+boolean_t
+PEGetProductName( char * name, int maxLength )
 {
-  IOPMrootDomain    *pmRootDomain;
-  AbsoluteTime      deadline;
-  thread_call_t     shutdown_hang;
-  
-  if(type == kPEHaltCPU || type == kPERestartCPU || type == kPEUPSDelayHaltCPU)
-  {
-    pmRootDomain = IOService::getPMRootDomain();
-    /* Notify IOKit PM clients of shutdown/restart
-       Clients subscribe to this message with a call to
-       IOService::registerInterest()
-    */
-    
-    /* Spawn a thread that will panic in 30 seconds. 
-       If all goes well the machine will be off by the time
-       the timer expires.
-     */
-    shutdown_hang = thread_call_allocate( &IOShutdownNotificationsTimedOut, 
-                        (thread_call_param_t)(uintptr_t) type);
-    clock_interval_to_deadline( 30, kSecondScale, &deadline );
-    thread_call_enter1_delayed( shutdown_hang, 0, deadline );
-
-    pmRootDomain->handlePlatformHaltRestart(type); 
-    /* This notification should have few clients who all do 
-       their work synchronously.
-             
-       In this "shutdown notification" context we don't give
-       drivers the option of working asynchronously and responding 
-       later. PM internals make it very hard to wait for asynchronous
-       replies.
-     */
-   }
-
-  if (gIOPlatform) return gIOPlatform->haltRestart(type);
-  else return -1;
+	if (gIOPlatform) {
+		return gIOPlatform->getProductName( name, maxLength );
+	} else {
+		return false;
+	}
 }
 
-UInt32 PESavePanicInfo(UInt8 *buffer, UInt32 length)
+int
+PEGetPlatformEpoch(void)
 {
-  if (gIOPlatform != 0) return gIOPlatform->savePanicInfo(buffer, length);
-  else return 0;
+	if (gIOPlatform) {
+		return (int) gIOPlatform->getBootROMType();
+	} else {
+		return -1;
+	}
+}
+
+/* Handle necessary platform specific actions prior to panic */
+void
+PEInitiatePanic(void)
+{
+#if defined(__arm64__)
+	/*
+	 * Trigger a TLB flush so any hard hangs exercise the SoC diagnostic
+	 * collection flow rather than hanging late in panic (see rdar://58062030)
+	 */
+	flush_mmu_tlb_entries_async(0, PAGE_SIZE, PAGE_SIZE, true, true);
+	arm64_sync_tlb(true);
+#endif // defined(__arm64__)
+}
+
+int
+PEHaltRestartInternal(unsigned int type, uint32_t details)
+{
+	IOPMrootDomain    *pmRootDomain;
+	AbsoluteTime      deadline;
+	thread_call_t     shutdown_hang;
+	IORegistryEntry   *node;
+	OSData            *data;
+	uint32_t          timeout = kShutdownTimeout;
+	static boolean_t  panic_begin_called = FALSE;
+
+	if (type == kPEHaltCPU || type == kPERestartCPU || type == kPEUPSDelayHaltCPU) {
+		/* If we're in the panic path, the locks and memory allocations required below
+		 *  could fail. So just try to reboot instead of risking a nested panic.
+		 */
+		if (panic_begin_called) {
+			goto skip_to_haltRestart;
+		}
+
+		pmRootDomain = IOService::getPMRootDomain();
+		/* Notify IOKit PM clients of shutdown/restart
+		 *  Clients subscribe to this message with a call to
+		 *  IOService::registerInterest()
+		 */
+
+		/* Spawn a thread that will panic in 30 seconds.
+		 *  If all goes well the machine will be off by the time
+		 *  the timer expires. If the device wants a different
+		 *  timeout, use that value instead of 30 seconds.
+		 */
+#if  defined(__arm64__)
+#define RESTART_NODE_PATH    "/defaults"
+#else
+#define RESTART_NODE_PATH    "/chosen"
+#endif
+		node = IORegistryEntry::fromPath( RESTART_NODE_PATH, gIODTPlane );
+		if (node) {
+			data = OSDynamicCast( OSData, node->getProperty( "halt-restart-timeout" ));
+			if (data && data->getLength() == 4) {
+				timeout = *((uint32_t *) data->getBytesNoCopy());
+			}
+			OSSafeReleaseNULL(node);
+		}
+
+#if (DEVELOPMENT || DEBUG)
+		/* Override the default timeout via a boot-arg */
+		uint32_t boot_arg_val;
+		if (PE_parse_boot_argn("halt_restart_timeout", &boot_arg_val, sizeof(boot_arg_val))) {
+			timeout = boot_arg_val;
+		}
+#endif
+
+		if (timeout) {
+			shutdown_hang = thread_call_allocate( &IOShutdownNotificationsTimedOut,
+			    (thread_call_param_t)(uintptr_t) type);
+			clock_interval_to_deadline( timeout, kSecondScale, &deadline );
+			thread_call_enter1_delayed( shutdown_hang, (thread_call_param_t)(uintptr_t)timeout, deadline );
+		}
+
+		pmRootDomain->handlePlatformHaltRestart(type);
+		/* This notification should have few clients who all do
+		 *  their work synchronously.
+		 *
+		 *  In this "shutdown notification" context we don't give
+		 *  drivers the option of working asynchronously and responding
+		 *  later. PM internals make it very hard to wait for asynchronous
+		 *  replies.
+		 */
+	} else if (type == kPEPanicRestartCPU || type == kPEPanicSync || type == kPEPanicRestartCPUNoCallouts) {
+		if (type == kPEPanicRestartCPU) {
+			// Notify any listeners that we're done collecting
+			// panic data before we call through to do the restart
+#if defined(__x86_64__)
+			if (coprocessor_cross_panic_enabled)
+#endif
+			IOCPURunPlatformPanicActions(kPEPanicEnd, details);
+		} else if (type == kPEPanicRestartCPUNoCallouts) {
+			// We skipped the callouts so now set the type to
+			// the variant that the platform uses for panic restarts.
+			type = kPEPanicRestartCPU;
+		}
+
+
+		// Do an initial sync to flush as much panic data as possible,
+		// in case we have a problem in one of the platorm panic handlers.
+		// After running the platform handlers, do a final sync w/
+		// platform hardware quiesced for the panic.
+		PE_sync_panic_buffers();
+		IOCPURunPlatformPanicActions(type, details);
+		PE_sync_panic_buffers();
+	} else if (type == kPEPanicEnd) {
+#if defined(__x86_64__)
+		if (coprocessor_cross_panic_enabled)
+#endif
+		IOCPURunPlatformPanicActions(type, details);
+	} else if (type == kPEPanicBegin) {
+#if defined(__x86_64__)
+		if (coprocessor_cross_panic_enabled)
+#endif
+		{
+			// Only call the kPEPanicBegin callout once
+			if (!panic_begin_called) {
+				panic_begin_called = TRUE;
+				IOCPURunPlatformPanicActions(type, details);
+			}
+		}
+	} else if (type == kPEPanicDiagnosticsDone || type == kPEPanicDiagnosticsInProgress) {
+		IOCPURunPlatformPanicActions(type, details);
+	}
+
+skip_to_haltRestart:
+	if (gIOPlatform) {
+		// note that this will not necessarily halt or restart the system...
+		// Implementors of this function will check the type and take action accordingly
+		return gIOPlatform->haltRestart(type);
+	} else {
+		return -1;
+	}
+}
+
+int
+PEHaltRestart(unsigned int type)
+{
+	return PEHaltRestartInternal(type, 0);
+}
+
+UInt32
+PESavePanicInfo(UInt8 *buffer, UInt32 length)
+{
+	if (gIOPlatform != NULL) {
+		return (UInt32) gIOPlatform->savePanicInfo(buffer, length);
+	} else {
+		return 0;
+	}
+}
+
+void
+PESavePanicInfoAction(void *buffer, UInt32 offset, UInt32 length)
+{
+	IOCPURunPlatformPanicSyncAction(buffer, offset, length);
+	return;
 }
 
 
-
-inline static int init_gIOOptionsEntry(void)
+/*
+ * Depending on the platform, the /options node may not be created
+ * until after IOKit matching has started, by an externally-supplied
+ * platform expert subclass.  Therefore, we must check for its presence
+ * here and update gIOOptionsEntry for the platform code as necessary.
+ */
+inline static int
+init_gIOOptionsEntry(void)
 {
-    IORegistryEntry *entry;
-    void *nvram_entry;
-    volatile void **options;
-    int ret = -1;
+	IORegistryEntry *entry;
+	void *nvram_entry;
+	volatile void **options;
+	int ret = -1;
 
-    if (gIOOptionsEntry) 
-        return 0;
+	if (gIOOptionsEntry) {
+		return 0;
+	}
 
-    entry = IORegistryEntry::fromPath( "/options", gIODTPlane );
-    if (!entry)
-        return -1;
+	entry = IORegistryEntry::fromPath( "/options", gIODTPlane );
+	if (!entry) {
+		return -1;
+	}
 
-    nvram_entry = (void *) OSDynamicCast(IODTNVRAM, entry);
-    if (!nvram_entry) 
-        goto release;
+	nvram_entry = (void *) OSDynamicCast(IODTNVRAM, entry);
+	if (!nvram_entry) {
+		goto release;
+	}
 
-    options = (volatile void **) &gIOOptionsEntry;
-    if (!OSCompareAndSwapPtr(NULL, nvram_entry, options)) {
-        ret = 0;
-        goto release;
-    }
+	options = (volatile void **) &gIOOptionsEntry;
+	if (!OSCompareAndSwapPtr(NULL, nvram_entry, options)) {
+		ret = 0;
+		goto release;
+	}
 
-    return 0;
+	return 0;
 
 release:
-    entry->release();
-    return ret;
-
+	entry->release();
+	return ret;
 }
 
 /* pass in a NULL value if you just want to figure out the len */
-boolean_t PEReadNVRAMProperty(const char *symbol, void *value,
-                              unsigned int *len)
+boolean_t
+PEReadNVRAMProperty(const char *symbol, void *value,
+    unsigned int *len)
 {
-    OSObject  *obj;
-    OSData *data;
-    unsigned int vlen;
+	OSObject  *obj;
+	OSData *data;
+	unsigned int vlen;
 
-    if (!symbol || !len)
-        goto err;
+	if (!symbol || !len) {
+		goto err;
+	}
 
-    if (init_gIOOptionsEntry() < 0)
-        goto err;
+	if (init_gIOOptionsEntry() < 0) {
+		goto err;
+	}
 
-    vlen = *len;
-    *len = 0;
+	vlen = *len;
+	*len = 0;
 
-    obj = gIOOptionsEntry->getProperty(symbol);
-    if (!obj)
-        goto err;
+	obj = gIOOptionsEntry->getProperty(symbol);
+	if (!obj) {
+		goto err;
+	}
 
-    /* convert to data */
-    data = OSDynamicCast(OSData, obj);
-    if (!data) 
-        goto err;
+	/* convert to data */
+	data = OSDynamicCast(OSData, obj);
+	if (!data) {
+		goto err;
+	}
 
-    *len  = data->getLength();
-    vlen  = min(vlen, *len);
-    if (value && vlen)
-        memcpy((void *) value, data->getBytesNoCopy(), vlen);
+	*len  = data->getLength();
+	vlen  = min(vlen, *len);
+	if (value && vlen) {
+		memcpy((void *) value, data->getBytesNoCopy(), vlen);
+	}
 
-    return TRUE;
+	return TRUE;
 
 err:
-    return FALSE;
+	return FALSE;
 }
 
-
-boolean_t PEWriteNVRAMProperty(const char *symbol, const void *value, 
-                               const unsigned int len)
+boolean_t
+PEReadNVRAMBooleanProperty(const char *symbol, boolean_t *value)
 {
-    const OSSymbol *sym;
-    OSData *data;
-    bool ret = false;
+	OSObject  *obj;
+	OSBoolean *data;
 
-    if (!symbol || !value || !len)
-        goto err;
+	if (!symbol || !value) {
+		goto err;
+	}
 
-    if (init_gIOOptionsEntry() < 0)
-        goto err;
+	if (init_gIOOptionsEntry() < 0) {
+		goto err;
+	}
 
-    sym = OSSymbol::withCStringNoCopy(symbol);
-    if (!sym)
-        goto err;
+	obj = gIOOptionsEntry->getProperty(symbol);
+	if (!obj) {
+		return TRUE;
+	}
 
-    data = OSData::withBytes((void *) value, len);
-    if (!data)
-        goto sym_done;
+	/* convert to bool */
+	data = OSDynamicCast(OSBoolean, obj);
+	if (!data) {
+		goto err;
+	}
 
-    ret = gIOOptionsEntry->setProperty(sym, data);
-    data->release();
+	*value = data->isTrue() ? TRUE : FALSE;
+
+	return TRUE;
+
+err:
+	return FALSE;
+}
+
+boolean_t
+PEWriteNVRAMBooleanProperty(const char *symbol, boolean_t value)
+{
+	const OSSymbol *sym = NULL;
+	OSBoolean *data = NULL;
+	bool ret = false;
+
+	if (symbol == NULL) {
+		goto exit;
+	}
+
+	if (init_gIOOptionsEntry() < 0) {
+		goto exit;
+	}
+
+	if ((sym = OSSymbol::withCStringNoCopy(symbol)) == NULL) {
+		goto exit;
+	}
+
+	data  = value ? kOSBooleanTrue : kOSBooleanFalse;
+	ret = gIOOptionsEntry->setProperty(sym, data);
+
+	sym->release();
+
+	/* success, force the NVRAM to flush writes */
+	if (ret == true) {
+		gIOOptionsEntry->sync();
+	}
+
+exit:
+	return ret;
+}
+
+static boolean_t
+PEWriteNVRAMPropertyInternal(const char *symbol, boolean_t copySymbol, const void *value,
+    const unsigned int len)
+{
+	const OSSymbol *sym;
+	OSData *data;
+	bool ret = false;
+
+	if (!symbol || !value || !len) {
+		goto err;
+	}
+
+	if (init_gIOOptionsEntry() < 0) {
+		goto err;
+	}
+
+	if (copySymbol == TRUE) {
+		sym = OSSymbol::withCString(symbol);
+	} else {
+		sym = OSSymbol::withCStringNoCopy(symbol);
+	}
+
+	if (!sym) {
+		goto err;
+	}
+
+	data = OSData::withBytes((void *) value, len);
+	if (!data) {
+		goto sym_done;
+	}
+
+	ret = gIOOptionsEntry->setProperty(sym, data);
+	data->release();
 
 sym_done:
-    sym->release();
+	sym->release();
 
-    if (ret == true) {
-        gIOOptionsEntry->sync();
-        return TRUE;
-    }
-
-err:
-    return FALSE;
-}
-
-
-boolean_t PERemoveNVRAMProperty(const char *symbol)
-{
-    const OSSymbol *sym;
-
-    if (!symbol)
-        goto err;
-
-    if (init_gIOOptionsEntry() < 0)
-        goto err;
-
-    sym = OSSymbol::withCStringNoCopy(symbol);
-    if (!sym)
-        goto err;
-
-    gIOOptionsEntry->removeProperty(sym);
-
-    sym->release();
-
-    gIOOptionsEntry->sync();
-    return TRUE;
+	if (ret == true) {
+		gIOOptionsEntry->sync();
+		return TRUE;
+	}
 
 err:
-    return FALSE;
-
+	return FALSE;
 }
 
-long PEGetGMTTimeOfDay(void)
+boolean_t
+PEWriteNVRAMProperty(const char *symbol, const void *value,
+    const unsigned int len)
 {
-	long	result = 0;
-
-	if( gIOPlatform)		result = gIOPlatform->getGMTTimeOfDay();
-
-	return (result);
+	return PEWriteNVRAMPropertyInternal(symbol, FALSE, value, len);
 }
 
-void PESetGMTTimeOfDay(long secs)
+boolean_t
+PEWriteNVRAMPropertyWithCopy(const char *symbol, const void *value,
+    const unsigned int len)
 {
-    if( gIOPlatform)		gIOPlatform->setGMTTimeOfDay(secs);
+	return PEWriteNVRAMPropertyInternal(symbol, TRUE, value, len);
 }
 
+boolean_t
+PERemoveNVRAMProperty(const char *symbol)
+{
+	const OSSymbol *sym;
+
+	if (!symbol) {
+		goto err;
+	}
+
+	if (init_gIOOptionsEntry() < 0) {
+		goto err;
+	}
+
+	sym = OSSymbol::withCStringNoCopy(symbol);
+	if (!sym) {
+		goto err;
+	}
+
+	gIOOptionsEntry->removeProperty(sym);
+
+	sym->release();
+
+	gIOOptionsEntry->sync();
+	return TRUE;
+
+err:
+	return FALSE;
+}
+
+boolean_t
+PESyncNVRAM(void)
+{
+	if (gIOOptionsEntry != nullptr) {
+		gIOOptionsEntry->sync();
+	}
+
+	return TRUE;
+}
+
+long
+PEGetGMTTimeOfDay(void)
+{
+	clock_sec_t     secs;
+	clock_usec_t    usecs;
+
+	PEGetUTCTimeOfDay(&secs, &usecs);
+	return secs;
+}
+
+void
+PESetGMTTimeOfDay(long secs)
+{
+	PESetUTCTimeOfDay(secs, 0);
+}
+
+void
+PEGetUTCTimeOfDay(clock_sec_t * secs, clock_usec_t * usecs)
+{
+	clock_nsec_t    nsecs = 0;
+
+	*secs = 0;
+	if (gIOPlatform) {
+		gIOPlatform->getUTCTimeOfDay(secs, &nsecs);
+	}
+
+	assert(nsecs < NSEC_PER_SEC);
+	*usecs = nsecs / NSEC_PER_USEC;
+}
+
+void
+PESetUTCTimeOfDay(clock_sec_t secs, clock_usec_t usecs)
+{
+	assert(usecs < USEC_PER_SEC);
+	if (gIOPlatform) {
+		gIOPlatform->setUTCTimeOfDay(secs, usecs * NSEC_PER_USEC);
+	}
+}
+
+coprocessor_type_t
+PEGetCoprocessorVersion( void )
+{
+	coprocessor_type_t coprocessor_version = kCoprocessorVersionNone;
+#if defined(__x86_64__)
+	IORegistryEntry     *platform_entry = NULL;
+	OSData              *coprocessor_version_obj = NULL;
+
+	platform_entry = IORegistryEntry::fromPath(kIODeviceTreePlane ":/efi/platform");
+	if (platform_entry != NULL) {
+		coprocessor_version_obj = OSDynamicCast(OSData, platform_entry->getProperty("apple-coprocessor-version"));
+		if ((coprocessor_version_obj != NULL) && (coprocessor_version_obj->getLength() <= sizeof(uint64_t))) {
+			memcpy(&coprocessor_version, coprocessor_version_obj->getBytesNoCopy(), coprocessor_version_obj->getLength());
+		}
+		platform_entry->release();
+	}
+#endif
+	return coprocessor_version;
+}
 } /* extern "C" */
 
-void IOPlatformExpert::registerNVRAMController(IONVRAMController * caller)
+bool gIOPlatformUUIDAndSerialDone = false;
+
+void
+IOPlatformExpert::publishPlatformUUIDAndSerial( void )
 {
-    OSData *          data;
-    IORegistryEntry * entry;
-    OSString *        string = 0;
-    uuid_string_t     uuid;
+	if (!gIOPlatformUUIDAndSerialDone) {
+		// Parse the serial-number data and publish a user-readable string
+		if (NULL == getProvider()->getProperty(kIOPlatformSerialNumberKey)) {
+			OSData* mydata = (OSData*) (getProvider()->getProperty("serial-number"));
+			if (mydata != NULL) {
+				OSString *serNoString = createSystemSerialNumberString(mydata);
+				if (serNoString != NULL) {
+					getProvider()->setProperty(kIOPlatformSerialNumberKey, serNoString);
+					serNoString->release();
+				}
+			}
+		}
+		IOPlatformExpertDevice *provider = OSDynamicCast(IOPlatformExpertDevice, getProvider());
+		assert(provider != NULL);
+		provider->generatePlatformUUID();
+	}
 
-    entry = IORegistryEntry::fromPath( "/efi/platform", gIODTPlane );
-    if ( entry )
-    {
-        data = OSDynamicCast( OSData, entry->getProperty( "system-id" ) );
-        if ( data && data->getLength( ) == 16 )
-        {
-            SHA1_CTX     context;
-            uint8_t      digest[ SHA_DIGEST_LENGTH ];
-            const uuid_t space = { 0x2A, 0x06, 0x19, 0x90, 0xD3, 0x8D, 0x44, 0x40, 0xA1, 0x39, 0xC4, 0x97, 0x70, 0x37, 0x65, 0xAC };
-
-            SHA1Init( &context );
-            SHA1Update( &context, space, sizeof( space ) );
-            SHA1Update( &context, data->getBytesNoCopy( ), data->getLength( ) );
-            SHA1Final( digest, &context );
-
-            digest[ 6 ] = ( digest[ 6 ] & 0x0F ) | 0x50;
-            digest[ 8 ] = ( digest[ 8 ] & 0x3F ) | 0x80;
-
-            uuid_unparse( digest, uuid );
-            string = OSString::withCString( uuid );
-        }
-
-        entry->release( );
-    }
-
-    if ( string == 0 )
-    {
-        entry = IORegistryEntry::fromPath( "/options", gIODTPlane );
-        if ( entry )
-        {
-            data = OSDynamicCast( OSData, entry->getProperty( "platform-uuid" ) );
-            if ( data && data->getLength( ) == sizeof( uuid_t ) )
-            {
-                uuid_unparse( ( uint8_t * ) data->getBytesNoCopy( ), uuid );
-                string = OSString::withCString( uuid );
-            }
-
-            entry->release( );
-        }
-    }
-
-    if ( string )
-    {
-        getProvider( )->setProperty( kIOPlatformUUIDKey, string );
-        publishResource( kIOPlatformUUIDKey, string );
-
-        string->release( );
-    }
-
-    publishResource("IONVRAM");
+	if (gIOPlatformUUIDAndSerialDone) {
+		publishResource(kIOPlatformUUIDKey, getProvider()->getProperty(kIOPlatformUUIDKey));
+	}
 }
 
-IOReturn IOPlatformExpert::callPlatformFunction(const OSSymbol *functionName,
-						bool waitForFunction,
-						void *param1, void *param2,
-						void *param3, void *param4)
+void
+IOPlatformExpert::publishNVRAM( void )
 {
-  IOService *service, *_resources;
-  
-  if (waitForFunction) {
-    _resources = waitForService(resourceMatching(functionName));
-  } else {
-    _resources = getResourceService();
-  }
-  if (_resources == 0) return kIOReturnUnsupported;
-  
-  service = OSDynamicCast(IOService, _resources->getProperty(functionName));
-  if (service == 0) return kIOReturnUnsupported;
-  
-  return service->callPlatformFunction(functionName, waitForFunction,
-				       param1, param2, param3, param4);
+	if (init_gIOOptionsEntry() < 0) {
+		IOPlatformExpertDevice *provider = OSDynamicCast(IOPlatformExpertDevice, getProvider());
+		assert(provider != NULL);
+		provider->createNVRAM();
+	}
+	if (gIOOptionsEntry != NULL) {
+		gIOOptionsEntry->registerService();
+	}
 }
 
-IOByteCount IOPlatformExpert::savePanicInfo(UInt8 *buffer, IOByteCount length)
+void
+IOPlatformExpert::registerNVRAMController(IONVRAMController * caller)
 {
-  return 0;
+#if defined(__x86_64__)
+	OSData *          data;
+	IORegistryEntry * entry;
+
+	/*
+	 * If we have panic debugging enabled WITHOUT behavior to reboot after any crash (DB_REBOOT_ALWAYS)
+	 * and we are on a co-processor system that has the panic SoC watchdog enabled, disable
+	 * cross panics so that the co-processor doesn't cause the system
+	 * to reset when we enter the debugger or hit a panic on the x86 side.
+	 */
+	if (panicDebugging && !(debug_boot_arg & DB_REBOOT_ALWAYS)) {
+		entry = IORegistryEntry::fromPath( "/options", gIODTPlane );
+		if (entry) {
+			data = OSDynamicCast( OSData, entry->getProperty( APPLE_VENDOR_VARIABLE_GUID":BridgeOSPanicWatchdogEnabled" ));
+			if (data && (data->getLength() == sizeof(UInt8))) {
+				UInt8 *panicWatchdogEnabled = (UInt8 *) data->getBytesNoCopy();
+				UInt32 debug_flags = 0;
+				if (*panicWatchdogEnabled || (PE_i_can_has_debugger(&debug_flags) &&
+				    (debug_flags & DB_DISABLE_CROSS_PANIC))) {
+					coprocessor_cross_panic_enabled = FALSE;
+				}
+			}
+			entry->release();
+		}
+	}
+
+#if (DEVELOPMENT || DEBUG)
+	entry = IORegistryEntry::fromPath( "/options", gIODTPlane );
+	if (entry) {
+		data = OSDynamicCast( OSData, entry->getProperty(nvram_osenvironment));
+		if (data) {
+			sysctl_set_osenvironment(data->getLength(), data->getBytesNoCopy());
+			entry->removeProperty(nvram_osenvironment);
+			IODTNVRAM * nvramOptionsEntry = OSDynamicCast(IODTNVRAM, entry);
+			if (nvramOptionsEntry) {
+				nvramOptionsEntry->sync();
+			}
+		}
+		entry->release();
+	}
+	sysctl_unblock_osenvironment();
+#endif
+	/* on intel the UUID must be published after nvram is available */
+	publishPlatformUUIDAndSerial();
+
+#endif /* defined(__x86_64__) */
+
+	publishResource("IONVRAM");
+}
+
+IOReturn
+IOPlatformExpert::callPlatformFunction(const OSSymbol *functionName,
+    bool waitForFunction,
+    void *param1, void *param2,
+    void *param3, void *param4)
+{
+	IOService *service, *_resources;
+	OSObject  *prop = NULL;
+	IOReturn   ret;
+
+	if (functionName == gIOPlatformQuiesceActionKey ||
+	    functionName == gIOPlatformActiveActionKey ||
+	    functionName == gIOPlatformPanicActionKey) {
+		/*
+		 * Services which register for IOPlatformQuiesceAction / IOPlatformActiveAction / IOPlatformPanicAction
+		 * must consume that event themselves, without passing it up to super/IOPlatformExpert.
+		 */
+		if (gEnforcePlatformActionSafety) {
+			panic("Class %s passed the %s action to IOPlatformExpert",
+			    getMetaClass()->getClassName(), functionName->getCStringNoCopy());
+		}
+	}
+
+	if (waitForFunction) {
+		_resources = waitForService(resourceMatching(functionName));
+	} else {
+		_resources = getResourceService();
+	}
+	if (_resources == NULL) {
+		return kIOReturnUnsupported;
+	}
+
+	prop = _resources->copyProperty(functionName);
+	service = OSDynamicCast(IOService, prop);
+	if (service == NULL) {
+		ret = kIOReturnUnsupported;
+		goto finish;
+	}
+
+	ret = service->callPlatformFunction(functionName, waitForFunction,
+	    param1, param2, param3, param4);
+
+finish:
+	OSSafeReleaseNULL(prop);
+	return ret;
+}
+
+IOByteCount
+IOPlatformExpert::savePanicInfo(UInt8 *buffer, IOByteCount length)
+{
+	return 0;
 }
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
@@ -1039,291 +1587,462 @@ IOByteCount IOPlatformExpert::savePanicInfo(UInt8 *buffer, IOByteCount length)
 
 OSDefineMetaClassAndAbstractStructors( IODTPlatformExpert, IOPlatformExpert )
 
-OSMetaClassDefineReservedUnused(IODTPlatformExpert,  0);
-OSMetaClassDefineReservedUnused(IODTPlatformExpert,  1);
-OSMetaClassDefineReservedUnused(IODTPlatformExpert,  2);
-OSMetaClassDefineReservedUnused(IODTPlatformExpert,  3);
-OSMetaClassDefineReservedUnused(IODTPlatformExpert,  4);
-OSMetaClassDefineReservedUnused(IODTPlatformExpert,  5);
-OSMetaClassDefineReservedUnused(IODTPlatformExpert,  6);
-OSMetaClassDefineReservedUnused(IODTPlatformExpert,  7);
+OSMetaClassDefineReservedUnused(IODTPlatformExpert, 0);
+OSMetaClassDefineReservedUnused(IODTPlatformExpert, 1);
+OSMetaClassDefineReservedUnused(IODTPlatformExpert, 2);
+OSMetaClassDefineReservedUnused(IODTPlatformExpert, 3);
+OSMetaClassDefineReservedUnused(IODTPlatformExpert, 4);
+OSMetaClassDefineReservedUnused(IODTPlatformExpert, 5);
+OSMetaClassDefineReservedUnused(IODTPlatformExpert, 6);
+OSMetaClassDefineReservedUnused(IODTPlatformExpert, 7);
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
-IOService * IODTPlatformExpert::probe( IOService * provider,
-			       		SInt32 * score )
+IOService *
+IODTPlatformExpert::probe( IOService * provider,
+    SInt32 * score )
 {
-    if( !super::probe( provider, score))
-	return( 0 );
-
-    // check machine types
-    if( !provider->compareNames( getProperty( gIONameMatchKey ) ))
-        return( 0 );
-
-    return( this);
-}
-
-bool IODTPlatformExpert::configure( IOService * provider )
-{
-    if( !super::configure( provider))
-	return( false);
-
-    processTopLevel( provider );
-
-    return( true );
-}
-
-IOService * IODTPlatformExpert::createNub( IORegistryEntry * from )
-{
-    IOService *		nub;
-
-    nub = new IOPlatformDevice;
-    if( nub) {
-	if( !nub->init( from, gIODTPlane )) {
-	    nub->free();
-	    nub = 0;
-	}
-    }
-    return( nub);
-}
-
-bool IODTPlatformExpert::createNubs( IOService * parent, OSIterator * iter )
-{
-    IORegistryEntry *	next;
-    IOService *		nub;
-    bool		ok = true;
-
-    if( iter) {
-	while( (next = (IORegistryEntry *) iter->getNextObject())) {
-
-            if( 0 == (nub = createNub( next )))
-                continue;
-
-            nub->attach( parent );
-            nub->registerService();
-        }
-	iter->release();
-    }
-
-    return( ok );
-}
-
-void IODTPlatformExpert::processTopLevel( IORegistryEntry * rootEntry )
-{
-    OSIterator * 	kids;
-    IORegistryEntry *	next;
-    IORegistryEntry *	cpus;
-    IORegistryEntry *	options;
-
-    // infanticide
-    kids = IODTFindMatchingEntries( rootEntry, 0, deleteList() );
-    if( kids) {
-	while( (next = (IORegistryEntry *)kids->getNextObject())) {
-	    next->detachAll( gIODTPlane);
-	}
-	kids->release();
-    }
-
-    // Publish an IODTNVRAM class on /options.
-    options = rootEntry->childFromPath("options", gIODTPlane);
-    if (options) {
-      dtNVRAM = new IODTNVRAM;
-      if (dtNVRAM) {
-        if (!dtNVRAM->init(options, gIODTPlane)) {
-	  dtNVRAM->release();
-	  dtNVRAM = 0;
-        } else {
-	  dtNVRAM->attach(this);
-	  dtNVRAM->registerService();
-	}
-      }
-    }
-
-    // Publish the cpus.
-    cpus = rootEntry->childFromPath( "cpus", gIODTPlane);
-    if ( cpus)
-      createNubs( this, IODTFindMatchingEntries( cpus, kIODTExclusive, 0));
-
-    // publish top level, minus excludeList
-    createNubs( this, IODTFindMatchingEntries( rootEntry, kIODTExclusive, excludeList()));
-}
-
-IOReturn IODTPlatformExpert::getNubResources( IOService * nub )
-{
-  if( nub->getDeviceMemory())
-    return( kIOReturnSuccess );
-
-  IODTResolveAddressing( nub, "reg", 0);
-
-  return( kIOReturnSuccess);
-}
-
-bool IODTPlatformExpert::compareNubName( const IOService * nub,
-				OSString * name, OSString ** matched ) const
-{
-    return( IODTCompareNubName( nub, name, matched )
-	  || super::compareNubName( nub, name, matched) );
-}
-
-bool IODTPlatformExpert::getModelName( char * name, int maxLength )
-{
-    OSData *		prop;
-    const char *	str;
-    int			len;
-    char		c;
-    bool		ok = false;
-
-    maxLength--;
-
-    prop = (OSData *) getProvider()->getProperty( gIODTCompatibleKey );
-    if( prop ) {
-	str = (const char *) prop->getBytesNoCopy();
-
-	if( 0 == strncmp( str, "AAPL,", strlen( "AAPL," ) ))
-	    str += strlen( "AAPL," );
-
-	len = 0;
-	while( (c = *str++)) {
-	    if( (c == '/') || (c == ' '))
-		c = '-';
-
-	    name[ len++ ] = c;
-	    if( len >= maxLength)
-		break;
+	if (!super::probe( provider, score)) {
+		return NULL;
 	}
 
-	name[ len ] = 0;
-	ok = true;
-    }
-    return( ok );
+	// check machine types
+	if (!provider->compareNames( getProperty( gIONameMatchKey ))) {
+		return NULL;
+	}
+
+	return this;
 }
 
-bool IODTPlatformExpert::getMachineName( char * name, int maxLength )
+bool
+IODTPlatformExpert::configure( IOService * provider )
 {
-    OSData *		prop;
-    bool		ok = false;
+	if (!super::configure( provider)) {
+		return false;
+	}
 
-    maxLength--;
-    prop = (OSData *) getProvider()->getProperty( gIODTModelKey );
-    ok = (0 != prop);
+	processTopLevel( provider );
 
-    if( ok )
-	strlcpy( name, (const char *) prop->getBytesNoCopy(), maxLength );
+	return true;
+}
 
-    return( ok );
+IOService *
+IODTPlatformExpert::createNub( IORegistryEntry * from )
+{
+	IOService *         nub;
+
+	nub = new IOPlatformDevice;
+	if (nub) {
+		if (!nub->init( from, gIODTPlane )) {
+			nub->free();
+			nub = NULL;
+		}
+	}
+	return nub;
+}
+
+bool
+IODTPlatformExpert::createNubs( IOService * parent, OSIterator * iter )
+{
+	IORegistryEntry *   next;
+	IOService *         nub = NULL;
+	bool                ok = true;
+
+	if (iter) {
+		while ((next = (IORegistryEntry *) iter->getNextObject())) {
+			OSSafeReleaseNULL(nub);
+
+			if (NULL == (nub = createNub( next ))) {
+				continue;
+			}
+
+			nub->attach( parent );
+#if !defined(__x86_64__)
+			OSData *tmpData = (OSData *)next->getProperty("device_type");
+			if (tmpData == NULL) {
+				nub->registerService();
+				continue;
+			}
+
+			char *device_type = (char *)tmpData->getBytesNoCopy();
+			if (strcmp(device_type, "cpu") != 0) {
+				nub->registerService();
+				continue;
+			}
+
+			tmpData = (OSData *)next->getProperty("reg");
+			assert(tmpData != NULL);
+			assert(tmpData->getLength() >= sizeof(UInt32));
+
+			uint32_t phys_id = *(UInt32 *)tmpData->getBytesNoCopy();
+			int logical_cpu_id = ml_get_cpu_number(phys_id);
+			int logical_cluster_id = ml_get_cluster_number(phys_id);
+
+			/*
+			 * If the following condition triggers, it means that a CPU that was present in the DT
+			 * was ignored by XNU at topology parsing time. This can happen currently when using the
+			 * cpus=N boot-arg; for example, cpus=1 will cause XNU to parse and enable a single CPU.
+			 *
+			 * Note that this condition will not trigger for harvested cores because these do not show up
+			 * in the DT/IORegistry in the first place.
+			 */
+			if (logical_cpu_id < 0) {
+				nub->registerService();
+				continue;
+			}
+
+			__assert_only bool logical_id_added_to_ioreg = nub->setProperty("logical-cpu-id", logical_cpu_id, 32U);
+			assert(logical_id_added_to_ioreg == true);
+			logical_id_added_to_ioreg = nub->setProperty("logical-cluster-id", logical_cluster_id, 32U);
+			assert(logical_id_added_to_ioreg == true);
+#endif
+			nub->registerService();
+		}
+		OSSafeReleaseNULL(nub);
+		iter->release();
+	}
+
+	return ok;
+}
+
+void
+IODTPlatformExpert::processTopLevel( IORegistryEntry * rootEntry )
+{
+	OSIterator *        kids;
+	IORegistryEntry *   next;
+	IORegistryEntry *   cpus;
+
+	// infanticide
+	kids = IODTFindMatchingEntries( rootEntry, 0, deleteList());
+	if (kids) {
+		while ((next = (IORegistryEntry *)kids->getNextObject())) {
+			next->detachAll( gIODTPlane);
+		}
+		kids->release();
+	}
+
+	publishNVRAM();
+	assert(gIOOptionsEntry != NULL); // subclasses that do their own NVRAM initialization shouldn't be calling this
+	dtNVRAM = gIOOptionsEntry;
+
+	// Publish the cpus.
+	cpus = rootEntry->childFromPath( "cpus", gIODTPlane);
+	if (cpus) {
+		createNubs( this, IODTFindMatchingEntries( cpus, kIODTExclusive, NULL));
+		cpus->release();
+	}
+
+	// publish top level, minus excludeList
+	createNubs( this, IODTFindMatchingEntries( rootEntry, kIODTExclusive, excludeList()));
+}
+
+IOReturn
+IODTPlatformExpert::getNubResources( IOService * nub )
+{
+	if (nub->getDeviceMemory()) {
+		return kIOReturnSuccess;
+	}
+
+	IODTResolveAddressing( nub, "reg", NULL);
+
+	return kIOReturnSuccess;
+}
+
+bool
+IODTPlatformExpert::compareNubName( const IOService * nub,
+    OSString * name, OSString ** matched ) const
+{
+	return IODTCompareNubName( nub, name, matched )
+	       || super::compareNubName( nub, name, matched);
+}
+
+
+/*
+ * Do not use this method directly, it returns inconsistent results
+ * across architectures and is considered deprecated.
+ *
+ * Use getTargetName and getProductName respectively.  For example:
+ *
+ * targetName: J137AP
+ * productName: iMacPro1,1
+ *
+ * targetName: D331pAP
+ * productName: iPhone11,6
+ */
+
+bool
+IODTPlatformExpert::getModelName( char * name, int maxLength )
+{
+	OSData *            prop;
+	const char *        str;
+	int                 len;
+	char                c;
+	bool                ok = false;
+
+	maxLength--;
+
+	prop = (OSData *) getProvider()->getProperty( gIODTCompatibleKey );
+	if (prop) {
+		str = (const char *) prop->getBytesNoCopy();
+
+		if (0 == strncmp( str, "AAPL,", strlen( "AAPL," ))) {
+			str += strlen( "AAPL," );
+		}
+
+		len = 0;
+		while ((c = *str++)) {
+			if ((c == '/') || (c == ' ')) {
+				c = '-';
+			}
+
+			name[len++] = c;
+			if (len >= maxLength) {
+				break;
+			}
+		}
+
+		name[len] = 0;
+		ok = true;
+	}
+	return ok;
+}
+
+/*
+ * Do not use this method directly, it returns inconsistent results
+ * across architectures and is considered deprecated.
+ *
+ * Use getTargetName and getProductName respectively.  For example:
+ *
+ * targetName: J137AP
+ * productName: iMacPro1,1
+ *
+ * targetName: D331pAP
+ * productName: iPhone11,6
+ */
+
+bool
+IODTPlatformExpert::getMachineName( char * name, int maxLength )
+{
+	OSData *            prop;
+	bool                ok = false;
+
+	maxLength--;
+	prop = (OSData *) getProvider()->getProperty( gIODTModelKey );
+	ok = (NULL != prop);
+
+	if (ok) {
+		strlcpy( name, (const char *) prop->getBytesNoCopy(), maxLength );
+	}
+
+	return ok;
+}
+
+/* Examples: J137AP, D331pAP... */
+
+bool
+IODTPlatformExpert::getTargetName( char * name, int maxLength )
+{
+#if __x86_64__
+	OSData *            prop;
+
+	const OSSymbol *        key = gIODTBridgeModelKey;
+
+	maxLength--;
+	prop = (OSData *) getProvider()->getProperty( key );
+
+	if (prop == NULL) {
+		// This happens if there is no bridge.
+		char const * const  unknown = "";
+
+		strlcpy( name, unknown, maxLength );
+	} else {
+		strlcpy( name, (const char *)prop->getBytesNoCopy(), maxLength );
+	}
+
+	return true;
+#else
+	return getModelName( name, maxLength );
+#endif
+}
+
+/* Examples: iMacPro1,1, iPhone11,6... */
+
+bool
+IODTPlatformExpert::getProductName( char * name, int maxLength )
+{
+#if __x86_64__
+	return getModelName( name, maxLength );
+#else
+	return getMachineName( name, maxLength );
+#endif
 }
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
-void IODTPlatformExpert::registerNVRAMController( IONVRAMController * nvram )
+void
+IODTPlatformExpert::registerNVRAMController( IONVRAMController * nvram )
 {
-  if (dtNVRAM) dtNVRAM->registerNVRAMController(nvram);
-  
-  super::registerNVRAMController(nvram);
+	if (dtNVRAM) {
+		dtNVRAM->registerNVRAMController(nvram);
+	}
+
+	super::registerNVRAMController(nvram);
 }
 
-int IODTPlatformExpert::haltRestart(unsigned int type)
+int
+IODTPlatformExpert::haltRestart(unsigned int type)
 {
-  if (dtNVRAM) dtNVRAM->sync();
-  
-  return super::haltRestart(type);
+	return super::haltRestart(type);
 }
 
-IOReturn IODTPlatformExpert::readXPRAM(IOByteCount offset, UInt8 * buffer,
-				       IOByteCount length)
+IOReturn
+IODTPlatformExpert::readXPRAM(IOByteCount offset, UInt8 * buffer,
+    IOByteCount length)
 {
-  if (dtNVRAM) return dtNVRAM->readXPRAM(offset, buffer, length);
-  else return kIOReturnNotReady;
+	if (dtNVRAM) {
+		return dtNVRAM->readXPRAM(offset, buffer, length);
+	} else {
+		return kIOReturnNotReady;
+	}
 }
 
-IOReturn IODTPlatformExpert::writeXPRAM(IOByteCount offset, UInt8 * buffer,
-					IOByteCount length)
+IOReturn
+IODTPlatformExpert::writeXPRAM(IOByteCount offset, UInt8 * buffer,
+    IOByteCount length)
 {
-  if (dtNVRAM) return dtNVRAM->writeXPRAM(offset, buffer, length);
-  else return kIOReturnNotReady;
+	if (dtNVRAM) {
+		return dtNVRAM->writeXPRAM(offset, buffer, length);
+	} else {
+		return kIOReturnNotReady;
+	}
 }
 
-IOReturn IODTPlatformExpert::readNVRAMProperty(
+IOReturn
+IODTPlatformExpert::readNVRAMProperty(
 	IORegistryEntry * entry,
 	const OSSymbol ** name, OSData ** value )
 {
-  if (dtNVRAM) return dtNVRAM->readNVRAMProperty(entry, name, value);
-  else return kIOReturnNotReady;
+	if (dtNVRAM) {
+		return dtNVRAM->readNVRAMProperty(entry, name, value);
+	} else {
+		return kIOReturnNotReady;
+	}
 }
 
-IOReturn IODTPlatformExpert::writeNVRAMProperty(
+IOReturn
+IODTPlatformExpert::readNVRAMProperty(
+	IORegistryEntry * entry,
+	OSSharedPtr<const OSSymbol>& name, OSSharedPtr<OSData>& value )
+{
+	const OSSymbol* nameRaw = NULL;
+	OSData* valueRaw = NULL;
+
+	IOReturn result = readNVRAMProperty(entry, &nameRaw, &valueRaw);
+
+	name.reset(nameRaw, OSNoRetain);
+	value.reset(valueRaw, OSNoRetain);
+
+	return result;
+}
+
+IOReturn
+IODTPlatformExpert::writeNVRAMProperty(
 	IORegistryEntry * entry,
 	const OSSymbol * name, OSData * value )
 {
-  if (dtNVRAM) return dtNVRAM->writeNVRAMProperty(entry, name, value);
-  else return kIOReturnNotReady;
+	if (dtNVRAM) {
+		return dtNVRAM->writeNVRAMProperty(entry, name, value);
+	} else {
+		return kIOReturnNotReady;
+	}
 }
 
-OSDictionary *IODTPlatformExpert::getNVRAMPartitions(void)
+OSDictionary *
+IODTPlatformExpert::getNVRAMPartitions(void)
 {
-  if (dtNVRAM) return dtNVRAM->getNVRAMPartitions();
-  else return 0;
+	if (dtNVRAM) {
+		return dtNVRAM->getNVRAMPartitions();
+	} else {
+		return NULL;
+	}
 }
 
-IOReturn IODTPlatformExpert::readNVRAMPartition(const OSSymbol * partitionID,
-						IOByteCount offset, UInt8 * buffer,
-						IOByteCount length)
+IOReturn
+IODTPlatformExpert::readNVRAMPartition(const OSSymbol * partitionID,
+    IOByteCount offset, UInt8 * buffer,
+    IOByteCount length)
 {
-  if (dtNVRAM) return dtNVRAM->readNVRAMPartition(partitionID, offset,
-						  buffer, length);
-  else return kIOReturnNotReady;
+	if (dtNVRAM) {
+		return dtNVRAM->readNVRAMPartition(partitionID, offset,
+		           buffer, length);
+	} else {
+		return kIOReturnNotReady;
+	}
 }
 
-IOReturn IODTPlatformExpert::writeNVRAMPartition(const OSSymbol * partitionID,
-						 IOByteCount offset, UInt8 * buffer,
-						 IOByteCount length)
+IOReturn
+IODTPlatformExpert::writeNVRAMPartition(const OSSymbol * partitionID,
+    IOByteCount offset, UInt8 * buffer,
+    IOByteCount length)
 {
-  if (dtNVRAM) return dtNVRAM->writeNVRAMPartition(partitionID, offset,
-						   buffer, length);
-  else return kIOReturnNotReady;
+	if (dtNVRAM) {
+		return dtNVRAM->writeNVRAMPartition(partitionID, offset,
+		           buffer, length);
+	} else {
+		return kIOReturnNotReady;
+	}
 }
 
-IOByteCount IODTPlatformExpert::savePanicInfo(UInt8 *buffer, IOByteCount length)
+IOByteCount
+IODTPlatformExpert::savePanicInfo(UInt8 *buffer, IOByteCount length)
 {
-  IOByteCount lengthSaved = 0;
-  
-  if (dtNVRAM) lengthSaved = dtNVRAM->savePanicInfo(buffer, length);
-  
-  if (lengthSaved == 0) lengthSaved = super::savePanicInfo(buffer, length);
-  
-  return lengthSaved;
+	IOByteCount lengthSaved = 0;
+
+	if (dtNVRAM) {
+		lengthSaved = dtNVRAM->savePanicInfo(buffer, length);
+	}
+
+	if (lengthSaved == 0) {
+		lengthSaved = super::savePanicInfo(buffer, length);
+	}
+
+	return lengthSaved;
 }
 
-OSString* IODTPlatformExpert::createSystemSerialNumberString(OSData* myProperty) {
-    UInt8* serialNumber;
-    unsigned int serialNumberSize;
-    unsigned short pos = 0;
-    char* temp;
-    char SerialNo[30];
-    
-    if (myProperty != NULL) {
-        serialNumberSize = myProperty->getLength();
-        serialNumber = (UInt8*)(myProperty->getBytesNoCopy());
-        temp = (char*)serialNumber;
-        if (serialNumberSize > 0) {
-            // check to see if this is a CTO serial number...
-            while (pos < serialNumberSize && temp[pos] != '-') pos++;
-            
-            if (pos < serialNumberSize) { // there was a hyphen, so it's a CTO serial number
-                memcpy(SerialNo, serialNumber + 12, 8);
-                memcpy(&SerialNo[8], serialNumber, 3);
-                SerialNo[11] = '-';
-                memcpy(&SerialNo[12], serialNumber + 3, 8);
-                SerialNo[20] = 0;
-            } else { // just a normal serial number
-                memcpy(SerialNo, serialNumber + 13, 8);
-                memcpy(&SerialNo[8], serialNumber, 3);
-                SerialNo[11] = 0;
-            }
-            return OSString::withCString(SerialNo);
-        }
-    }
-    return NULL;
+OSString*
+IODTPlatformExpert::createSystemSerialNumberString(OSData* myProperty)
+{
+	UInt8* serialNumber;
+	unsigned int serialNumberSize;
+	unsigned short pos = 0;
+	char* temp;
+	char SerialNo[30];
+
+	if (myProperty != NULL) {
+		serialNumberSize = myProperty->getLength();
+		serialNumber = (UInt8*)(myProperty->getBytesNoCopy());
+		temp = (char*)serialNumber;
+		if (serialNumberSize > 0) {
+			// check to see if this is a CTO serial number...
+			while (pos < serialNumberSize && temp[pos] != '-') {
+				pos++;
+			}
+
+			if (pos < serialNumberSize) { // there was a hyphen, so it's a CTO serial number
+				memcpy(SerialNo, serialNumber + 12, 8);
+				memcpy(&SerialNo[8], serialNumber, 3);
+				SerialNo[11] = '-';
+				memcpy(&SerialNo[12], serialNumber + 3, 8);
+				SerialNo[20] = 0;
+			} else { // just a normal serial number
+				memcpy(SerialNo, serialNumber + 13, 8);
+				memcpy(&SerialNo[8], serialNumber, 3);
+				SerialNo[11] = 0;
+			}
+			return OSString::withCString(SerialNo);
+		}
+	}
+	return NULL;
 }
 
 
@@ -1334,109 +2053,238 @@ OSString* IODTPlatformExpert::createSystemSerialNumberString(OSData* myProperty)
 
 OSDefineMetaClassAndStructors(IOPlatformExpertDevice, IOService)
 
-OSMetaClassDefineReservedUnused(IOPlatformExpertDevice,  0);
-OSMetaClassDefineReservedUnused(IOPlatformExpertDevice,  1);
-OSMetaClassDefineReservedUnused(IOPlatformExpertDevice,  2);
-OSMetaClassDefineReservedUnused(IOPlatformExpertDevice,  3);
+OSMetaClassDefineReservedUnused(IOPlatformExpertDevice, 0);
+OSMetaClassDefineReservedUnused(IOPlatformExpertDevice, 1);
+OSMetaClassDefineReservedUnused(IOPlatformExpertDevice, 2);
+OSMetaClassDefineReservedUnused(IOPlatformExpertDevice, 3);
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
-bool IOPlatformExpertDevice::compareName( OSString * name,
-                                        OSString ** matched ) const
+bool
+IOPlatformExpertDevice::compareName( OSString * name,
+    OSString ** matched ) const
 {
-    return( IODTCompareNubName( this, name, matched ));
+	return IODTCompareNubName( this, name, matched );
 }
 
 bool
-IOPlatformExpertDevice::initWithArgs(
-                            void * dtTop, void * p2, void * p3, void * p4 )
+IOPlatformExpertDevice::init(void *dtRoot)
 {
-    IORegistryEntry * 	dt = 0;
-    void *		argsData[ 4 ];
-    bool		ok;
+	IORegistryEntry *   dt = NULL;
+	bool                ok;
 
-    // dtTop may be zero on non- device tree systems
-    if( dtTop && (dt = IODeviceTreeAlloc( dtTop )))
-	ok = super::init( dt, gIODTPlane );
-    else
-	ok = super::init();
+	if ((dtRoot != NULL) && (dt = IODeviceTreeAlloc(dtRoot))) {
+		ok = super::init( dt, gIODTPlane );
+	} else {
+		ok = super::init();
+	}
 
-    if( !ok)
-	return( false);
+	if (!ok) {
+		return false;
+	}
 
-    reserved = NULL;
-    workLoop = IOWorkLoop::workLoop();
-    if (!workLoop)
-        return false;
-
-    argsData[ 0 ] = dtTop;
-    argsData[ 1 ] = p2;
-    argsData[ 2 ] = p3;
-    argsData[ 3 ] = p4;
-
-    setProperty("IOPlatformArgs", (void *)argsData, sizeof(argsData));
-
-    return( true);
+	return true;
 }
 
-IOWorkLoop *IOPlatformExpertDevice::getWorkLoop() const
+bool
+IOPlatformExpertDevice::startIOServiceMatching(void)
 {
-    return workLoop;
+	workLoop = IOWorkLoop::workLoop();
+	if (!workLoop) {
+		return false;
+	}
+
+	registerService();
+
+	return true;
 }
 
-IOReturn IOPlatformExpertDevice::setProperties( OSObject * properties )
+IOWorkLoop *
+IOPlatformExpertDevice::getWorkLoop() const
 {
-    OSDictionary * dictionary;
-    OSObject *     object;
-    IOReturn       status;
-
-    status = super::setProperties( properties );
-    if ( status != kIOReturnUnsupported ) return status;
-
-    status = IOUserClient::clientHasPrivilege( current_task( ), kIOClientPrivilegeAdministrator );
-    if ( status != kIOReturnSuccess ) return status;
-
-    dictionary = OSDynamicCast( OSDictionary, properties );
-    if ( dictionary == 0 ) return kIOReturnBadArgument;
-
-    object = dictionary->getObject( kIOPlatformUUIDKey );
-    if ( object )
-    {
-        IORegistryEntry * entry;
-        OSString *        string;
-        uuid_t            uuid;
-
-        string = ( OSString * ) getProperty( kIOPlatformUUIDKey );
-        if ( string ) return kIOReturnNotPermitted;
-
-        string = OSDynamicCast( OSString, object );
-        if ( string == 0 ) return kIOReturnBadArgument;
-
-        status = uuid_parse( string->getCStringNoCopy( ), uuid );
-        if ( status != 0 ) return kIOReturnBadArgument;
-
-        entry = IORegistryEntry::fromPath( "/options", gIODTPlane );
-        if ( entry )
-        {
-            entry->setProperty( "platform-uuid", uuid, sizeof( uuid_t ) );
-            entry->release( );
-        }
-
-        setProperty( kIOPlatformUUIDKey, string );
-        publishResource( kIOPlatformUUIDKey, string );
-
-        return kIOReturnSuccess;
-    }
-
-    return kIOReturnUnsupported;
+	return workLoop;
 }
 
-void IOPlatformExpertDevice::free()
+IOReturn
+IOPlatformExpertDevice::setProperties( OSObject * properties )
 {
-    if (workLoop)
-        workLoop->release();
+	return kIOReturnUnsupported;
 }
 
+IOReturn
+IOPlatformExpertDevice::newUserClient( task_t owningTask, void * securityID,
+    UInt32 type, OSDictionary * properties,
+    IOUserClient ** handler )
+{
+	IOReturn            err = kIOReturnSuccess;
+	IOUserClient *      newConnect = NULL;
+	IOUserClient *      theConnect = NULL;
+
+	switch (type) {
+	case kIOKitDiagnosticsClientType:
+		newConnect = IOKitDiagnosticsClient::withTask(owningTask);
+		if (!newConnect) {
+			err = kIOReturnNotPermitted;
+		}
+		break;
+	case kIOKitUserServerClientType:
+		newConnect = IOUserServer::withTask(owningTask);
+		if (!newConnect) {
+			err = kIOReturnNotPermitted;
+		}
+		break;
+	default:
+		err = kIOReturnBadArgument;
+	}
+
+	if (newConnect) {
+		if ((false == newConnect->attach(this))
+		    || (false == newConnect->start(this))) {
+			newConnect->detach( this );
+			newConnect->release();
+			err = kIOReturnNotPermitted;
+		} else {
+			theConnect = newConnect;
+		}
+	}
+
+	*handler = theConnect;
+	return err;
+}
+
+void
+IOPlatformExpertDevice::free()
+{
+	if (workLoop) {
+		workLoop->release();
+	}
+}
+
+void
+IOPlatformExpertDevice::configureDefaults( void )
+{
+	createNVRAM();
+	// Parse the serial-number data and publish a user-readable string
+	OSData* mydata = (OSData*) (getProperty("serial-number"));
+	if (mydata != NULL) {
+		OSString *serNoString = OSString::withCString((const char *)mydata->getBytesNoCopy());
+		if (serNoString != NULL) {
+			setProperty(kIOPlatformSerialNumberKey, serNoString);
+			serNoString->release();
+		}
+	}
+	generatePlatformUUID();
+}
+
+void
+IOPlatformExpertDevice::createNVRAM( void )
+{
+	/*
+	 * Publish an IODTNVRAM class on /options, if present.
+	 * DT-based platforms may need NVRAM access prior to the start
+	 * of IOKit matching, to support security-related operations
+	 * that must happen before machine_lockdown().
+	 */
+	IORegistryEntry *options = IORegistryEntry::fromPath("/options", gIODTPlane);
+	if (options == NULL) {
+		return; // /options may not be present
+	}
+
+	assert(gIOOptionsEntry == NULL);
+	gIOOptionsEntry = new IODTNVRAM;
+
+	assert(gIOOptionsEntry != NULL);
+
+	gIOOptionsEntry->init(options, gIODTPlane);
+	gIOOptionsEntry->attach(this);
+	gIOOptionsEntry->start(this);
+	options->release();
+}
+
+void
+IOPlatformExpertDevice::generatePlatformUUID( void )
+{
+	IORegistryEntry * entry;
+	OSString *        string = NULL;
+	uuid_string_t     uuid;
+
+#if !defined(__x86_64__)
+	entry = IORegistryEntry::fromPath( "/chosen", gIODTPlane );
+	if (entry) {
+		OSData * data1;
+
+		data1 = OSDynamicCast( OSData, entry->getProperty( "unique-chip-id" ));
+		if (data1 && data1->getLength() == 8) {
+			OSData * data2;
+
+			data2 = OSDynamicCast( OSData, entry->getProperty( "chip-id" ));
+			if (data2 && data2->getLength() == 4) {
+				SHA1_CTX     context;
+				uint8_t      digest[SHA_DIGEST_LENGTH];
+				const uuid_t space = { 0xA6, 0xDD, 0x4C, 0xCB, 0xB5, 0xE8, 0x4A, 0xF5, 0xAC, 0xDD, 0xB6, 0xDC, 0x6A, 0x05, 0x42, 0xB8 };
+
+				SHA1Init( &context );
+				SHA1Update( &context, space, sizeof(space));
+				SHA1Update( &context, data1->getBytesNoCopy(), data1->getLength());
+				SHA1Update( &context, data2->getBytesNoCopy(), data2->getLength());
+				SHA1Final( digest, &context );
+
+				digest[6] = (digest[6] & 0x0F) | 0x50;
+				digest[8] = (digest[8] & 0x3F) | 0x80;
+
+				uuid_unparse( digest, uuid );
+				string = OSString::withCString( uuid );
+			}
+		}
+
+		entry->release();
+	}
+#else /* !defined(__x86_64__) */
+	OSData * data;
+
+	entry = IORegistryEntry::fromPath( "/efi/platform", gIODTPlane );
+	if (entry) {
+		data = OSDynamicCast( OSData, entry->getProperty( "system-id" ));
+		if (data && data->getLength() == 16) {
+			SHA1_CTX     context;
+			uint8_t      digest[SHA_DIGEST_LENGTH];
+			const uuid_t space = { 0x2A, 0x06, 0x19, 0x90, 0xD3, 0x8D, 0x44, 0x40, 0xA1, 0x39, 0xC4, 0x97, 0x70, 0x37, 0x65, 0xAC };
+
+			SHA1Init( &context );
+			SHA1Update( &context, space, sizeof(space));
+			SHA1Update( &context, data->getBytesNoCopy(), data->getLength());
+			SHA1Final( digest, &context );
+
+			digest[6] = (digest[6] & 0x0F) | 0x50;
+			digest[8] = (digest[8] & 0x3F) | 0x80;
+
+			uuid_unparse( digest, uuid );
+			string = OSString::withCString( uuid );
+		}
+
+		entry->release();
+	}
+	if (!string) {
+		/* vmware still runs this path */
+		entry = IORegistryEntry::fromPath( "/options", gIODTPlane );
+		if (entry) {
+			data = OSDynamicCast( OSData, entry->getProperty( "platform-uuid" ));
+			if (data && data->getLength() == sizeof(uuid_t)) {
+				uuid_unparse((uint8_t *) data->getBytesNoCopy(), uuid );
+				string = OSString::withCString( uuid );
+			}
+			entry->release();
+		}
+	}
+#endif /* defined(__x86_64__) */
+
+	if (string) {
+		setProperty( kIOPlatformUUIDKey, string );
+		gIOPlatformUUIDAndSerialDone = true;
+
+		string->release();
+	}
+}
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
 #undef super
@@ -1444,28 +2292,31 @@ void IOPlatformExpertDevice::free()
 
 OSDefineMetaClassAndStructors(IOPlatformDevice, IOService)
 
-OSMetaClassDefineReservedUnused(IOPlatformDevice,  0);
-OSMetaClassDefineReservedUnused(IOPlatformDevice,  1);
-OSMetaClassDefineReservedUnused(IOPlatformDevice,  2);
-OSMetaClassDefineReservedUnused(IOPlatformDevice,  3);
+OSMetaClassDefineReservedUnused(IOPlatformDevice, 0);
+OSMetaClassDefineReservedUnused(IOPlatformDevice, 1);
+OSMetaClassDefineReservedUnused(IOPlatformDevice, 2);
+OSMetaClassDefineReservedUnused(IOPlatformDevice, 3);
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
-bool IOPlatformDevice::compareName( OSString * name,
-					OSString ** matched ) const
+bool
+IOPlatformDevice::compareName( OSString * name,
+    OSString ** matched ) const
 {
-    return( ((IOPlatformExpert *)getProvider())->
-		compareNubName( this, name, matched ));
+	return ((IOPlatformExpert *)getProvider())->
+	       compareNubName( this, name, matched );
 }
 
-IOService * IOPlatformDevice::matchLocation( IOService * /* client */ )
+IOService *
+IOPlatformDevice::matchLocation( IOService * /* client */ )
 {
-    return( this );
+	return this;
 }
 
-IOReturn IOPlatformDevice::getResources( void )
+IOReturn
+IOPlatformDevice::getResources( void )
 {
-    return( ((IOPlatformExpert *)getProvider())->getNubResources( this ));
+	return ((IOPlatformExpert *)getProvider())->getNubResources( this );
 }
 
 /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
@@ -1478,24 +2329,27 @@ IOReturn IOPlatformDevice::getResources( void )
 *********************************************************************/
 
 class IOPanicPlatform : IOPlatformExpert {
-    OSDeclareDefaultStructors(IOPanicPlatform);
+	OSDeclareDefaultStructors(IOPanicPlatform);
 
 public:
-    bool start(IOService * provider);
+	bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
 };
 
 
 OSDefineMetaClassAndStructors(IOPanicPlatform, IOPlatformExpert);
 
 
-bool IOPanicPlatform::start(IOService * provider) {
-    const char * platform_name = "(unknown platform name)";
+bool
+IOPanicPlatform::start(IOService * provider)
+{
+	const char * platform_name = "(unknown platform name)";
 
-    if (provider) platform_name = provider->getName();
+	if (provider) {
+		platform_name = provider->getName();
+	}
 
-    panic("Unable to find driver for this platform: \"%s\".\n",
-        platform_name);
+	panic("Unable to find driver for this platform: \"%s\".",
+	    platform_name);
 
-    return false;
+	return false;
 }
-

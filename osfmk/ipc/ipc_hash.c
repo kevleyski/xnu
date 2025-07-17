@@ -2,7 +2,7 @@
  * Copyright (c) 2000-2004 Apple Computer, Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
- * 
+ *
  * This file contains Original Code and/or Modifications of Original Code
  * as defined in and that are subject to the Apple Public Source License
  * Version 2.0 (the 'License'). You may not use this file except in
@@ -11,10 +11,10 @@
  * unlawful or unlicensed copies of an Apple operating system, or to
  * circumvent, violate, or enable the circumvention or violation of, any
  * terms of an Apple operating system software license agreement.
- * 
+ *
  * Please obtain a copy of the License at
  * http://www.opensource.apple.com/apsl/ and read it before using this file.
- * 
+ *
  * The Original Code and all software distributed under the License are
  * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
@@ -22,34 +22,34 @@
  * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
  * Please see the License for the specific language governing rights and
  * limitations under the License.
- * 
+ *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
 /*
  * @OSF_COPYRIGHT@
  */
-/* 
+/*
  * Mach Operating System
  * Copyright (c) 1991,1990,1989 Carnegie Mellon University
  * All Rights Reserved.
- * 
+ *
  * Permission to use, copy, modify and distribute this software and its
  * documentation is hereby granted, provided that both the copyright
  * notice and this permission notice appear in all copies of the
  * software, derivative works or modified versions, and any portions
  * thereof, and that both notices appear in supporting documentation.
- * 
+ *
  * CARNEGIE MELLON ALLOWS FREE USE OF THIS SOFTWARE IN ITS "AS IS"
  * CONDITION.  CARNEGIE MELLON DISCLAIMS ANY LIABILITY OF ANY KIND FOR
  * ANY DAMAGES WHATSOEVER RESULTING FROM THE USE OF THIS SOFTWARE.
- * 
+ *
  * Carnegie Mellon requests users of this software to return to
- * 
+ *
  *  Software Distribution Coordinator  or  Software.Distribution@CS.CMU.EDU
  *  School of Computer Science
  *  Carnegie Mellon University
  *  Pittsburgh PA 15213-3890
- * 
+ *
  * any improvements or extensions that they make and grant Carnegie Mellon
  * the rights to redistribute these changes.
  */
@@ -65,34 +65,29 @@
 
 #include <mach/boolean.h>
 #include <mach/port.h>
-#include <kern/lock.h>
-#include <kern/kalloc.h>
 #include <ipc/port.h>
 #include <ipc/ipc_space.h>
 #include <ipc/ipc_object.h>
 #include <ipc/ipc_entry.h>
 #include <ipc/ipc_hash.h>
 #include <ipc/ipc_init.h>
+#include <os/hash.h>
 
-#include <mach_ipc_debug.h>
-
-#if	MACH_IPC_DEBUG
 #include <mach/kern_return.h>
 #include <mach_debug/hash_info.h>
 #include <vm/vm_map.h>
 #include <vm/vm_kern.h>
-#endif	/* MACH_IPC_DEBUG */
 
 /*
- * Forward declarations 
+ * Forward declarations
  */
 
 /* Delete an entry from the local reverse hash table */
 void ipc_hash_local_delete(
-	ipc_space_t		space,
-	ipc_object_t		obj,
-	mach_port_index_t	index,
-	ipc_entry_t		entry);
+	ipc_space_t             space,
+	ipc_object_t            obj,
+	mach_port_index_t       index,
+	ipc_entry_t             entry);
 
 /*
  *	Routine:	ipc_hash_lookup
@@ -105,12 +100,12 @@ void ipc_hash_local_delete(
 
 boolean_t
 ipc_hash_lookup(
-	ipc_space_t		space,
-	ipc_object_t		obj,
-	mach_port_name_t	*namep,
-	ipc_entry_t		*entryp)
+	ipc_space_t             space,
+	ipc_object_t            obj,
+	mach_port_name_t        *namep,
+	ipc_entry_t             *entryp)
 {
-	return ipc_hash_table_lookup(space->is_table, space->is_table_size, obj, namep, entryp);
+	return ipc_hash_table_lookup(is_active_table(space), obj, namep, entryp);
 }
 
 /*
@@ -124,15 +119,16 @@ ipc_hash_lookup(
 
 void
 ipc_hash_insert(
-	ipc_space_t		space,
-	ipc_object_t		obj,
-	mach_port_name_t	name,
-	ipc_entry_t		entry)
+	ipc_space_t             space,
+	ipc_object_t            obj,
+	mach_port_name_t        name,
+	ipc_entry_t             entry)
 {
 	mach_port_index_t index;
 
 	index = MACH_PORT_INDEX(name);
-	ipc_hash_table_insert(space->is_table, space->is_table_size, obj, index, entry);
+	space->is_table_hashed++;
+	ipc_hash_table_insert(is_active_table(space), obj, index, entry);
 }
 
 /*
@@ -145,15 +141,16 @@ ipc_hash_insert(
 
 void
 ipc_hash_delete(
-	ipc_space_t		space,
-	ipc_object_t		obj,
-	mach_port_name_t	name,
-	ipc_entry_t		entry)
+	ipc_space_t             space,
+	ipc_object_t            obj,
+	mach_port_name_t        name,
+	ipc_entry_t             entry)
 {
 	mach_port_index_t index;
 
 	index = MACH_PORT_INDEX(name);
-	ipc_hash_table_delete(space->is_table, space->is_table_size, obj, index, entry);
+	space->is_table_hashed--;
+	ipc_hash_table_delete(is_active_table(space), obj, index, entry);
 }
 
 /*
@@ -186,8 +183,8 @@ ipc_hash_delete(
  *	So possibly a small win; probably nothing significant.
  */
 
-#define	IH_TABLE_HASH(obj, size)				\
-		((mach_port_index_t)((((uintptr_t) (obj)) >> 6) % (size)))
+#define IH_TABLE_HASH(obj, size)                                \
+	        ((mach_port_index_t)(os_hash_kernel_pointer(obj) % (size)))
 
 /*
  *	Routine:	ipc_hash_table_lookup
@@ -199,19 +196,21 @@ ipc_hash_delete(
 
 boolean_t
 ipc_hash_table_lookup(
-	ipc_entry_t		table,
-	ipc_entry_num_t		size,
-	ipc_object_t		obj,
-	mach_port_name_t	*namep,
-	ipc_entry_t		*entryp)
+	ipc_entry_table_t       array,
+	ipc_object_t            obj,
+	mach_port_name_t        *namep,
+	ipc_entry_t             *entryp)
 {
-	mach_port_index_t hindex, index;
+	mach_port_index_t hindex, index, hdist;
+	ipc_entry_t       table = ipc_entry_table_base(array);
+	ipc_entry_num_t   size  = ipc_entry_table_count(array);
 
-	if (obj == IO_NULL) {
+	if (obj == IPC_OBJECT_NULL) {
 		return FALSE;
 	}
 
 	hindex = IH_TABLE_HASH(obj, size);
+	hdist  = 0;
 
 	/*
 	 *	Ideally, table[hindex].ie_index is the name we want.
@@ -221,19 +220,39 @@ ipc_hash_table_lookup(
 	 */
 
 	while ((index = table[hindex].ie_index) != 0) {
-		ipc_entry_t entry;
+		ipc_entry_t entry = index < size ? &table[index] : IE_NULL;
 
-		assert(index < size);
-		entry = &table[index];
-		if (entry->ie_object == obj) {
-			*entryp = entry;
-			*namep = MACH_PORT_MAKE(index,
-						IE_BITS_GEN(entry->ie_bits));
-			return TRUE;
+		/*
+		 * if our current displacement is strictly larger
+		 * than the current slot one, then insertion would
+		 * have stolen his place so we can't possibly exist.
+		 */
+		if (hdist > table[hindex].ie_dist) {
+			return FALSE;
 		}
 
-		if (++hindex == size)
+		/*
+		 * If our current displacement is exactly the current
+		 * slot displacement, then it can be a match, let's check.
+		 */
+		if (hdist == table[hindex].ie_dist) {
+			if (entry->ie_object == obj) {
+				*entryp = entry;
+				*namep = MACH_PORT_MAKE(index,
+				    IE_BITS_GEN(entry->ie_bits));
+				return TRUE;
+			}
+		} else {
+			assert(entry->ie_object != obj);
+		}
+
+		if (hdist < IPC_ENTRY_DIST_MAX) {
+			/* peg the displacement distance at IPC_ENTRY_DIST_MAX */
+			++hdist;
+		}
+		if (++hindex == size) {
 			hindex = 0;
+		}
 	}
 
 	return FALSE;
@@ -249,18 +268,20 @@ ipc_hash_table_lookup(
 
 void
 ipc_hash_table_insert(
-	ipc_entry_t			table,
-	ipc_entry_num_t			size,
-	ipc_object_t			obj,
-	mach_port_index_t		index,
-	__assert_only ipc_entry_t	entry)
+	ipc_entry_table_t               array,
+	ipc_object_t                    obj,
+	mach_port_index_t               index,
+	__assert_only ipc_entry_t       entry)
 {
-	mach_port_index_t hindex;
+	mach_port_index_t hindex, hdist;
+	ipc_entry_t       table = ipc_entry_table_base(array);
+	ipc_entry_num_t   size  = ipc_entry_table_count(array);
 
 	assert(index != 0);
-	assert(obj != IO_NULL);
+	assert(obj != IPC_OBJECT_NULL);
 
 	hindex = IH_TABLE_HASH(obj, size);
+	hdist  = 0;
 
 	assert(entry == &table[index]);
 	assert(entry->ie_object == obj);
@@ -269,14 +290,30 @@ ipc_hash_table_insert(
 	 *	We want to insert at hindex, but there may be collisions.
 	 *	If a collision occurs, search for the end of the clump
 	 *	and insert there.
+	 *
+	 *	However, Robin Hood steals from the rich, and as we go
+	 *	through the clump, if we go over an item that is less
+	 *	displaced than we'd be, we steal his slot and
+	 *	keep inserting him in our stead.
 	 */
-
 	while (table[hindex].ie_index != 0) {
-		if (++hindex == size)
+		if (table[hindex].ie_dist < hdist) {
+#define swap(a, b)  ({ typeof(a) _tmp = (b); (b) = (a); (a) = _tmp; })
+			swap(hdist, table[hindex].ie_dist);
+			swap(index, table[hindex].ie_index);
+#undef swap
+		}
+		if (hdist < IPC_ENTRY_DIST_MAX) {
+			/* peg the displacement distance at IPC_ENTRY_DIST_MAX */
+			++hdist;
+		}
+		if (++hindex == size) {
 			hindex = 0;
+		}
 	}
 
 	table[hindex].ie_index = index;
+	table[hindex].ie_dist = hdist;
 }
 
 /*
@@ -289,16 +326,17 @@ ipc_hash_table_insert(
 
 void
 ipc_hash_table_delete(
-	ipc_entry_t			table,
-	ipc_entry_num_t			size,
-	ipc_object_t			obj,
-	mach_port_index_t		index,
-	__assert_only ipc_entry_t	entry)
+	ipc_entry_table_t               array,
+	ipc_object_t                    obj,
+	mach_port_index_t               index,
+	__assert_only ipc_entry_t       entry)
 {
-	mach_port_index_t hindex, dindex;
+	mach_port_index_t hindex, dindex, dist;
+	ipc_entry_t       table = ipc_entry_table_base(array);
+	ipc_entry_num_t   size  = ipc_entry_table_count(array);
 
 	assert(index != MACH_PORT_NULL);
-	assert(obj != IO_NULL);
+	assert(obj != IPC_OBJECT_NULL);
 
 	hindex = IH_TABLE_HASH(obj, size);
 
@@ -312,8 +350,9 @@ ipc_hash_table_delete(
 	 */
 
 	while (table[hindex].ie_index != index) {
-		if (++hindex == size)
+		if (++hindex == size) {
 			hindex = 0;
+		}
 	}
 
 	/*
@@ -335,34 +374,47 @@ ipc_hash_table_delete(
 	 *	until we get to the end of the clump.
 	 */
 
-	for (dindex = hindex; index != 0; hindex = dindex) {
-		for (;;) {
-			mach_port_index_t tindex;
-			ipc_object_t tobj;
-
-			if (++dindex == size)
-				dindex = 0;
-			assert(dindex != hindex);
-
-			/* are we at the end of the clump? */
-
-			index = table[dindex].ie_index;
-			if (index == 0)
-				break;
-
-			/* is this a displaced object? */
-
-			tobj = table[index].ie_object;
-			assert(tobj != IO_NULL);
-			tindex = IH_TABLE_HASH(tobj, size);
-
-			if ((dindex < hindex) ?
-			    ((dindex < tindex) && (tindex <= hindex)) :
-			    ((dindex < tindex) || (tindex <= hindex)))
-				break;
+	for (;;) {
+		dindex = hindex + 1;
+		if (dindex == size) {
+			dindex = 0;
 		}
 
+		/*
+		 * If the next element is empty or isn't displaced,
+		 * then lookup will end on the next element anyway,
+		 * so we can leave the hole right here, we're done
+		 */
+		index = table[dindex].ie_index;
+		dist  = table[dindex].ie_dist;
+		if (index == 0 || dist == 0) {
+			table[hindex].ie_index = 0;
+			table[hindex].ie_dist = 0;
+			return;
+		}
+
+		/*
+		 * Move this object closer to its own slot by occupying the hole.
+		 * If its displacement was pegged, recompute it.
+		 */
+		if (dist-- == IPC_ENTRY_DIST_MAX) {
+			uint32_t desired = IH_TABLE_HASH(table[index].ie_object, size);
+			if (hindex >= desired) {
+				dist = hindex - desired;
+			} else {
+				dist = hindex + size - desired;
+			}
+			if (dist > IPC_ENTRY_DIST_MAX) {
+				dist = IPC_ENTRY_DIST_MAX;
+			}
+		}
+
+		/*
+		 * Move the displaced element closer to its ideal bucket,
+		 * and keep shifting elements back.
+		 */
 		table[hindex].ie_index = index;
+		table[hindex].ie_dist = dist;
+		hindex = dindex;
 	}
 }
-

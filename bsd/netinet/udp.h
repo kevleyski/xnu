@@ -2,7 +2,7 @@
  * Copyright (c) 2000 Apple Computer, Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
- * 
+ *
  * This file contains Original Code and/or Modifications of Original Code
  * as defined in and that are subject to the Apple Public Source License
  * Version 2.0 (the 'License'). You may not use this file except in
@@ -11,10 +11,10 @@
  * unlawful or unlicensed copies of an Apple operating system, or to
  * circumvent, violate, or enable the circumvention or violation of, any
  * terms of an Apple operating system software license agreement.
- * 
+ *
  * Please obtain a copy of the License at
  * http://www.opensource.apple.com/apsl/ and read it before using this file.
- * 
+ *
  * The Original Code and all software distributed under the License are
  * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
@@ -22,7 +22,7 @@
  * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
  * Please see the License for the specific language governing rights and
  * limitations under the License.
- * 
+ *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
 /*
@@ -62,22 +62,61 @@
 
 #ifndef _NETINET_UDP_H_
 #define _NETINET_UDP_H_
+
+#ifndef DRIVERKIT
 #include <sys/appleapiopts.h>
-#include <sys/types.h>		/* u_short */
+#include <sys/types.h>          /* u_short */
+#else
+#include <sys/_types.h>
+#include <sys/_types/_u_char.h>
+#include <sys/_types/_u_short.h>
+#endif /* DRIVERKIT */
 
 /*
  * Udp protocol header.
  * Per RFC 768, September, 1981.
  */
 struct udphdr {
-	u_short	uh_sport;		/* source port */
-	u_short	uh_dport;		/* destination port */
-	u_short	uh_ulen;		/* udp length */
-	u_short	uh_sum;			/* udp checksum */
+	u_short uh_sport;               /* source port */
+	u_short uh_dport;               /* destination port */
+	u_short uh_ulen;                /* udp length */
+	u_short uh_sum;                 /* udp checksum */
 };
 
 /*
  * User-settable options (used with setsockopt).
  */
-#define	UDP_NOCKSUM	0x01	/* don't checksum outbound payloads */
-#endif
+#define UDP_NOCKSUM     0x01    /* don't checksum outbound payloads */
+#ifdef PRIVATE
+#define UDP_KEEPALIVE_OFFLOAD   0x02 /* Send keep-alive at a given interval */
+#endif /* PRIVATE */
+
+#ifdef PRIVATE
+/*
+ * This is a mechanism to offload keep-alive or heartbeat messages
+ * to the Wifi driver when the host processor is sleeping. The application
+ * will give a small amount of data that can be placed in the message. The
+ * application will also specify an interval at which these messages
+ * should be sent.
+ *
+ * The purpose of these messages is to detect loss of connectivity in
+ * peer-to-peer communication without keeping the host processor awake.
+ *
+ * The application will pass this data to the kernel using setsockopt. It
+ * can set the interval to 0 to disable keepalive offload.
+ */
+#define UDP_KEEPALIVE_OFFLOAD_DATA_SIZE 32
+
+/* Maximum keep alive interval in seconds */
+#define UDP_KEEPALIVE_INTERVAL_MAX_SECONDS      65536
+
+struct udp_keepalive_offload {
+	u_char ka_data[UDP_KEEPALIVE_OFFLOAD_DATA_SIZE];
+	u_int16_t ka_interval;          /* interval in seconds */
+	u_int8_t ka_data_len;           /* valid length of ka_data */
+	u_int8_t ka_type;               /* type of application */
+#define UDP_KEEPALIVE_OFFLOAD_TYPE_AIRPLAY      0x1
+};
+
+#endif /* PRIVATE */
+#endif /* _NETINET_UDP_H */

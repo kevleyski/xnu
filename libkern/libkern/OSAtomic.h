@@ -37,6 +37,7 @@
 #define _OS_OSATOMIC_H
 
 #include <libkern/OSBase.h>
+#include <string.h>
 
 #if defined(__cplusplus)
 extern "C" {
@@ -44,16 +45,18 @@ extern "C" {
 
 #ifdef XNU_KERNEL_PRIVATE
 /*
- * The macro SAFE_CAST_PTR() casts one type of pointer to another type, making sure
- * the data the pointer is referencing is the same size. If it is not, it will cause
- * a division by zero compiler warning. This is to work around "SInt32" being defined
- * as "long" on ILP32 and as "int" on LP64, which would require an explicit cast to
- * "SInt32*" when for instance passing an "int*" to OSAddAtomic() - which masks size
- * mismatches.
+ * The macro SAFE_CAST_PTR() casts one type of pointer to another type,
+ * making sure the data the pointer is referencing is the same size.
+ * If it is not, it will cause a "size mismatch" assertion.
+ *
+ * This is to work around "SInt32" being defined as "long" on ILP32 and as "int"
+ * on LP64, which would require an explicit cast to "SInt32*" when for instance
+ * passing an "int*" to OSAddAtomic() - which masks size mismatches.
  * -- var is used, but sizeof does not evaluate the
  *    argument, i.e. we're safe against "++" etc. in var --
  */
-#define __SAFE_CAST_PTR(type, var) (((type)(var))+(0/(sizeof(*var) == sizeof(*(type)0) ? 1 : 0)))
+#define __SAFE_CAST_PTR(type, var) \
+	({ _Static_assert(sizeof(*(var)) == sizeof(*(type)NULL), "size mismatch"); ((type)(var)); })
 #else
 #define __SAFE_CAST_PTR(type, var) ((type)(var))
 #endif
@@ -65,7 +68,7 @@ extern "C" {
  * This header declares the OSAtomic group of functions for atomic
  * reading and updating of values.
  */
- 
+
 /*!
  * @function OSCompareAndSwap64
  *
@@ -76,9 +79,9 @@ extern "C" {
  * See OSCompareAndSwap.
  */
 extern Boolean OSCompareAndSwap64(
-    UInt64            oldValue,
-    UInt64            newValue,
-    volatile UInt64 * address);
+	UInt64            oldValue,
+	UInt64            newValue,
+	volatile UInt64 * address);
 #define OSCompareAndSwap64(a, b, c) \
 	(OSCompareAndSwap64(a, b, __SAFE_CAST_PTR(volatile UInt64*,c)))
 
@@ -92,8 +95,8 @@ extern Boolean OSCompareAndSwap64(
  * See OSAddAtomic.
  */
 extern SInt64 OSAddAtomic64(
-    SInt64            theAmount,
-    volatile SInt64 * address);
+	SInt64            theAmount,
+	volatile SInt64 * address);
 #define OSAddAtomic64(a, b) \
 	(OSAddAtomic64(a, __SAFE_CAST_PTR(volatile SInt64*,b)))
 
@@ -105,10 +108,11 @@ extern SInt64 OSAddAtomic64(
  *
  * @discussion
  * See OSIncrementAtomic.
-*/
-inline static SInt64 OSIncrementAtomic64(volatile SInt64 * address)
+ */
+inline static SInt64
+OSIncrementAtomic64(volatile SInt64 * address)
 {
-    return OSAddAtomic64(1LL, address);
+	return OSAddAtomic64(1LL, address);
 }
 
 /*!
@@ -119,10 +123,11 @@ inline static SInt64 OSIncrementAtomic64(volatile SInt64 * address)
  *
  * @discussion
  * See OSDecrementAtomic.
-*/
-inline static SInt64 OSDecrementAtomic64(volatile SInt64 * address)
+ */
+inline static SInt64
+OSDecrementAtomic64(volatile SInt64 * address)
 {
-    return OSAddAtomic64(-1LL, address);
+	return OSAddAtomic64(-1LL, address);
 }
 
 #if XNU_KERNEL_PRIVATE
@@ -137,8 +142,8 @@ inline static SInt64 OSDecrementAtomic64(volatile SInt64 * address)
  * See OSAddAtomic.
  */
 extern long OSAddAtomicLong(
-    long            theAmount,
-    volatile long * address);
+	long            theAmount,
+	volatile long * address);
 #define OSAddAtomicLong(a, b) \
 	(OSAddAtomicLong(a, __SAFE_CAST_PTR(volatile long*,b)))
 
@@ -151,10 +156,11 @@ extern long OSAddAtomicLong(
  *
  * @discussion
  * See OSIncrementAtomic.
-*/
-inline static long OSIncrementAtomicLong(volatile long * address)
+ */
+inline static long
+OSIncrementAtomicLong(volatile long * address)
 {
-    return OSAddAtomicLong(1L, address);
+	return OSAddAtomicLong(1L, address);
 }
 
 /* Not to be included in headerdoc.
@@ -165,13 +171,60 @@ inline static long OSIncrementAtomicLong(volatile long * address)
  * 32/64-bit decrement, depending on sizeof(long)
  *@discussion See OSDecrementAtomic.
  */
-inline static long OSDecrementAtomicLong(volatile long * address)
+inline static long
+OSDecrementAtomicLong(volatile long * address)
 {
-    return OSAddAtomicLong(-1L, address);
+	return OSAddAtomicLong(-1L, address);
 }
 #endif /* XNU_KERNEL_PRIVATE */
 
 #if XNU_KERNEL_PRIVATE
+/*!
+ * @function OSCompareAndSwap8
+ *
+ * @abstract
+ * Compare and swap operation, performed atomically with respect to all devices that participate in the coherency architecture of the platform.
+ *
+ * @discussion
+ * The OSCompareAndSwap8 function compares the value at the specified address with oldVal. The value of newValue is written to the address only if oldValue and the value at the address are equal. OSCompareAndSwap returns true if newValue is written to the address; otherwise, it returns false.
+ *
+ * This function guarantees atomicity only with main system memory. It is specifically unsuitable for use on noncacheable memory such as that in devices; this function cannot guarantee atomicity, for example, on memory mapped from a PCI device. Additionally, this function incorporates a memory barrier on systems with weakly-ordered memory architectures.
+ *
+ * @param oldValue The value to compare at address.
+ * @param newValue The value to write to address if oldValue compares true.
+ * @param address The byte aligned address of the data to update atomically.
+ * @result true if newValue was written to the address.
+ */
+extern Boolean OSCompareAndSwap8(
+	UInt8            oldValue,
+	UInt8            newValue,
+	volatile UInt8 * address);
+#define OSCompareAndSwap8(a, b, c) \
+	(OSCompareAndSwap8(a, b, __SAFE_CAST_PTR(volatile UInt8*,c)))
+
+/*!
+ * @function OSCompareAndSwap16
+ *
+ * @abstract
+ * Compare and swap operation, performed atomically with respect to all devices that participate in the coherency architecture of the platform.
+ *
+ * @discussion
+ * The OSCompareAndSwap16 function compares the value at the specified address with oldVal. The value of newValue is written to the address only if oldValue and the value at the address are equal. OSCompareAndSwap returns true if newValue is written to the address; otherwise, it returns false.
+ *
+ * This function guarantees atomicity only with main system memory. It is specifically unsuitable for use on noncacheable memory such as that in devices; this function cannot guarantee atomicity, for example, on memory mapped from a PCI device. Additionally, this function incorporates a memory barrier on systems with weakly-ordered memory architectures.
+ *
+ * @param oldValue The value to compare at address.
+ * @param newValue The value to write to address if oldValue compares true.
+ * @param address The 2-byte aligned address of the data to update atomically.
+ * @result true if newValue was written to the address.
+ */
+extern Boolean OSCompareAndSwap16(
+	UInt16            oldValue,
+	UInt16            newValue,
+	volatile UInt16 * address);
+#define OSCompareAndSwap16(a, b, c) \
+	(OSCompareAndSwap16(a, b, __SAFE_CAST_PTR(volatile UInt16*,c)))
+
 #endif /* XNU_KERNEL_PRIVATE */
 
 /*!
@@ -191,9 +244,9 @@ inline static long OSDecrementAtomicLong(volatile long * address)
  * @result true if newValue was written to the address.
  */
 extern Boolean OSCompareAndSwap(
-    UInt32            oldValue,
-    UInt32            newValue,
-    volatile UInt32 * address);
+	UInt32            oldValue,
+	UInt32            newValue,
+	volatile UInt32 * address);
 #define OSCompareAndSwap(a, b, c) \
 	(OSCompareAndSwap(a, b, __SAFE_CAST_PTR(volatile UInt32*,c)))
 
@@ -213,9 +266,9 @@ extern Boolean OSCompareAndSwap(
  * @result true if newValue was written to the address.
  */
 extern Boolean OSCompareAndSwapPtr(
-    void            * oldValue,
-    void            * newValue,
-    void * volatile * address);
+	void            * oldValue,
+	void            * newValue,
+	void * volatile * address);
 #define OSCompareAndSwapPtr(a, b, c) \
 	(OSCompareAndSwapPtr(a, b, __SAFE_CAST_PTR(void * volatile *,c)))
 
@@ -234,8 +287,8 @@ extern Boolean OSCompareAndSwapPtr(
  * @result The value before the addition
  */
 extern SInt32 OSAddAtomic(
-    SInt32            amount,
-    volatile SInt32 * address);
+	SInt32            amount,
+	volatile SInt32 * address);
 #define OSAddAtomic(a, b) \
 	(OSAddAtomic(a, __SAFE_CAST_PTR(volatile SInt32*,b)))
 
@@ -253,8 +306,8 @@ extern SInt32 OSAddAtomic(
  * @result The value before the addition
  */
 extern SInt16 OSAddAtomic16(
-    SInt32            amount,
-    volatile SInt16 * address);
+	SInt32            amount,
+	volatile SInt16 * address);
 
 /*!
  * @function OSAddAtomic8
@@ -271,8 +324,8 @@ extern SInt16 OSAddAtomic16(
  * @result The value before the addition.
  */
 extern SInt8 OSAddAtomic8(
-    SInt32           amount,
-    volatile SInt8 * address);
+	SInt32           amount,
+	volatile SInt8 * address);
 
 /*!
  * @function OSIncrementAtomic
@@ -383,8 +436,8 @@ extern SInt8 OSDecrementAtomic8(volatile SInt8 * address);
  * @result The value before the bitwise operation
  */
 extern UInt32 OSBitAndAtomic(
-    UInt32            mask,
-    volatile UInt32 * address);
+	UInt32            mask,
+	volatile UInt32 * address);
 #define OSBitAndAtomic(a, b) \
 	(OSBitAndAtomic(a, __SAFE_CAST_PTR(volatile UInt32*,b)))
 
@@ -397,14 +450,14 @@ extern UInt32 OSBitAndAtomic(
  * @discussion
  * The OSBitAndAtomic16 function logically ands the bits of the specified mask into the value at the specified address and returns the original value.
  *
- * This function guarantees atomicity only with main system memory. It is specifically unsuitable for use on noncacheable memory such as that in devices; this function cannot guarantee atomicity, for example, on memory mapped from a PCI device. Additionally, this function incorporates a memory barrier on systems with weakly-ordered memory architectures.
+ * This function guarantees atomicity only with main system memory. It is specifically unsuitable for use on noncacheable memory such as that in devices; this function cannot guarantee atomicity, for example, on memory mapped from a PCI device.
  * @param mask The mask to logically and with the value.
  * @param address The 2-byte aligned address of the value to update atomically.
  * @result The value before the bitwise operation.
  */
 extern UInt16 OSBitAndAtomic16(
-    UInt32            mask,
-    volatile UInt16 * address);
+	UInt32            mask,
+	volatile UInt16 * address);
 
 /*!
  * @function OSBitAndAtomic8
@@ -415,14 +468,14 @@ extern UInt16 OSBitAndAtomic16(
  * @discussion
  * The OSBitAndAtomic8 function logically ands the bits of the specified mask into the value at the specified address and returns the original value.
  *
- * This function guarantees atomicity only with main system memory. It is specifically unsuitable for use on noncacheable memory such as that in devices; this function cannot guarantee atomicity, for example, on memory mapped from a PCI device. Additionally, this function incorporates a memory barrier on systems with weakly-ordered memory architectures.
+ * This function guarantees atomicity only with main system memory. It is specifically unsuitable for use on noncacheable memory such as that in devices; this function cannot guarantee atomicity, for example, on memory mapped from a PCI device.
  * @param mask The mask to logically and with the value.
  * @param address The address of the value to update atomically.
  * @result The value before the bitwise operation.
  */
 extern UInt8 OSBitAndAtomic8(
-    UInt32           mask,
-    volatile UInt8 * address);
+	UInt32           mask,
+	volatile UInt8 * address);
 
 /*!
  * @function OSBitOrAtomic
@@ -433,14 +486,14 @@ extern UInt8 OSBitAndAtomic8(
  * @discussion
  * The OSBitOrAtomic function logically ors the bits of the specified mask into the value at the specified address and returns the original value.
  *
- * This function guarantees atomicity only with main system memory. It is specifically unsuitable for use on noncacheable memory such as that in devices; this function cannot guarantee atomicity, for example, on memory mapped from a PCI device. Additionally, this function incorporates a memory barrier on systems with weakly-ordered memory architectures.
+ * This function guarantees atomicity only with main system memory. It is specifically unsuitable for use on noncacheable memory such as that in devices; this function cannot guarantee atomicity, for example, on memory mapped from a PCI device.
  * @param mask The mask to logically or with the value.
  * @param address The 4-byte aligned address of the value to update atomically.
  * @result The value before the bitwise operation.
  */
 extern UInt32 OSBitOrAtomic(
-    UInt32            mask,
-    volatile UInt32 * address);
+	UInt32            mask,
+	volatile UInt32 * address);
 #define OSBitOrAtomic(a, b) \
 	(OSBitOrAtomic(a, __SAFE_CAST_PTR(volatile UInt32*,b)))
 
@@ -453,14 +506,14 @@ extern UInt32 OSBitOrAtomic(
  * @discussion
  * The OSBitOrAtomic16 function logically ors the bits of the specified mask into the value at the specified address and returns the original value.
  *
- * This function guarantees atomicity only with main system memory. It is specifically unsuitable for use on noncacheable memory such as that in devices; this function cannot guarantee atomicity, for example, on memory mapped from a PCI device. Additionally, this function incorporates a memory barrier on systems with weakly-ordered memory architectures.
+ * This function guarantees atomicity only with main system memory. It is specifically unsuitable for use on noncacheable memory such as that in devices; this function cannot guarantee atomicity, for example, on memory mapped from a PCI device.
  * @param mask The mask to logically or with the value.
  * @param address The 2-byte aligned address of the value to update atomically.
  * @result The value before the bitwise operation.
  */
 extern UInt16 OSBitOrAtomic16(
-    UInt32            mask,
-    volatile UInt16 * address);
+	UInt32            mask,
+	volatile UInt16 * address);
 
 /*!
  * @function OSBitOrAtomic8
@@ -468,7 +521,7 @@ extern UInt16 OSBitOrAtomic16(
  * @abstract
  * 8-bit logical or operation, performed atomically with respect to all devices that participate in the coherency architecture of the platform.
  *
- * This function guarantees atomicity only with main system memory. It is specifically unsuitable for use on noncacheable memory such as that in devices; this function cannot guarantee atomicity, for example, on memory mapped from a PCI device. Additionally, this function incorporates a memory barrier on systems with weakly-ordered memory architectures.
+ * This function guarantees atomicity only with main system memory. It is specifically unsuitable for use on noncacheable memory such as that in devices; this function cannot guarantee atomicity, for example, on memory mapped from a PCI device.
  *
  * @discussion
  * The OSBitOrAtomic8 function logically ors the bits of the specified mask into the value at the specified address and returns the original value.
@@ -477,8 +530,8 @@ extern UInt16 OSBitOrAtomic16(
  * @result The value before the bitwise operation.
  */
 extern UInt8 OSBitOrAtomic8(
-    UInt32           mask,
-    volatile UInt8 * address);
+	UInt32           mask,
+	volatile UInt8 * address);
 
 /*!
  * @function OSBitXorAtomic
@@ -486,7 +539,7 @@ extern UInt8 OSBitOrAtomic8(
  * @abstract
  * 32-bit logical xor operation, performed atomically with respect to all devices that participate in the coherency architecture of the platform.
  *
- * This function guarantees atomicity only with main system memory. It is specifically unsuitable for use on noncacheable memory such as that in devices; this function cannot guarantee atomicity, for example, on memory mapped from a PCI device. Additionally, this function incorporates a memory barrier on systems with weakly-ordered memory architectures.
+ * This function guarantees atomicity only with main system memory. It is specifically unsuitable for use on noncacheable memory such as that in devices; this function cannot guarantee atomicity, for example, on memory mapped from a PCI device.
  *
  * @discussion
  * The OSBitXorAtomic function logically xors the bits of the specified mask into the value at the specified address and returns the original value.
@@ -495,8 +548,8 @@ extern UInt8 OSBitOrAtomic8(
  * @result The value before the bitwise operation.
  */
 extern UInt32 OSBitXorAtomic(
-    UInt32            mask,
-    volatile UInt32 * address);
+	UInt32            mask,
+	volatile UInt32 * address);
 #define OSBitXorAtomic(a, b) \
 	(OSBitXorAtomic(a, __SAFE_CAST_PTR(volatile UInt32*,b)))
 
@@ -509,14 +562,14 @@ extern UInt32 OSBitXorAtomic(
  * @discussion
  * The OSBitXorAtomic16 function logically xors the bits of the specified mask into the value at the specified address and returns the original value.
  *
- * This function guarantees atomicity only with main system memory. It is specifically unsuitable for use on noncacheable memory such as that in devices; this function cannot guarantee atomicity, for example, on memory mapped from a PCI device. Additionally, this function incorporates a memory barrier on systems with weakly-ordered memory architectures.
+ * This function guarantees atomicity only with main system memory. It is specifically unsuitable for use on noncacheable memory such as that in devices; this function cannot guarantee atomicity, for example, on memory mapped from a PCI device.
  * @param mask The mask to logically or with the value.
  * @param address The 2-byte aligned address of the value to update atomically.
  * @result The value before the bitwise operation.
  */
 extern UInt16 OSBitXorAtomic16(
-    UInt32            mask,
-    volatile UInt16 * address);
+	UInt32            mask,
+	volatile UInt16 * address);
 
 /*!
  * @function OSBitXorAtomic8
@@ -524,7 +577,7 @@ extern UInt16 OSBitXorAtomic16(
  * @abstract
  * 8-bit logical xor operation, performed atomically with respect to all devices that participate in the coherency architecture of the platform.
  *
- * This function guarantees atomicity only with main system memory. It is specifically unsuitable for use on noncacheable memory such as that in devices; this function cannot guarantee atomicity, for example, on memory mapped from a PCI device. Additionally, this function incorporates a memory barrier on systems with weakly-ordered memory architectures.
+ * This function guarantees atomicity only with main system memory. It is specifically unsuitable for use on noncacheable memory such as that in devices; this function cannot guarantee atomicity, for example, on memory mapped from a PCI device.
  *
  * @discussion
  * The OSBitXorAtomic8 function logically xors the bits of the specified mask into the value at the specified address and returns the original value.
@@ -533,8 +586,8 @@ extern UInt16 OSBitXorAtomic16(
  * @result The value before the bitwise operation.
  */
 extern UInt8 OSBitXorAtomic8(
-    UInt32           mask,
-    volatile UInt8 * address);
+	UInt32           mask,
+	volatile UInt8 * address);
 
 /*!
  * @function OSTestAndSet
@@ -542,17 +595,17 @@ extern UInt8 OSBitXorAtomic8(
  * @abstract
  * Bit test and set operation, performed atomically with respect to all devices that participate in the coherency architecture of the platform.
  *
- * This function guarantees atomicity only with main system memory. It is specifically unsuitable for use on noncacheable memory such as that in devices; this function cannot guarantee atomicity, for example, on memory mapped from a PCI device. Additionally, this function incorporates a memory barrier on systems with weakly-ordered memory architectures.
+ * This function guarantees atomicity only with main system memory. It is specifically unsuitable for use on noncacheable memory such as that in devices; this function cannot guarantee atomicity, for example, on memory mapped from a PCI device.
  *
  * @discussion
  * The OSTestAndSet function sets a single bit in a byte at a specified address. It returns true if the bit was already set, false otherwise.
- * @param bit The bit number in the range 0 through 7.
+ * @param bit The bit number in the range 0 through 7. Bit 0 is the most significant.
  * @param startAddress The address of the byte to update atomically.
  * @result true if the bit was already set, false otherwise.
  */
 extern Boolean OSTestAndSet(
-    UInt32           bit,
-    volatile UInt8 * startAddress);
+	UInt32           bit,
+	volatile UInt8 * startAddress);
 
 /*!
  * @function OSTestAndClear
@@ -563,14 +616,14 @@ extern Boolean OSTestAndSet(
  * @discussion
  * The OSTestAndClear function clears a single bit in a byte at a specified address. It returns true if the bit was already clear, false otherwise.
  *
- * This function guarantees atomicity only with main system memory. It is specifically unsuitable for use on noncacheable memory such as that in devices; this function cannot guarantee atomicity, for example, on memory mapped from a PCI device. Additionally, this function incorporates a memory barrier on systems with weakly-ordered memory architectures.
- * @param bit The bit number in the range 0 through 7.
+ * This function guarantees atomicity only with main system memory. It is specifically unsuitable for use on noncacheable memory such as that in devices; this function cannot guarantee atomicity, for example, on memory mapped from a PCI device.
+ * @param bit The bit number in the range 0 through 7. Bit 0 is the most significant.
  * @param startAddress The address of the byte to update atomically.
  * @result true if the bit was already clear, false otherwise.
  */
 extern Boolean OSTestAndClear(
-    UInt32           bit,
-    volatile UInt8 * startAddress);
+	UInt32           bit,
+	volatile UInt8 * startAddress);
 
 /*!
  * @defined OS_SPINLOCK_INIT
@@ -581,9 +634,9 @@ extern Boolean OSTestAndClear(
  * @discussion
  * The convention is that unlocked is zero, locked is nonzero.
  */
-#define	OS_SPINLOCK_INIT 0
+#define OS_SPINLOCK_INIT 0
 
-/*! 
+/*!
  * @typedef OSSpinLock
  *
  * @abstract
@@ -605,7 +658,7 @@ typedef SInt32 OSSpinLock;
  * Multiprocessor locks used within the shared memory area between the kernel and event system.  These must work in both user and kernel mode.
  *
  * @result
- * Returns false if the lock was already held by another thread, true if it took the lock successfully. 
+ * Returns false if the lock was already held by another thread, true if it took the lock successfully.
  */
 extern Boolean OSSpinLockTry(volatile OSSpinLock * lock);
 
@@ -630,16 +683,29 @@ extern void OSSpinLockUnlock(volatile OSSpinLock * lock);
  * @discussion
  * The OSSynchronizeIO routine ensures orderly load and store operations to noncached memory mapped I/O devices. It executes the eieio instruction on PowerPC processors.
  */
-static __inline__ void OSSynchronizeIO(void)
+#if defined(__arm__) || defined(__arm64__)
+extern void OSSynchronizeIO(void);
+#else
+static __inline__ void
+OSSynchronizeIO(void)
 {
 }
+#endif
 
-#if	defined(KERNEL_PRIVATE)
+#if     defined(KERNEL_PRIVATE)
 
-#if   defined(__i386__) || defined(__x86_64__)
-#if	defined(XNU_KERNEL_PRIVATE)
-static inline void OSMemoryBarrier(void) {
-	__asm__ volatile("mfence" ::: "memory");
+#if     defined(__arm__) || defined(__arm64__)
+static inline void
+OSMemoryBarrier(void)
+{
+	__asm__ volatile ("dmb ish" ::: "memory");
+}
+#elif defined(__i386__) || defined(__x86_64__)
+#if     defined(XNU_KERNEL_PRIVATE)
+static inline void
+OSMemoryBarrier(void)
+{
+	__asm__ volatile ("mfence" ::: "memory");
 }
 #endif /* XNU_KERNEL_PRIVATE */
 #endif

@@ -2,7 +2,7 @@
  * Copyright (c) 2003-2004 Apple Computer, Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
- * 
+ *
  * This file contains Original Code and/or Modifications of Original Code
  * as defined in and that are subject to the Apple Public Source License
  * Version 2.0 (the 'License'). You may not use this file except in
@@ -11,10 +11,10 @@
  * unlawful or unlicensed copies of an Apple operating system, or to
  * circumvent, violate, or enable the circumvention or violation of, any
  * terms of an Apple operating system software license agreement.
- * 
+ *
  * Please obtain a copy of the License at
  * http://www.opensource.apple.com/apsl/ and read it before using this file.
- * 
+ *
  * The Original Code and all software distributed under the License are
  * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
@@ -22,11 +22,11 @@
  * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
  * Please see the License for the specific language governing rights and
  * limitations under the License.
- * 
+ *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
 
-#ifndef	LIBKERN_SYSCTL_H
+#ifndef LIBKERN_SYSCTL_H
 #define LIBKERN_SYSCTL_H
 
 #include <sys/cdefs.h>
@@ -58,13 +58,15 @@ __BEGIN_DECLS
  *                               In general is is better to use mach's or higher level timing services, but this value
  *                               is needed to convert the PPC Time Base registers to real time.
  *
- *   hw.cpufrequency           - These values provide the current, min and max cpu frequency.  The min and max are for
- *   hw.cpufrequency_max       - all power management modes.  The current frequency is the max frequency in the current mode.
- *   hw.cpufrequency_min       - All frequencies are in Hz.
+ *   hw.cpufrequency, hw.busfrequency and their min/max versions are deprecated because frequency isn't consistent.
  *
- *   hw.busfrequency           - These values provide the current, min and max bus frequency.  The min and max are for
- *   hw.busfrequency_max       - all power management modes.  The current frequency is the max frequency in the current mode.
- *   hw.busfrequency_min       - All frequencies are in Hz.
+ *   hw.cpufrequency           - (deprecated) These values provide the current, min and max cpu frequency.  The min and max are for
+ *   hw.cpufrequency_max       - (deprecated) all power management modes.  The current frequency is the max frequency in the current mode.
+ *   hw.cpufrequency_min       - (deprecated) All frequencies are in Hz.
+ *
+ *   hw.busfrequency           - (deprecated) These values provide the current, min and max bus frequency.  The min and max are for
+ *   hw.busfrequency_max       - (deprecated) all power management modes.  The current frequency is the max frequency in the current mode.
+ *   hw.busfrequency_min       - (deprecated) All frequencies are in Hz.
  *
  *   hw.cputype                - These values provide the mach-o cpu type and subtype.  A complete list is in <mach/machine.h>
  *   hw.cpusubtype             - These values should be used to determine what processor family the running cpu is from so that
@@ -107,8 +109,12 @@ __BEGIN_DECLS
 /*
  * Sysctl handling
  */
+#ifdef XNU_KERNEL_PRIVATE
+int     kernel_sysctlbyname(const char *, void *, size_t *, void *, size_t);
+#else
 int     sysctlbyname(const char *, void *, size_t *, void *, size_t);
+#endif
 
 __END_DECLS
 
-#endif	/* LIBKERN_SYSCTL_H */
+#endif  /* LIBKERN_SYSCTL_H */

@@ -39,9 +39,7 @@
 /*
 **      ml_get_timebase()
 **
-**      Entry   - %rdi contains pointer to 64 bit structure.
-**
-**      Exit    - 64 bit structure filled in.
+**      Returns TSC in RAX
 **
 */
 ENTRY(ml_get_timebase)
@@ -51,7 +49,6 @@ ENTRY(ml_get_timebase)
 	lfence
         shlq	$32,%rdx 
         orq	%rdx,%rax
-	movq    %rax, (%rdi)
 			
 	ret
 
@@ -81,9 +78,14 @@ ENTRY(ml_get_timebase)
  *
  */
 ENTRY(tmrCvt)
+	cmpq	$1,%rsi				/* check for unity fastpath */
+	je	1f
 	movq	%rdi,%rax
 	mulq	%rsi				/* result is %rdx:%rax */
 	shrdq   $32,%rdx,%rax			/* %rdx:%rax >>= 32 */
+	ret
+1:
+	mov	%rdi,%rax
 	ret
 
  /*
@@ -173,62 +175,45 @@ ENTRY(_rtc_tsc_to_nanoseconds)
 	shrdq   $32,%rdx,%rax			/* %rdx:%rax >>= 32 */
 	ret
     
-    
+
+/*
+ *  typedef void (*thread_continue_t)(void *param, wait_result_t)
+ *
+ *	void call_continuation( thread_continue_t continuation,
+ *	            			void *param,
+ *				            wait_result_t wresult,
+ *                          bool enable interrupts)
+ */
 
 Entry(call_continuation)
-	movq	%rdi,%rcx			/* get continuation */
-	movq	%rsi,%rdi			/* continuation param */
-	movq	%rdx,%rsi			/* wait result */
+
+	movq    %rdi, %r12  /* continuation */
+    movq    %rsi, %r13  /* continuation param */
+    movq    %rdx, %r14  /* wait result */
+
 	movq	%gs:CPU_KERNEL_STACK,%rsp	/* set the stack */
 	xorq	%rbp,%rbp			/* zero frame pointer */
+
+    test    %ecx, %ecx
+    jz 1f
+    mov     $1, %edi
+    call   _ml_set_interrupts_enabled
+1:
+
+	movq	%r12,%rcx			/* continuation */
+	movq	%r13,%rdi			/* continuation param */
+	movq	%r14,%rsi			/* wait result */
+
 	call	*%rcx				/* call continuation */
 	movq	%gs:CPU_ACTIVE_THREAD,%rdi
 	call	EXT(thread_terminate)
+
 
 Entry(x86_init_wrapper)
 	xor	%rbp, %rbp
 	movq	%rsi, %rsp
 	callq	*%rdi
 
-	/*
-	* Generate a 64-bit quantity with possibly random characteristics, intended for use
-	* before the kernel entropy pool is available. The processor's RNG is used if
-	* available, and a value derived from the Time Stamp Counter is returned if not.
-	* Multiple invocations may result in well-correlated values if sourced from the TSC.
-	*/
-Entry(ml_early_random)
-	mov	%rbx, %rsi
-	mov	$1, %eax
-	cpuid
-	mov	%rsi, %rbx
-	test	$(1 << 30), %ecx
-	jz	Lnon_rdrand
-	RDRAND_RAX		/* RAX := 64 bits of DRBG entropy */
-	jnc	Lnon_rdrand
-	ret
-Lnon_rdrand:
-	rdtsc /* EDX:EAX := TSC */
-	/* Distribute low order bits */
-	mov	%eax, %ecx
-	xor	%al, %ah
-	shl	$16, %rcx
-	xor	%rcx, %rax
-	xor	%eax, %edx
-
-	/* Incorporate ASLR entropy, if any */
-	lea	(%rip), %rcx
-	shr	$21, %rcx
-	movzbl	%cl, %ecx
-	shl	$16, %ecx
-	xor	%ecx, %edx
-
-	mov	%ah, %cl
-	ror	%cl, %edx /* Right rotate EDX (TSC&0xFF ^ (TSC>>8 & 0xFF))&1F */
-	shl	$32, %rdx
-	xor	%rdx, %rax
-	mov	%cl, %al
-	ret
-	
 #if CONFIG_VMX
 
 /*

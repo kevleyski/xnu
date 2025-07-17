@@ -120,6 +120,8 @@ typedef unsigned IPos;
 
 typedef struct internal_state {
     z_streamp strm;      /* pointer back to this zlib stream */
+    z_input_func zinput;
+    z_output_func zoutput;
     int   status;        /* as the name implies */
     Bytef *pending_buf;  /* output still pending */
     ulg   pending_buf_size; /* size of pending_buf */
@@ -340,8 +342,8 @@ void _tr_stored_block OF((deflate_state *s, charf *buf, ulg stored_len,
     flush = (s->last_lit == s->lit_bufsize-1); \
    }
 # define _tr_tally_dist(s, distance, length, flush) \
-  { uch len = (length); \
-    ush dist = (distance); \
+  { uch len = (uch)(length); \
+    ush dist = (ush)(distance); \
     s->d_buf[s->last_lit] = dist; \
     s->l_buf[s->last_lit++] = len; \
     dist--; \

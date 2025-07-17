@@ -73,7 +73,7 @@
 #include <sys/protosw.h>
 #include <sys/socket.h>
 #include <sys/socketvar.h>
-#include <sys/filio.h>			/* XXX */
+#include <sys/filio.h>                  /* XXX */
 #include <sys/sockio.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
@@ -98,78 +98,55 @@ static int soo_close(struct fileglob *, vfs_context_t ctx);
 static int soo_drain(struct fileproc *, vfs_context_t ctx);
 
 const struct fileops socketops = {
-	DTYPE_SOCKET,
-	soo_read,
-	soo_write,
-	soo_ioctl,
-	soo_select,
-	soo_close,
-	soo_kqfilter,
-	soo_drain
+	.fo_type     = DTYPE_SOCKET,
+	.fo_read     = soo_read,
+	.fo_write    = soo_write,
+	.fo_ioctl    = soo_ioctl,
+	.fo_select   = soo_select,
+	.fo_close    = soo_close,
+	.fo_drain    = soo_drain,
+	.fo_kqfilter = soo_kqfilter,
 };
 
 /* ARGSUSED */
 static int
 soo_read(struct fileproc *fp, struct uio *uio, __unused int flags,
-#if !CONFIG_MACF_SOCKET
-	__unused
-#endif
-	vfs_context_t ctx)
+    __unused vfs_context_t ctx)
 {
-	struct socket *so;
+	struct socket *__single so;
 	int stat;
-#if CONFIG_MACF_SOCKET
-	int error;
-#endif
 
 	int (*fsoreceive)(struct socket *so2, struct sockaddr **paddr,
 	    struct uio *uio2, struct mbuf **mp0, struct mbuf **controlp,
 	    int *flagsp);
 
-	if ((so = (struct socket *)fp->f_fglob->fg_data) == NULL) {
+	if ((so = (struct socket *)fp_get_data(fp)) == NULL) {
 		/* This is not a valid open file descriptor */
-		return (EBADF);
+		return EBADF;
 	}
-
-#if CONFIG_MACF_SOCKET
-	error = mac_socket_check_receive(vfs_context_ucred(ctx), so);
-	if (error)
-		return (error);
-#endif /* CONFIG_MACF_SOCKET */
 
 	fsoreceive = so->so_proto->pr_usrreqs->pru_soreceive;
 
 	stat = (*fsoreceive)(so, 0, uio, 0, 0, 0);
-	return (stat);
+	return stat;
 }
 
 /* ARGSUSED */
 static int
 soo_write(struct fileproc *fp, struct uio *uio, __unused int flags,
-	vfs_context_t ctx)
+    vfs_context_t ctx)
 {
-	struct socket *so;
+	struct socket *__single so;
 	int stat;
 	int (*fsosend)(struct socket *so2, struct sockaddr *addr,
 	    struct uio *uio2, struct mbuf *top, struct mbuf *control,
 	    int flags2);
 	proc_t procp;
 
-#if CONFIG_MACF_SOCKET
-	int error;
-#endif
-
-	if ((so = (struct socket *)fp->f_fglob->fg_data) == NULL) {
+	if ((so = (struct socket *)fp_get_data(fp)) == NULL) {
 		/* This is not a valid open file descriptor */
-		return (EBADF);
+		return EBADF;
 	}
-
-#if CONFIG_MACF_SOCKET
-	/* JMM - have to fetch the socket's remote addr */
-	error = mac_socket_check_send(vfs_context_ucred(ctx), so, NULL);
-	if (error)
-		return (error);
-#endif /* CONFIG_MACF_SOCKET */
 
 	fsosend = so->so_proto->pr_usrreqs->pru_sosend;
 
@@ -177,17 +154,25 @@ soo_write(struct fileproc *fp, struct uio *uio, __unused int flags,
 
 	/* Generation of SIGPIPE can be controlled per socket */
 	procp = vfs_context_proc(ctx);
-	if (stat == EPIPE && !(so->so_flags & SOF_NOSIGPIPE))
+	if (stat == EPIPE && !(so->so_flags & SOF_NOSIGPIPE)) {
 		psignal(procp, SIGPIPE);
+	}
 
-	return (stat);
+	return stat;
 }
 
 __private_extern__ int
-soioctl(struct socket *so, u_long cmd, caddr_t data, struct proc *p)
+soioctl(struct socket *so, u_long cmd, caddr_t __sized_by(IOCPARM_LEN(cmd)) data, struct proc *p)
 {
 	int error = 0;
 	int int_arg;
+
+#if CONFIG_MACF_SOCKET_SUBSET
+	error = mac_socket_check_ioctl(kauth_cred_get(), so, cmd);
+	if (error) {
+		return error;
+	}
+#endif
 
 	socket_lock(so, 1);
 
@@ -207,24 +192,26 @@ soioctl(struct socket *so, u_long cmd, caddr_t data, struct proc *p)
 
 		default:
 			error = sflt_ioctl(so, cmd, data);
-			if (error != 0)
+			if (error != 0) {
 				goto out;
+			}
 			break;
 		}
 	}
 
 	switch (cmd) {
-	case FIONBIO:			/* int */
-		bcopy(data, &int_arg, sizeof (int_arg));
-		if (int_arg)
+	case FIONBIO:                   /* int */
+		bcopy(data, &int_arg, sizeof(int_arg));
+		if (int_arg) {
 			so->so_state |= SS_NBIO;
-		else
+		} else {
 			so->so_state &= ~SS_NBIO;
+		}
 
 		goto out;
 
-	case FIOASYNC:			/* int */
-		bcopy(data, &int_arg, sizeof (int_arg));
+	case FIOASYNC:                  /* int */
+		bcopy(data, &int_arg, sizeof(int_arg));
 		if (int_arg) {
 			so->so_state |= SS_ASYNC;
 			so->so_rcv.sb_flags |= SB_ASYNC;
@@ -236,35 +223,31 @@ soioctl(struct socket *so, u_long cmd, caddr_t data, struct proc *p)
 		}
 		goto out;
 
-	case FIONREAD:			/* int */
-		bcopy(&so->so_rcv.sb_cc, data, sizeof (u_int32_t));
+	case FIONREAD:                  /* int */
+		bcopy(&so->so_rcv.sb_cc, data, sizeof(u_int32_t));
 		goto out;
 
-	case SIOCSPGRP:			/* int */
-		bcopy(data, &so->so_pgid, sizeof (pid_t));
+	case SIOCSPGRP:                 /* int */
+		bcopy(data, &so->so_pgid, sizeof(pid_t));
 		goto out;
 
-	case SIOCGPGRP:			/* int */
-		bcopy(&so->so_pgid, data, sizeof (pid_t));
+	case SIOCGPGRP:                 /* int */
+		bcopy(&so->so_pgid, data, sizeof(pid_t));
 		goto out;
 
-	case SIOCATMARK:		/* int */
+	case SIOCATMARK:                /* int */
 		int_arg = (so->so_state & SS_RCVATMARK) != 0;
-		bcopy(&int_arg, data, sizeof (int_arg));
+		bcopy(&int_arg, data, sizeof(int_arg));
 		goto out;
 
-	case SIOCSETOT:			/* int; deprecated */
-		error = EOPNOTSUPP;
-		goto out;
-
-	case SIOCGASSOCIDS32:		/* so_aidreq32 */
-	case SIOCGASSOCIDS64:		/* so_aidreq64 */
-	case SIOCGCONNIDS32:		/* so_cidreq32 */
-	case SIOCGCONNIDS64:		/* so_cidreq64 */
-	case SIOCGCONNINFO32:		/* so_cinforeq32 */
-	case SIOCGCONNINFO64:		/* so_cinforeq64 */
-	case SIOCSCONNORDER:		/* so_cordreq */
-	case SIOCGCONNORDER:		/* so_cordreq */
+	case SIOCGASSOCIDS32:           /* so_aidreq32 */
+	case SIOCGASSOCIDS64:           /* so_aidreq64 */
+	case SIOCGCONNIDS32:            /* so_cidreq32 */
+	case SIOCGCONNIDS64:            /* so_cidreq64 */
+	case SIOCGCONNINFO32:           /* so_cinforeq32 */
+	case SIOCGCONNINFO64:           /* so_cinforeq64 */
+	case SIOCSCONNORDER:            /* so_cordreq */
+	case SIOCGCONNORDER:            /* so_cordreq */
 		error = (*so->so_proto->pr_usrreqs->pru_control)(so,
 		    cmd, data, NULL, p);
 		goto out;
@@ -278,57 +261,53 @@ soioctl(struct socket *so, u_long cmd, caddr_t data, struct proc *p)
 	if (IOCGROUP(cmd) == 'i') {
 		error = ifioctllocked(so, cmd, data, p);
 	} else {
-		if (IOCGROUP(cmd) == 'r')
+		if (IOCGROUP(cmd) == 'r') {
 			error = rtioctl(cmd, data, p);
-		else
+		} else {
 			error = (*so->so_proto->pr_usrreqs->pru_control)(so,
 			    cmd, data, NULL, p);
+		}
 	}
 
 out:
 	socket_unlock(so, 1);
 
-	if (error == EJUSTRETURN)
+	if (error == EJUSTRETURN) {
 		error = 0;
+	}
 
-	return (error);
+	return error;
 }
 
 int
-soo_ioctl(struct fileproc *fp, u_long cmd, caddr_t data, vfs_context_t ctx)
+soo_ioctl(struct fileproc *fp, u_long cmd, caddr_t __sized_by(IOCPARM_LEN(cmd)) data, vfs_context_t ctx)
 {
-	struct socket *so;
+	struct socket *__single so;
 	proc_t procp = vfs_context_proc(ctx);
 
-	if ((so = (struct socket *)fp->f_fglob->fg_data) == NULL) {
+	if ((so = (struct socket *)fp_get_data(fp)) == NULL) {
 		/* This is not a valid open file descriptor */
-		return (EBADF);
+		return EBADF;
 	}
 
-	return (soioctl(so, cmd, data, procp));
+	return soioctl(so, cmd, data, procp);
 }
 
 int
 soo_select(struct fileproc *fp, int which, void *wql, vfs_context_t ctx)
 {
-	struct socket *so = (struct socket *)fp->f_fglob->fg_data;
+	struct socket *__single so = (struct socket *)fp_get_data(fp);
 	int retnum = 0;
 	proc_t procp;
 
-	if (so == NULL || so == (struct socket *)-1)
-		return (0);
+	if (so == NULL || so == (struct socket *)-1) {
+		return 0;
+	}
 
 	procp = vfs_context_proc(ctx);
 
-#if CONFIG_MACF_SOCKET
-	if (mac_socket_check_select(vfs_context_ucred(ctx), so, which) != 0)
-		return (0);
-#endif /* CONFIG_MACF_SOCKET */
-
-
 	socket_lock(so, 1);
 	switch (which) {
-
 	case FREAD:
 		so->so_rcv.sb_flags |= SB_SEL;
 		if (soreadable(so)) {
@@ -362,7 +341,7 @@ soo_select(struct fileproc *fp, int which, void *wql, vfs_context_t ctx)
 
 done:
 	socket_unlock(so, 1);
-	return (retnum);
+	return retnum;
 }
 
 int
@@ -374,38 +353,43 @@ soo_stat(struct socket *so, void *ub, int isstat64)
 	/* warning avoidance ; protected by isstat64 */
 	struct stat64 *sb64 = (struct stat64 *)0;
 
-#if CONFIG_MACF_SOCKET
+#if CONFIG_MACF_SOCKET_SUBSET
 	ret = mac_socket_check_stat(kauth_cred_get(), so);
-	if (ret)
-		return (ret);
+	if (ret) {
+		return ret;
+	}
 #endif
 
 	if (isstat64 != 0) {
 		sb64 = (struct stat64 *)ub;
-		bzero((caddr_t)sb64, sizeof (*sb64));
+		bzero((caddr_t)sb64, sizeof(*sb64));
 	} else {
 		sb = (struct stat *)ub;
-		bzero((caddr_t)sb, sizeof (*sb));
+		bzero((caddr_t)sb, sizeof(*sb));
 	}
 
 	socket_lock(so, 1);
 	if (isstat64 != 0) {
 		sb64->st_mode = S_IFSOCK;
 		if ((so->so_state & SS_CANTRCVMORE) == 0 ||
-		    so->so_rcv.sb_cc != 0)
+		    so->so_rcv.sb_cc != 0) {
 			sb64->st_mode |= S_IRUSR | S_IRGRP | S_IROTH;
-		if ((so->so_state & SS_CANTSENDMORE) == 0)
+		}
+		if ((so->so_state & SS_CANTSENDMORE) == 0) {
 			sb64->st_mode |= S_IWUSR | S_IWGRP | S_IWOTH;
+		}
 		sb64->st_size = so->so_rcv.sb_cc - so->so_rcv.sb_ctl;
 		sb64->st_uid = kauth_cred_getuid(so->so_cred);
 		sb64->st_gid = kauth_cred_getgid(so->so_cred);
 	} else {
 		sb->st_mode = S_IFSOCK;
 		if ((so->so_state & SS_CANTRCVMORE) == 0 ||
-		    so->so_rcv.sb_cc != 0)
+		    so->so_rcv.sb_cc != 0) {
 			sb->st_mode |= S_IRUSR | S_IRGRP | S_IROTH;
-		if ((so->so_state & SS_CANTSENDMORE) == 0)
+		}
+		if ((so->so_state & SS_CANTSENDMORE) == 0) {
 			sb->st_mode |= S_IWUSR | S_IWGRP | S_IWOTH;
+		}
 		sb->st_size = so->so_rcv.sb_cc - so->so_rcv.sb_ctl;
 		sb->st_uid = kauth_cred_getuid(so->so_cred);
 		sb->st_gid = kauth_cred_getgid(so->so_cred);
@@ -413,7 +397,7 @@ soo_stat(struct socket *so, void *ub, int isstat64)
 
 	ret = (*so->so_proto->pr_usrreqs->pru_sense)(so, ub, isstat64);
 	socket_unlock(so, 1);
-	return (ret);
+	return ret;
 }
 
 /* ARGSUSED */
@@ -421,22 +405,23 @@ static int
 soo_close(struct fileglob *fg, __unused vfs_context_t ctx)
 {
 	int error = 0;
-	struct socket *sp;
+	struct socket *__single sp;
 
-	sp = (struct socket *)fg->fg_data;
-	fg->fg_data = NULL;
+	sp = (struct socket *)fg_get_data(fg);
+	fg_set_data(fg, NULL);
 
-	if (sp)
+	if (sp) {
 		error = soclose(sp);
+	}
 
-	return (error);
+	return error;
 }
 
 static int
 soo_drain(struct fileproc *fp, __unused vfs_context_t ctx)
 {
 	int error = 0;
-	struct socket *so = (struct socket *)fp->f_fglob->fg_data;
+	struct socket *__single so = (struct socket *)fp_get_data(fp);
 
 	if (so) {
 		socket_lock(so, 1);
@@ -450,7 +435,7 @@ soo_drain(struct fileproc *fp, __unused vfs_context_t ctx)
 		socket_unlock(so, 1);
 	}
 
-	return (error);
+	return error;
 }
 
 /*
@@ -482,7 +467,6 @@ soioctl_cassert(void)
 	case SIOCATMARK:
 	case SIOCSPGRP:
 	case SIOCGPGRP:
-	case SIOCSETOT:
 	case SIOCGASSOCIDS32:
 	case SIOCGASSOCIDS64:
 	case SIOCGCONNIDS32:

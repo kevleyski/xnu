@@ -56,7 +56,6 @@
 /*
  */
 
-#include <platforms.h>
 #include <debug.h>
 
 #include <i386/asm.h>
@@ -64,7 +63,6 @@
 #include <i386/postcode.h>
 #include <assym.s>
 
-#include <i386/mp.h>
 #include <i386/cpuid.h>
 #include <i386/acpi.h>
 
@@ -190,7 +188,7 @@ LEXT(pstart)
 
 	POSTCODE(PSTART_REBASE)
 
-/* the following code is shared by the master CPU and all slave CPUs */
+/* the following code is shared by the BSP CPU and all AP CPUs */
 L_pstart_common:
 	/*
 	 * switch to 64 bit mode
@@ -212,7 +210,7 @@ L_pstart_common:
 	cpuid
 	test	$(1 << 30), %ecx
 	jz	Lnon_rdrand
-	RDRAND_RAX		/* RAX := 64 bits of DRBG entropy */
+	rdrand	%rax		/* RAX := 64 bits of DRBG entropy */
 	jnc	Lnon_rdrand	/* TODO: complain if DRBG fails at this stage */
 
 Lstore_random_guard:
@@ -226,7 +224,7 @@ Lvstartshim:
 	/* %edi = boot_args_start */
 	
 	leaq	_vstart(%rip), %rcx
-	movq	$0xffffff8000000000, %rax	/* adjust pointer up high */
+	movq	$(KERNEL_BASE), %rax		/* adjust pointer up high */
 	or	%rax, %rsp			/* and stack pointer up there */
 	or	%rcx, %rax
 	andq	$0xfffffffffffffff0, %rsp	/* align stack */
@@ -310,7 +308,7 @@ LEXT(hibernate_machine_entrypoint)
 	leaq	EXT(hibernate_kernel_entrypoint)(%rip),%rcx
 
 	/* adjust the pointers to be up high */
-	movq	$0xffffff8000000000, %rax
+	movq	$(KERNEL_BASE), %rax
 	orq	%rax, %rsp
 	orq	%rcx, %rax
 

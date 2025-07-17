@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012-2013 Apple Inc. All rights reserved.
+ * Copyright (c) 2012-2020 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -27,7 +27,7 @@
  */
 
 #ifndef _NETINET_MPTCP_VAR_H_
-#define	_NETINET_MPTCP_VAR_H_
+#define _NETINET_MPTCP_VAR_H_
 
 #ifdef PRIVATE
 #include <netinet/in.h>
@@ -40,122 +40,233 @@
 #include <kern/locks.h>
 #include <mach/boolean.h>
 #include <netinet/mp_pcb.h>
+#include <netinet/tcp_var.h>
+#include <os/log.h>
+#include <libkern/crypto/sha1.h>
+#include <libkern/crypto/sha2.h>
+
+struct mpt_itf_info {
+	uint32_t ifindex;
+	uint32_t has_v4_conn:1,
+	    has_v6_conn:1,
+	    has_nat64_conn:1,
+	    no_mptcp_support:1;
+};
 
 /*
  * MPTCP Session
  *
  * This is an extension to the multipath PCB specific for MPTCP, protected by
- * the per-PCB mpp_lock (also the socket's lock); MPTCP thread signalling uses
- * its own mpte_thread_lock due to lock ordering constraints.
+ * the per-PCB mpp_lock (also the socket's lock);
  */
 struct mptses {
-	struct mppcb	*mpte_mppcb;		/* back ptr to multipath PCB */
-	struct mptcb	*mpte_mptcb;		/* ptr to MPTCP PCB */
-	TAILQ_HEAD(, mptopt) mpte_sopts;	/* list of socket options */
-	TAILQ_HEAD(, mptsub) mpte_subflows;	/* list of subflows */
-	uint16_t	mpte_numflows;		/* # of subflows in list */
-	uint16_t	mpte_nummpcapflows;	/* # of MP_CAP subflows */
-	associd_t	mpte_associd;		/* MPTCP association ID */
-	connid_t	mpte_connid_last;	/* last used connection ID */
-	/*
-	 * Threading (protected by mpte_thread_lock)
-	 */
-	decl_lck_mtx_data(, mpte_thread_lock);	/* thread lock */
-	struct thread	*mpte_thread;		/* worker thread */
-	uint32_t	mpte_thread_active;	/* thread is running */
-	uint32_t	mpte_thread_reqs;	/* # of requests for thread */
-	struct mptsub	*mpte_active_sub;	/* ptr to last active subf */
-	u_int8_t	mpte_flags;		/* per mptcp session flags */
-	u_int8_t	mpte_lost_aid;		/* storing lost address id */
+	struct mppcb    *mpte_mppcb;            /* back ptr to multipath PCB */
+	struct mptcb    *mpte_mptcb;            /* ptr to MPTCP PCB */
+	TAILQ_HEAD(, mptopt) mpte_sopts;        /* list of socket options */
+	TAILQ_HEAD(, mptsub) mpte_subflows;     /* list of subflows */
+#define MPTCP_MAX_NUM_SUBFLOWS 256
+	uint16_t        mpte_numflows;          /* # of subflows in list */
+	uint16_t        mpte_nummpcapflows;     /* # of MP_CAP subflows */
+	sae_associd_t   mpte_associd;           /* MPTCP association ID */
+	sae_connid_t    mpte_connid_last;       /* last used connection ID */
+
+	uint64_t        mpte_time_target;
+	thread_call_t   mpte_time_thread;
+	thread_call_t   mpte_stop_urgency;
+
+	uint32_t        mpte_last_cellicon_set;
+	uint32_t        mpte_cellicon_increments;
+
+	union {
+		/* Source address of initial subflow */
+		struct sockaddr _mpte_src;
+		struct sockaddr_in _mpte_src_v4;
+		struct sockaddr_in6 _mpte_src_v6;
+	} mpte_u_src;
+#define mpte_src mpte_u_src._mpte_src
+#define __mpte_src_v4 mpte_u_src._mpte_src_v4
+#define __mpte_src_v6 mpte_u_src._mpte_src_v6
+	union {
+		/* Destination address of initial subflow */
+		struct sockaddr _mpte_dst;
+		struct sockaddr_in _mpte_dst_v4;
+		struct sockaddr_in6 _mpte_dst_v6;
+	} mpte_u_dst;
+#define mpte_dst mpte_u_dst._mpte_dst
+#define __mpte_dst_v4 mpte_u_dst._mpte_dst_v4
+#define __mpte_dst_v6 mpte_u_dst._mpte_dst_v6
+
+	struct sockaddr_in      mpte_sub_dst_v4;
+	struct sockaddr_in6     mpte_sub_dst_v6;
+	uint8_t         sub_dst_addr_id_v4;
+	uint8_t         sub_dst_addr_id_v6;
+
+	uint16_t        mpte_alternate_port;    /* Alternate port for subflow establishment (network-byte-order) */
+
+	int mpte_epid;
+	uuid_t mpte_euuid;
+
+	struct mptsub   *mpte_active_sub;       /* ptr to last active subf */
+	uint16_t mpte_flags;                    /* per mptcp session flags */
+#define MPTE_SND_REM_ADDR       0x01            /* Send Remove_addr option */
+#define MPTE_SVCTYPE_CHECKED    0x02            /* Did entitlement-check for service-type */
+#define MPTE_FIRSTPARTY         0x04            /* First-party app used multipath_extended entitlement */
+#define MPTE_ACCESS_GRANTED     0x08            /* Access to cellular has been granted for this connection */
+#define MPTE_FORCE_ENABLE       0x10            /* For MPTCP regardless of heuristics to detect middleboxes */
+#define MPTE_IN_WORKLOOP        0x20            /* Are we currently inside the workloop ? */
+#define MPTE_WORKLOOP_RELAUNCH  0x40            /* Another event got queued, we should restart the workloop */
+#define MPTE_UNICAST_IP         0x80            /* New subflows are only being established towards the unicast IP in the ADD_ADDR */
+#define MPTE_CELL_PROHIBITED    0x100           /* Cell access has been prohibited based on signal quality */
+#define MPTE_FORCE_V0           0x200           /* Force MPTCP to use version 0 regradless of tcp cache */
+#define MPTE_FORCE_V1           0x400           /* Force MPTCP to use version 1 regradless of tcp cache */
+#define MPTE_ITFINFO_INIT       0x800           /* Set when the itfinfo has been initialized */
+	uint8_t mpte_svctype;                   /* MPTCP Service type */
+	uint8_t mpte_lost_aid;                  /* storing lost address id */
+	uint8_t mpte_addrid_last;               /* storing address id parm */
+
+#define MPTE_ITFINFO_SIZE       4
+	uint32_t        mpte_itfinfo_size;
+	struct mpt_itf_info     _mpte_itfinfo[MPTE_ITFINFO_SIZE];
+	struct mpt_itf_info     *mpte_itfinfo __counted_by(mpte_itfinfo_size);
+
+	struct mbuf             *mpte_reinjectq;
+
+	/* The below is used for stats */
+	uint32_t        mpte_subflow_switches;  /* Number of subflow-switches in sending */
+	uint32_t        mpte_used_cell:1,
+	    mpte_used_wifi:1,
+	    mpte_initial_cell:1,
+	    mpte_triggered_cell,
+	    mpte_handshake_success:1,
+	    mpte_last_added_addr_is_v4:1;
+
+	struct mptcp_itf_stats  mpte_itfstats[MPTCP_ITFSTATS_SIZE];
+	uint64_t                mpte_init_txbytes __attribute__((aligned(8)));
+	uint64_t                mpte_init_rxbytes __attribute__((aligned(8)));
 };
 
-/*
- * Valid values for mpte_flags.
- */
-#define	MPTE_SND_REM_ADDR	0x01		/* Send Remove_addr option */
+static inline struct socket *
+mptetoso(struct mptses *mpte)
+{
+	return mpte->mpte_mppcb->mpp_socket;
+}
 
-#define	mptompte(mp)	((struct mptses *)(mp)->mpp_pcbe)
+static inline struct mptses *
+mptompte(struct mppcb *mp)
+{
+	return (struct mptses *)mp->mpp_pcbe;
+}
 
-#define	MPTE_LOCK_ASSERT_HELD(_mpte)					\
-	lck_mtx_assert(&(_mpte)->mpte_mppcb->mpp_lock, LCK_MTX_ASSERT_OWNED)
+static inline struct mptses *
+mpsotompte(struct socket *so)
+{
+	return mptompte(mpsotomppcb(so));
+}
 
-#define	MPTE_LOCK_ASSERT_NOTHELD(_mpte)					\
-	lck_mtx_assert(&(_mpte)->mpte_mppcb->mpp_lock, LCK_MTX_ASSERT_NOTOWNED)
+static inline boolean_t
+mpp_try_lock(struct mppcb *mp)
+{
+	if (!lck_mtx_try_lock(&mp->mpp_lock)) {
+		return false;
+	}
 
-#define	MPTE_LOCK(_mpte)						\
-	lck_mtx_lock(&(_mpte)->mpte_mppcb->mpp_lock)
+	VERIFY(!(mp->mpp_flags & MPP_INSIDE_OUTPUT));
+	VERIFY(!(mp->mpp_flags & MPP_INSIDE_INPUT));
+	VERIFY(!(mp->mpp_flags & MPP_INSIDE_SETGETOPT));
 
-#define	MPTE_LOCK_SPIN(_mpte)						\
-	lck_mtx_lock_spin(&(_mpte)->mpte_mppcb->mpp_lock)
+	return true;
+}
 
-#define	MPTE_CONVERT_LOCK(_mpte) do {					\
-	MPTE_LOCK_ASSERT_HELD(_mpte);					\
-	lck_mtx_convert_spin(&(_mpte)->mpte_mppcb->mpp_lock);		\
-} while (0)
+static inline void
+mpp_lock(struct mppcb *mp)
+{
+	lck_mtx_lock(&mp->mpp_lock);
+	VERIFY(!(mp->mpp_flags & MPP_INSIDE_OUTPUT));
+	VERIFY(!(mp->mpp_flags & MPP_INSIDE_INPUT));
+	VERIFY(!(mp->mpp_flags & MPP_INSIDE_SETGETOPT));
+}
 
-#define	MPTE_UNLOCK(_mpte)						\
-	lck_mtx_unlock(&(_mpte)->mpte_mppcb->mpp_lock)
+static inline void
+mpp_unlock(struct mppcb *mp)
+{
+	VERIFY(!(mp->mpp_flags & MPP_INSIDE_OUTPUT));
+	VERIFY(!(mp->mpp_flags & MPP_INSIDE_INPUT));
+	VERIFY(!(mp->mpp_flags & MPP_INSIDE_SETGETOPT));
+	lck_mtx_unlock(&mp->mpp_lock);
+}
+
+static inline lck_mtx_t *
+mpp_getlock(struct mppcb *mp, int flags)
+{
+	if (flags & PR_F_WILLUNLOCK) {
+		VERIFY(!(mp->mpp_flags & MPP_INSIDE_OUTPUT));
+		VERIFY(!(mp->mpp_flags & MPP_INSIDE_INPUT));
+		VERIFY(!(mp->mpp_flags & MPP_INSIDE_SETGETOPT));
+	}
+
+	return &mp->mpp_lock;
+}
+
+static inline int
+mptcp_subflow_cwnd_space(struct socket *so)
+{
+	struct tcpcb *tp = sototcpcb(so);
+	int cwnd = (int)(MIN(tp->snd_wnd, tp->snd_cwnd) - (so->so_snd.sb_cc));
+
+	return MIN(cwnd, sbspace(&so->so_snd));
+}
+
+static inline bool
+mptcp_subflows_need_backup_flag(struct mptses *mpte)
+{
+	return mpte->mpte_svctype < MPTCP_SVCTYPE_AGGREGATE ||
+	       mpte->mpte_svctype == MPTCP_SVCTYPE_PURE_HANDOVER;
+}
 
 /*
  * MPTCP socket options
  */
 struct mptopt {
-	TAILQ_ENTRY(mptopt)	mpo_entry;	/* glue to other options */
-	uint32_t		mpo_flags;	/* see flags below */
-	int			mpo_level;	/* sopt_level */
-	int			mpo_name;	/* sopt_name */
-	int			mpo_intval;	/* sopt_val */
+	TAILQ_ENTRY(mptopt)     mpo_entry;      /* glue to other options */
+	uint32_t                mpo_flags;      /* see flags below */
+	int                     mpo_level;      /* sopt_level */
+	int                     mpo_name;       /* sopt_name */
+	int                     mpo_intval;     /* sopt_val */
 };
 
-#define	MPOF_ATTACHED		0x1	/* attached to MP socket */
-#define	MPOF_SUBFLOW_OK		0x2	/* can be issued on subflow socket */
-#define	MPOF_INTERIM		0x4	/* has not been issued on any subflow */
-
-/*
- * Structure passed down to TCP during subflow connection establishment
- * containing information pertaining to the MPTCP.
- */
-struct mptsub_connreq {
-	uint32_t	mpcr_type;	/* see MPTSUB_CONNREQ_* below */
-	uint32_t	mpcr_ifscope;	/* ifscope parameter to connectx(2) */
-	struct proc	*mpcr_proc;	/* process issuing connectx(2) */
-};
-
-/* valid values for mpcr_type */
-#define	MPTSUB_CONNREQ_MP_ENABLE	1	/* enable MPTCP */
-#define	MPTSUB_CONNREQ_MP_ADD		2	/* join an existing MPTCP */
+#define MPOF_ATTACHED           0x1     /* attached to MP socket */
+#define MPOF_SUBFLOW_OK         0x2     /* can be issued on subflow socket */
+#define MPOF_INTERIM            0x4     /* has not been issued on any subflow */
 
 /*
  * MPTCP subflow
- *
- * Protected by the the per-subflow mpts_lock.  Note that mpts_flags
- * and mpts_evctl are modified via atomic operations.
  */
 struct mptsub {
-	decl_lck_mtx_data(, mpts_lock);		/* per-subflow lock */
-	TAILQ_ENTRY(mptsub)	mpts_entry;	/* glue to peer subflows */
-	uint32_t		mpts_refcnt;	/* reference count */
-	uint32_t		mpts_flags;	/* see flags below */
-	uint32_t		mpts_evctl;	/* subflow control events */
-	uint32_t		mpts_family;	/* address family */
-	connid_t		mpts_connid;	/* subflow connection ID */
-	int			mpts_oldintval;	/* sopt_val before sosetopt  */
-	uint32_t		mpts_rank;	/* subflow priority/rank */
-	int32_t			mpts_soerror;	/* most recent subflow error */
-	struct mptses		*mpts_mpte;	/* back ptr to MPTCP session */
-	struct socket		*mpts_socket;	/* subflow socket */
-	struct sockaddr_list	*mpts_src_sl;	/* source list */
-	struct sockaddr_list	*mpts_dst_sl;	/* destination list */
-	struct ifnet		*mpts_outif;	/* outbound interface */
-	u_int64_t		mpts_sndnxt;	/* next byte to send in mp so */
-	u_int32_t		mpts_rel_seq;	/* running count of subflow # */
-	struct {
-		u_int64_t	mptsl_dsn;	/* Data Sequence Number */
-		u_int32_t	mptsl_sseq;	/* Corresponding Data Seq */
-		u_int32_t	mptsl_len;	/* length of mapping */
-	} mpts_lastmap;
-	struct protosw		*mpts_oprotosw;	/* original protosw */
-	struct mptsub_connreq	mpts_mpcr;	/* connection request */
+	TAILQ_ENTRY(mptsub)   mpts_entry;     /* glue to peer subflows */
+	uint32_t              mpts_refcnt;    /* reference count */
+	uint32_t              mpts_flags;     /* see flags below */
+	uint32_t              mpts_evctl;     /* subflow control events */
+	sae_connid_t          mpts_connid;    /* subflow connection ID */
+	int                   mpts_oldintval; /* sopt_val before sosetopt  */
+	struct mptses         *mpts_mpte;     /* back ptr to MPTCP session */
+	struct socket         *mpts_socket;   /* subflow socket */
+	struct sockaddr       *mpts_src;      /* source address */
+
+	union {
+		/* destination address */
+		struct sockaddr         _mpts_dst;
+		struct sockaddr_in      _mpts_dst_v4;
+		struct sockaddr_in6     _mpts_dst_v6;
+	} mpts_u_dst;
+#define mpts_dst mpts_u_dst._mpts_dst
+#define __mpts_dst_v4 mpts_u_dst._mpts_dst_v4
+#define __mpts_dst_v6 mpts_u_dst._mpts_dst_v6
+	u_int32_t               mpts_rel_seq;   /* running count of subflow # */
+	u_int32_t               mpts_iss;       /* Initial sequence number, taking TFO into account */
+	u_int32_t               mpts_ifscope;   /* scoped to the interface */
+	uint32_t                mpts_probesoon; /* send probe after probeto */
+	uint32_t                mpts_probecnt;  /* number of probes sent */
+	uint32_t                mpts_maxseg;    /* cached value of t_maxseg */
 };
 
 /*
@@ -187,91 +298,70 @@ struct mptsub {
  *
  * Keep in sync with bsd/dev/dtrace/scripts/mptcp.d.
  */
-#define	MPTSF_ATTACHED		0x1	/* attached to MPTCP PCB */
-#define	MPTSF_CONNECTING	0x2	/* connection was attempted */
-#define	MPTSF_CONNECT_PENDING	0x4	/* will connect when MPTCP is ready */
-#define	MPTSF_CONNECTED		0x8	/* connection is established */
-#define	MPTSF_DISCONNECTING	0x10	/* disconnection was attempted */
-#define	MPTSF_DISCONNECTED	0x20	/* has been disconnected */
-#define	MPTSF_MP_CAPABLE	0x40	/* connected as a MPTCP subflow */
-#define	MPTSF_MP_READY		0x80	/* MPTCP has been confirmed */
-#define	MPTSF_MP_DEGRADED	0x100	/* has lost its MPTCP capabilities */
-#define	MPTSF_SUSPENDED		0x200	/* write-side is flow controlled */
-#define	MPTSF_BOUND_IF		0x400	/* subflow bound to an interface */
-#define	MPTSF_BOUND_IP		0x800	/* subflow bound to a src address */
-#define	MPTSF_BOUND_PORT	0x1000	/* subflow bound to a src port */
-#define	MPTSF_PREFERRED		0x2000	/* primary/preferred subflow */
-#define	MPTSF_SOPT_OLDVAL	0x4000	/* old option value is valid */
-#define	MPTSF_SOPT_INPROG	0x8000	/* sosetopt in progress */
-#define	MPTSF_DELETEOK		0x10000	/* subflow can be deleted */
-#define	MPTSF_FAILINGOVER	0x20000	/* subflow not used for output */
-#define	MPTSF_ACTIVE		0x40000	/* subflow currently in use */
-#define	MPTSF_MPCAP_CTRSET	0x80000	/* mpcap counter */
-
-#define	MPTSF_BITS \
-	"\020\1ATTACHED\2CONNECTING\3PENDING\4CONNECTED\5DISCONNECTING" \
-	"\6DISCONNECTED\7MP_CAPABLE\10MP_READY\11MP_DEGRADED\12SUSPENDED" \
-	"\13BOUND_IF\14BOUND_IP\15BOUND_PORT\16PREFERRED\17SOPT_OLDVAL" \
-	"\20SOPT_INPROG\21NOLINGER\22FAILINGOVER\23ACTIVE\24MPCAP_CTRSET"
-
-#define	MPTS_LOCK_ASSERT_HELD(_mpts)					\
-	lck_mtx_assert(&(_mpts)->mpts_lock, LCK_MTX_ASSERT_OWNED)
-
-#define	MPTS_LOCK_ASSERT_NOTHELD(_mpts)					\
-	lck_mtx_assert(&(_mpts)->mpts_lock, LCK_MTX_ASSERT_NOTOWNED)
-
-#define	MPTS_LOCK(_mpts)						\
-	lck_mtx_lock(&(_mpts)->mpts_lock)
-
-#define	MPTS_LOCK_SPIN(_mpts)						\
-	lck_mtx_lock_spin(&(_mpts)->mpts_lock)
-
-#define	MPTS_CONVERT_LOCK(_mpts) do {					\
-	MPTS_LOCK_ASSERT_HELD(_mpts);					\
-	lck_mtx_convert_spin(&(_mpts)->mpts_lock);			\
-} while (0)
-
-#define	MPTS_UNLOCK(_mpts)						\
-	lck_mtx_unlock(&(_mpts)->mpts_lock)
-
-#define	MPTS_ADDREF(_mpts)						\
-	mptcp_subflow_addref(_mpts, 0)
-
-#define	MPTS_ADDREF_LOCKED(_mpts)					\
-	mptcp_subflow_addref(_mpts, 1)
-
-#define	MPTS_REMREF(_mpts)						\
-	mptcp_subflow_remref(_mpts)
+#define MPTSF_CONNECTING        0x00000002      /* connection was attempted */
+#define MPTSF_CONNECT_PENDING   0x00000004      /* will connect when MPTCP is ready */
+#define MPTSF_CONNECTED         0x00000008      /* connection is established */
+#define MPTSF_DISCONNECTING     0x00000010      /* disconnection was attempted */
+#define MPTSF_DISCONNECTED      0x00000020      /* has been disconnected */
+#define MPTSF_MP_CAPABLE        0x00000040      /* connected as a MPTCP subflow */
+#define MPTSF_MP_READY          0x00000080      /* MPTCP has been confirmed */
+#define MPTSF_MP_DEGRADED       0x00000100      /* has lost its MPTCP capabilities */
+#define MPTSF_PREFERRED         0x00000200      /* primary/preferred subflow */
+#define MPTSF_SOPT_OLDVAL       0x00000400      /* old option value is valid */
+#define MPTSF_SOPT_INPROG       0x00000800      /* sosetopt in progress */
+#define MPTSF_FAILINGOVER       0x00001000      /* subflow not used for output */
+#define MPTSF_ACTIVE            0x00002000      /* subflow currently in use */
+#define MPTSF_MPCAP_CTRSET      0x00004000      /* mpcap counter */
+#define MPTSF_CLOSED            0x00008000      /* soclose_locked has been called on this subflow */
+#define MPTSF_TFO_REQD          0x00010000      /* TFO requested */
+#define MPTSF_CLOSE_REQD        0x00020000      /* A close has been requested from NECP */
+#define MPTSF_INITIAL_SUB       0x00040000      /* This is the initial subflow */
+#define MPTSF_READ_STALL        0x00080000      /* A read-stall has been detected */
+#define MPTSF_WRITE_STALL       0x00100000      /* A write-stall has been detected */
+#define MPTSF_FULLY_ESTABLISHED 0x00200000      /* Subflow is fully established and it has been confirmed
+	                                         * whether or not it supports MPTCP.
+	                                         * No need for further middlebox-detection.
+	                                         */
+#define MPTSF_CELLICON_SET      0x00400000      /* This subflow set the cellicon */
 
 /*
  * MPTCP states
- * Keep in sync with bsd/dev/dtrace/mptcp.d
+ * Keep in sync with bsd/dev/dtrace/scripts/mptcp.d
  */
 typedef enum mptcp_state {
-	MPTCPS_CLOSED		= 0,	/* closed */
-	MPTCPS_LISTEN		= 1,	/* not yet implemented */
-	MPTCPS_ESTABLISHED	= 2,	/* MPTCP connection established */
-	MPTCPS_CLOSE_WAIT	= 3,	/* rcvd DFIN, waiting for close */
-	MPTCPS_FIN_WAIT_1	= 4,	/* have closed, sent DFIN */
-	MPTCPS_CLOSING		= 5,	/* closed xchd DFIN, waiting DFIN ACK */
-	MPTCPS_LAST_ACK		= 6,	/* had DFIN and close; await DFIN ACK */
-	MPTCPS_FIN_WAIT_2	= 7,	/* have closed, DFIN is acked */
-	MPTCPS_TIME_WAIT	= 8,	/* in 2*MSL quiet wait after close */
-	MPTCPS_FASTCLOSE_WAIT	= 9,	/* sent MP_FASTCLOSE */
+	MPTCPS_CLOSED           = 0,    /* closed */
+	MPTCPS_LISTEN           = 1,    /* not yet implemented */
+	MPTCPS_ESTABLISHED      = 2,    /* MPTCP connection established */
+	MPTCPS_CLOSE_WAIT       = 3,    /* rcvd DFIN, waiting for close */
+	MPTCPS_FIN_WAIT_1       = 4,    /* have closed, sent DFIN */
+	MPTCPS_CLOSING          = 5,    /* closed xchd DFIN, waiting DFIN ACK */
+	MPTCPS_LAST_ACK         = 6,    /* had DFIN and close; await DFIN ACK */
+	MPTCPS_FIN_WAIT_2       = 7,    /* have closed, DFIN is acked */
+	MPTCPS_TIME_WAIT        = 8,    /* in 2*MSL quiet wait after close */
+	MPTCPS_TERMINATE        = 9,    /* terminal state */
 } mptcp_state_t;
 
-typedef u_int64_t	mptcp_key_t;
-typedef u_int32_t	mptcp_token_t;
-typedef u_int8_t	mptcp_addr_id;
+/*
+ * WiFi Quality states from MPTCP's perspective
+ */
+typedef enum mptcp_wifi_quality {
+	MPTCP_WIFI_QUALITY_GOOD,
+	MPTCP_WIFI_QUALITY_BAD,
+	MPTCP_WIFI_QUALITY_UNSURE,
+} mptcp_wifi_quality_t;
+
+typedef u_int64_t       mptcp_key_t;
+typedef u_int32_t       mptcp_token_t;
+typedef u_int8_t        mptcp_addr_id;
 
 
 /* Address ID list */
 struct mptcp_subf_auth_entry {
 	LIST_ENTRY(mptcp_subf_auth_entry) msae_next;
-	u_int32_t	msae_laddr_rand;	/* Local nonce */
-	u_int32_t	msae_raddr_rand;	/* Remote nonce */
-	mptcp_addr_id	msae_laddr_id;		/* Local addr ID */
-	mptcp_addr_id	msae_raddr_id;		/* Remote addr ID */
+	u_int32_t       msae_laddr_rand;        /* Local nonce */
+	u_int32_t       msae_raddr_rand;        /* Remote nonce */
+	mptcp_addr_id   msae_laddr_id;          /* Local addr ID */
+	mptcp_addr_id   msae_raddr_id;          /* Remote addr ID */
 };
 
 /*
@@ -281,112 +371,102 @@ struct mptcp_subf_auth_entry {
  * Keep in sync with bsd/dev/dtrace/scripts/mptcp.d.
  */
 struct mptcb {
-	decl_lck_mtx_data(, mpt_lock);		/* per MPTCP PCB lock */
-	struct mptses	*mpt_mpte;		/* back ptr to MPTCP session */
-	mptcp_state_t	mpt_state;		/* MPTCP state */
-	u_int32_t	mpt_flags;		/* see flags below */
-	u_int32_t	mpt_refcnt;		/* references held on mptcb */
-	u_int32_t	mpt_version;		/* MPTCP proto version */
-	int		mpt_softerror;		/* error not yet reported */
+	struct mptses  *mpt_mpte;               /* back ptr to MPTCP session */
+	mptcp_state_t   mpt_state;              /* MPTCP state */
+	uint32_t        mpt_flags;              /* see flags below */
+	uint8_t         mpt_version;            /* MPTCP proto version */
+	u_short         mpt_softerror;          /* error not yet reported */
 	/*
 	 * Authentication and metadata invariants
 	 */
-	mptcp_key_t	*mpt_localkey;		/* in network byte order */
-	mptcp_key_t	mpt_remotekey;		/* in network byte order */
-	mptcp_token_t	mpt_localtoken;		/* HMAC SHA1 of local key */
-	mptcp_token_t	mpt_remotetoken;	/* HMAC SHA1 of remote key */
+	mptcp_key_t     mpt_localkey;           /* in network byte order */
+	mptcp_key_t     mpt_remotekey;          /* in network byte order */
+	mptcp_token_t   mpt_localtoken;         /* HMAC SHA1 of local key */
+	mptcp_token_t   mpt_remotetoken;        /* HMAC SHA1 of remote key */
 
 	/*
 	 * Timer vars for scenarios where subflow level acks arrive, but
 	 * Data ACKs do not.
 	 */
-	int		mpt_rxtshift;		/* num of consecutive retrans */
-	u_int32_t	mpt_rxtstart;		/* time at which rxt started */
-	u_int64_t	mpt_rtseq;		/* seq # being tracked */
-	u_int32_t	mpt_timer_vals;		/* timer related values */
-	u_int32_t	mpt_timewait;		/* timewait */
+	int             mpt_rxtshift;           /* num of consecutive retrans */
+	uint64_t        mpt_rxtstart;           /* time at which rxt started */
+	uint64_t        mpt_rtseq;              /* seq # being tracked */
+	uint64_t        mpt_timewait;           /* timewait */
+	uint32_t        mpt_timer_vals;         /* timer related values */
 	/*
 	 * Sending side
 	 */
-	u_int64_t	mpt_snduna;		/* DSN of last unacked byte */
-	u_int64_t	mpt_sndnxt;		/* DSN of next byte to send */
-	u_int64_t	mpt_sndmax;		/* DSN of max byte sent */
-	u_int64_t	mpt_local_idsn;		/* First byte's DSN */
-	u_int32_t	mpt_sndwnd;
+	uint64_t        mpt_snduna;             /* DSN of last unacked byte */
+	uint64_t        mpt_sndnxt;             /* DSN of next byte to send */
+	uint64_t        mpt_sndmax;             /* DSN of max byte sent */
+	uint64_t        mpt_local_idsn;         /* First byte's DSN */
+	uint32_t        mpt_sndwnd;
+	uint64_t        mpt_sndwl1;
+	uint64_t        mpt_sndwl2;
 	/*
 	 * Receiving side
 	 */
-	u_int64_t	mpt_rcvnxt;		/* Next expected DSN */
-	u_int64_t	mpt_rcvatmark;		/* mpsocket marker of rcvnxt */
-	u_int64_t	mpt_remote_idsn;	/* Peer's IDSN */
-	u_int32_t	mpt_rcvwnd;
+	uint64_t        mpt_rcvnxt;             /* Next expected DSN */
+	uint64_t        mpt_remote_idsn;        /* Peer's IDSN */
+	uint64_t        mpt_rcvadv;
+	uint32_t        mpt_rcvwnd;
 	LIST_HEAD(, mptcp_subf_auth_entry) mpt_subauth_list; /* address IDs */
 	/*
 	 * Fastclose
 	 */
-	u_int64_t	mpt_dsn_at_csum_fail;   /* MPFail Opt DSN */
+	uint64_t        mpt_dsn_at_csum_fail;   /* MPFail Opt DSN */
+	uint32_t        mpt_ssn_at_csum_fail;   /* MPFail Subflow Seq */
 	/*
 	 * Zombie handling
 	 */
-#define	MPT_GC_TICKS	(60)
-	int32_t		mpt_gc_ticks;		/* Used for zombie deletion */
+#define MPT_GC_TICKS            (30)
+#define MPT_GC_TICKS_FAST       (10)
+	int32_t         mpt_gc_ticks;           /* Used for zombie deletion */
+
+	uint32_t        mpt_notsent_lowat;      /* TCP_NOTSENT_LOWAT support */
+
+	struct tsegqe_head      mpt_segq;
+	uint32_t        mpt_reassqlen;          /* length of reassembly queue */
 };
 
 /* valid values for mpt_flags (see also notes on mpts_flags above) */
-#define	MPTCPF_CHECKSUM		0x1	/* checksum DSS option */
-#define	MPTCPF_FALLBACK_TO_TCP	0x2	/* Fallback to TCP */
-#define	MPTCPF_JOIN_READY	0x4	/* Ready to start 2 or more subflows */
-#define	MPTCPF_RECVD_MPFAIL	0x8	/* Received MP_FAIL option */
-#define	MPTCPF_PEEL_OFF		0x10	/* Peel off this socket */
-#define	MPTCPF_SND_64BITDSN	0x20	/* Send full 64-bit DSN */
-#define	MPTCPF_SND_64BITACK	0x40	/* Send 64-bit ACK response */
-#define	MPTCPF_RCVD_64BITACK	0x80	/* Received 64-bit Data ACK */
-
-#define	MPTCPF_BITS \
-	"\020\1CHECKSUM\2FALLBACK_TO_TCP\3JOIN_READY\4RECVD_MPFAIL\5PEEL_OFF" \
-	"\6SND_64BITDSN\7SND_64BITACK\10RCVD_64BITACK"
+#define MPTCPF_CHECKSUM                 0x001   /* checksum DSS option */
+#define MPTCPF_FALLBACK_TO_TCP          0x002   /* Fallback to TCP */
+#define MPTCPF_JOIN_READY               0x004   /* Ready to start 2 or more subflows */
+#define MPTCPF_RECVD_MPFAIL             0x008   /* Received MP_FAIL option */
+#define MPTCPF_SND_64BITDSN             0x010   /* Send full 64-bit DSN */
+#define MPTCPF_SND_64BITACK             0x020   /* Send 64-bit ACK response */
+#define MPTCPF_RCVD_64BITACK            0x040   /* Received 64-bit Data ACK */
+#define MPTCPF_POST_FALLBACK_SYNC       0x080   /* Post fallback resend data */
+#define MPTCPF_FALLBACK_HEURISTIC       0x100   /* Send SYN without MP_CAPABLE due to heuristic */
+#define MPTCPF_HEURISTIC_TRAC           0x200   /* Tracked this connection in the heuristics as a failure */
+#define MPTCPF_REASS_INPROG             0x400   /* Reassembly is in progress */
 
 /* valid values for mpt_timer_vals */
-#define	MPTT_REXMT	0x01	/* Starting Retransmit Timer */
-#define	MPTT_TW		0x02	/* Starting Timewait Timer */
-#define	MPTT_FASTCLOSE	0x04	/* Starting Fastclose wait timer */
-
-#define	MPT_LOCK_ASSERT_HELD(_mpt)					\
-	lck_mtx_assert(&(_mpt)->mpt_lock, LCK_MTX_ASSERT_OWNED)
-
-#define	MPT_LOCK_ASSERT_NOTHELD(_mpt)					\
-	lck_mtx_assert(&(_mpt)->mpt_lock, LCK_MTX_ASSERT_NOTOWNED)
-
-#define	MPT_LOCK(_mpt)							\
-	lck_mtx_lock(&(_mpt)->mpt_lock)
-
-#define	MPT_LOCK_SPIN(_mpt)						\
-	lck_mtx_lock_spin(&(_mpt)->mpt_lock)
-
-#define	MPT_CONVERT_LOCK(_mpt) do {					\
-	MPT_LOCK_ASSERT_HELD(_mpt);					\
-	lck_mtx_convert_spin(&(_mpt)->mpt_lock);			\
-} while (0)
-
-#define	MPT_UNLOCK(_mpt)						\
-	lck_mtx_unlock(&(_mpt)->mpt_lock)
+#define MPTT_REXMT              0x01    /* Starting Retransmit Timer */
+#define MPTT_TW                 0x02    /* Starting Timewait Timer */
+#define MPTT_FASTCLOSE          0x04    /* Starting Fastclose wait timer */
 
 /* events for close FSM */
-#define	MPCE_CLOSE		0x1
-#define	MPCE_RECV_DATA_ACK	0x2
-#define	MPCE_RECV_DATA_FIN	0x4
+#define MPCE_CLOSE              0x1
+#define MPCE_RECV_DATA_ACK      0x2
+#define MPCE_RECV_DATA_FIN      0x4
 
 /* mptcb manipulation */
-#define	tptomptp(tp)	((struct mptcb *)((tp)->t_mptcb))
+static inline struct mptcb *
+tptomptp(struct tcpcb *tp)
+{
+	return tp->t_mptcb;
+}
 
 /*
  * MPTCP control block and state structures are allocated along with
  * the MP protocol control block; the folllowing represents the layout.
  */
 struct mpp_mtp {
-	struct mppcb		mpp;		/* Multipath PCB */
-	struct mptses		mpp_ses;	/* MPTCP session */
-	struct mptcb		mtcb;		/* MPTCP PCB */
+	struct mppcb            mpp;            /* Multipath PCB */
+	struct mptses           mpp_ses;        /* MPTCP session */
+	struct mptcb            mtcb;           /* MPTCP PCB */
 };
 
 #ifdef SYSCTL_DECL
@@ -395,61 +475,24 @@ SYSCTL_DECL(_net_inet_mptcp);
 
 extern struct mppcbinfo mtcbinfo;
 extern struct pr_usrreqs mptcp_usrreqs;
+extern os_log_t mptcp_log_handle;
 
 /* Encryption algorithm related definitions */
-#define	MPTCP_SHA1_RESULTLEN    20
-#define	SHA1_TRUNCATED		8
-
-/* List of valid keys to use for MPTCP connections */
-#define	MPTCP_KEY_DIGEST_LEN		(MPTCP_SHA1_RESULTLEN)
-#define	MPTCP_MX_KEY_ALLOCS		(256)
-#define	MPTCP_KEY_PREALLOCS_MX		(16)
-#define	MPTCP_MX_PREALLOC_ZONE_SZ	(8192)
-
-struct mptcp_key_entry {
-	LIST_ENTRY(mptcp_key_entry)	mkey_next;
-	mptcp_key_t			mkey_value;
-#define	MKEYF_FREE	0x0
-#define	MKEYF_INUSE	0x1
-	u_int32_t			mkey_flags;
-	char				mkey_digest[MPTCP_KEY_DIGEST_LEN];
-};
-
-/* structure for managing unique key list */
-struct mptcp_keys_pool_head {
-	struct mptcp_key_entry *lh_first;	/* list of keys */
-	u_int32_t	mkph_count;		/* total keys in pool */
-	vm_size_t	mkph_key_elm_sz;	/* size of key entry */
-	struct zone	*mkph_key_entry_zone;	/* zone for key entry */
-	decl_lck_mtx_data(, mkph_lock);		/* lock for key list */
-};
-
-/* MPTCP Receive Window */
-#define	MPTCP_RWIN_MAX	(1<<16)
-
-/* MPTCP Debugging Levels */
-#define	MP_NODEBUG		0x0
-#define	MP_ERR_DEBUG		0x1
-#define	MP_VERBOSE_DEBUG_1	0x2
-#define	MP_VERBOSE_DEBUG_2	0x3
-#define	MP_VERBOSE_DEBUG_3	0x4
-#define	MP_VERBOSE_DEBUG_4	0x5	/* output path debugging */
+#define HMAC_TRUNCATED_SYNACK          8
+#define HMAC_TRUNCATED_ACK         20
+#define HMAC_TRUNCATED_ADD_ADDR         8
 
 /* Mask to obtain 32-bit portion of data sequence number */
-#define	MPTCP_DATASEQ_LOW32_MASK	(0xffffffff)
-#define	MPTCP_DATASEQ_LOW32(seq)	(seq & MPTCP_DATASEQ_LOW32_MASK)
+#define MPTCP_DATASEQ_LOW32_MASK        (0xffffffff)
+#define MPTCP_DATASEQ_LOW32(seq)        (seq & MPTCP_DATASEQ_LOW32_MASK)
 
 /* Mask to obtain upper 32-bit portion of data sequence number */
-#define	MPTCP_DATASEQ_HIGH32_MASK	(0xffffffff00000000)
-#define	MPTCP_DATASEQ_HIGH32(seq)	(seq & MPTCP_DATASEQ_HIGH32_MASK)
+#define MPTCP_DATASEQ_HIGH32_MASK       (0xffffffff00000000)
+#define MPTCP_DATASEQ_HIGH32(seq)       (seq & MPTCP_DATASEQ_HIGH32_MASK)
 
 /* Mask to obtain 32-bit portion of data ack */
-#define	MPTCP_DATAACK_LOW32_MASK	(0xffffffff)
-#define	MPTCP_DATAACK_LOW32(ack)	(ack & MPTCP_DATAACK_LOW32_MASK)
-
-/* Mask to obtain upper 32-bit portion of data ack */
-#define	MPTCP_DATAACK_HIGH32_MASK	(0xffffffff00000000)
-#define	MPTCP_DATAACK_HIGH32(ack)	(ack & MPTCP_DATAACK_HIGH32_MASK)
+#define MPTCP_DATAACK_LOW32_MASK        (0xffffffff)
+#define MPTCP_DATAACK_LOW32(ack)        (ack & MPTCP_DATAACK_LOW32_MASK)
 
 /*
  * x is the 64-bit data sequence number, y the 32-bit data seq number to be
@@ -465,140 +508,230 @@ struct mptcp_keys_pool_head {
  * comparing against rwnd. Bogus DSNs within rwnd cannot be protected against
  * and are as weak as bogus TCP sequence numbers.
  */
-#define	MPTCP_EXTEND_DSN(x, y, z) {					\
-	if ((MPTCP_DATASEQ_LOW32(x) > y) &&				\
-	    ((((u_int32_t)MPTCP_DATASEQ_LOW32(x)) - (u_int32_t)y) >=	\
-	    (u_int32_t)(1 << 31))) {					\
-		/*							\
-		 * y wrapped around and x and y are 2**31 bytes  apart	\
-		 */							\
-		z = MPTCP_DATASEQ_HIGH32(x) + 0x100000000;		\
-		z |= y;							\
-	} else if ((MPTCP_DATASEQ_LOW32(x) < y) &&			\
-	    (((u_int32_t)y -						\
-	    ((u_int32_t)MPTCP_DATASEQ_LOW32(x))) >=			\
-	    (u_int32_t)(1 << 31))) {					\
-		/*							\
-		 * x wrapped around and x and y are 2**31 apart		\
-		 */							\
-		z = MPTCP_DATASEQ_HIGH32(x) - 0x100000000;		\
-		z |= y;							\
-	} else {							\
-		z = MPTCP_DATASEQ_HIGH32(x) | y;			\
-	}								\
+#define MPTCP_EXTEND_DSN(x, y, z) {                                     \
+	if ((MPTCP_DATASEQ_LOW32(x) > y) &&                             \
+	    ((((u_int32_t)MPTCP_DATASEQ_LOW32(x)) - (u_int32_t)y) >=    \
+	    (u_int32_t)(1U << 31))) {                                    \
+	/* \
+	 * y wrapped around and x and y are 2**31 bytes  apart \
+	 */                                                             \
+	        z = MPTCP_DATASEQ_HIGH32(x) + 0x100000000;              \
+	        z |= y;                                                 \
+	} else if ((MPTCP_DATASEQ_LOW32(x) < y) &&                      \
+	    (((u_int32_t)y -                                            \
+	    ((u_int32_t)MPTCP_DATASEQ_LOW32(x))) >=                     \
+	    (u_int32_t)(1U << 31))) {                                    \
+	/* \
+	 * x wrapped around and x and y are 2**31 apart \
+	 */                                                             \
+	        z = MPTCP_DATASEQ_HIGH32(x) - 0x100000000;              \
+	        z |= y;                                                 \
+	} else {                                                        \
+	        z = MPTCP_DATASEQ_HIGH32(x) | y;                        \
+	}                                                               \
 }
 
-#define	mptcplog(x)	do { if (mptcp_verbose >= 1) log x; } while (0)
-#define	mptcplog2(x)	do { if (mptcp_verbose >= 2) log x; } while (0)
-#define	mptcplog3(x)	do { if (mptcp_verbose >= 3) log x; } while (0)
-
-extern int mptcp_enable;	/* Multipath TCP */
-extern int mptcp_dbg;		/* Multipath TCP DBG */
-extern int mptcp_mpcap_retries;	/* Multipath TCP retries */
-extern int mptcp_join_retries;	/* Multipath TCP Join retries */
-extern int mptcp_dss_csum;	/* Multipath DSS Option checksum */
-extern int mptcp_fail_thresh;	/* Multipath failover thresh of retransmits */
+extern int mptcp_enable;        /* Multipath TCP */
+extern int mptcp_mpcap_retries; /* Multipath TCP retries */
+extern int mptcp_join_retries;  /* Multipath TCP Join retries */
+extern int mptcp_dss_csum;      /* Multipath DSS Option checksum */
+extern int mptcp_fail_thresh;   /* Multipath failover thresh of retransmits */
 extern int mptcp_subflow_keeptime; /* Multipath subflow TCP_KEEPALIVE opt */
-extern int mptcp_mpprio_enable;	/* MP_PRIO option enable/disable */
-extern int mptcp_remaddr_enable;/* REMOVE_ADDR option enable/disable */
-extern uint32_t mptcp_verbose;	/* verbose and mptcp_dbg must be unified */
-#define MPPCB_LIMIT	16
-extern uint32_t mptcp_socket_limit; /* max number of mptcp sockets allowed */
-extern int tcp_jack_rxmt;	/* Join ACK retransmission value in msecs */
+extern int mptcp_developer_mode;        /* Allow aggregation mode */
+extern uint32_t mptcp_cellicon_refcount;
+extern uint32_t mptcp_enable_v1;
+
+#define MPTCP_CELLICON_TOGGLE_RATE      (5 * TCP_RETRANSHZ) /* Only toggle every 5 seconds */
+
+extern int tcp_jack_rxmt;       /* Join ACK retransmission value in msecs */
+
+extern int mptcp_reass_total_qlen;
 
 __BEGIN_DECLS
 extern void mptcp_init(struct protosw *, struct domain *);
 extern int mptcp_ctloutput(struct socket *, struct sockopt *);
-extern struct mptses *mptcp_sescreate(struct socket *, struct mppcb *);
-extern void mptcp_drain(void);
-extern struct mptses *mptcp_drop(struct mptses *, struct mptcb *, int);
+extern int mptcp_session_create(struct mppcb *);
+extern boolean_t mptcp_ok_to_create_subflows(struct mptcb *mp_tp);
+extern void mptcp_check_subflows_and_add(struct mptses *mpte);
+extern void mptcp_check_subflows_and_remove(struct mptses *mpte);
+extern void mptcpstats_inc_switch(struct mptses *mpte, const struct mptsub *mpts);
+extern void mptcpstats_update(struct mptcp_itf_stats *stats __counted_by(stats_count), uint16_t stats_count, const struct mptsub *mpts);
+extern int mptcpstats_get_index_by_ifindex(struct mptcp_itf_stats *stats __counted_by(stats_count), uint16_t stats_count, u_short ifindex, boolean_t create);
+extern struct mptses *mptcp_drop(struct mptses *mpte, struct mptcb *mp_tp, u_short errno);
 extern struct mptses *mptcp_close(struct mptses *, struct mptcb *);
 extern int mptcp_lock(struct socket *, int, void *);
 extern int mptcp_unlock(struct socket *, int, void *);
 extern lck_mtx_t *mptcp_getlock(struct socket *, int);
-extern void mptcp_thread_signal(struct mptses *);
-extern void mptcp_flush_sopts(struct mptses *);
-extern int mptcp_setconnorder(struct mptses *, connid_t, uint32_t);
-extern int mptcp_getconnorder(struct mptses *, connid_t, uint32_t *);
+extern void mptcp_subflow_workloop(struct mptses *);
 
-extern struct mptopt *mptcp_sopt_alloc(int);
-extern const char *mptcp_sopt2str(int, int, char *, int);
+extern void mptcp_sched_create_subflows(struct mptses *);
+
+extern void mptcp_finish_usrclosed(struct mptses *mpte);
+extern struct mptopt *mptcp_sopt_alloc(void);
+extern const char *mptcp_sopt2str(int, int);
 extern void mptcp_sopt_free(struct mptopt *);
 extern void mptcp_sopt_insert(struct mptses *, struct mptopt *);
 extern void mptcp_sopt_remove(struct mptses *, struct mptopt *);
 extern struct mptopt *mptcp_sopt_find(struct mptses *, struct sockopt *);
 
-extern struct mptsub *mptcp_subflow_alloc(int);
-extern void mptcp_subflow_free(struct mptsub *);
-extern void mptcp_subflow_addref(struct mptsub *, int);
-extern int mptcp_subflow_add(struct mptses *, struct mptsub *,
-    struct proc *, uint32_t);
-extern void mptcp_subflow_del(struct mptses *, struct mptsub *, boolean_t);
-extern void mptcp_subflow_remref(struct mptsub *);
-extern int mptcp_subflow_output(struct mptses *, struct mptsub *);
-extern void mptcp_subflow_disconnect(struct mptses *, struct mptsub *,
-    boolean_t);
-extern void mptcp_subflow_sopeeloff(struct mptses *, struct mptsub *,
-    struct socket *);
-extern int mptcp_subflow_sosetopt(struct mptses *, struct socket *,
+extern int mptcp_subflow_add(struct mptses *, struct sockaddr *,
+    struct sockaddr *, uint32_t, sae_connid_t *);
+extern void mptcp_subflow_del(struct mptses *, struct mptsub *);
+
+extern void mptcp_handle_input(struct socket *so);
+#define MPTCP_SUBOUT_PROBING    0x01
+extern int mptcp_subflow_output(struct mptses *mpte, struct mptsub *mpts, int flags);
+extern void mptcp_clean_reinjectq(struct mptses *mpte);
+extern void mptcp_subflow_shutdown(struct mptses *, struct mptsub *);
+extern void mptcp_subflow_disconnect(struct mptses *, struct mptsub *);
+extern int mptcp_subflow_sosetopt(struct mptses *, struct mptsub *,
     struct mptopt *);
 extern int mptcp_subflow_sogetopt(struct mptses *, struct socket *,
     struct mptopt *);
 
 extern void mptcp_input(struct mptses *, struct mbuf *);
+extern boolean_t mptcp_can_send_more(struct mptcb *mp_tp, boolean_t ignore_reinject);
 extern int mptcp_output(struct mptses *);
 extern void mptcp_close_fsm(struct mptcb *, uint32_t);
 
-extern mptcp_token_t mptcp_get_localtoken(void *);
-extern mptcp_token_t mptcp_get_remotetoken(void *);
-
-extern u_int64_t mptcp_get_localkey(void *);
-extern u_int64_t mptcp_get_remotekey(void *);
-
-extern void mptcp_free_key(mptcp_key_t *key);
 extern void mptcp_hmac_sha1(mptcp_key_t, mptcp_key_t, u_int32_t, u_int32_t,
-    u_char*, int);
-extern void mptcp_get_hmac(mptcp_addr_id, struct mptcb *, u_char *, int);
+    u_char sha_digest[SHA1_RESULTLEN]);
+extern void mptcp_hmac_sha256(mptcp_key_t, mptcp_key_t, u_char* __sized_by(msglen), uint16_t msglen,
+    u_char sha_digest[SHA256_DIGEST_LENGTH]);
+extern void mptcp_get_mpjoin_hmac(mptcp_addr_id, struct mptcb *, u_char * __sized_by(digest_len), uint8_t digest_len);
 extern void mptcp_get_rands(mptcp_addr_id, struct mptcb *, u_int32_t *,
     u_int32_t *);
 extern void mptcp_set_raddr_rand(mptcp_addr_id, struct mptcb *, mptcp_addr_id,
     u_int32_t);
-extern u_int64_t mptcp_get_trunced_hmac(mptcp_addr_id, struct mptcb *mp_tp);
-extern int mptcp_generate_token(char *, int, caddr_t, int);
-extern int mptcp_generate_idsn(char *, int, caddr_t, int);
+extern int mptcp_init_remote_parms(struct mptcb *);
 extern boolean_t mptcp_ok_to_keepalive(struct mptcb *);
 extern void mptcp_insert_dsn(struct mppcb *, struct mbuf *);
-extern void  mptcp_output_getm_dsnmap32(struct socket *, int, uint32_t,
-    u_int32_t *, u_int32_t *, u_int16_t *, u_int64_t *);
-extern void  mptcp_output_getm_dsnmap64(struct socket *, int, uint32_t,
-    u_int64_t *, u_int32_t *, u_int16_t *);
-extern void mptcp_send_dfin(struct socket *);
+extern void mptcp_output_getm_dsnmap32(struct socket *so, int off,
+    uint32_t *dsn, uint32_t *relseq,
+    uint16_t *data_len, uint16_t *dss_csum);
+extern void mptcp_output_getm_dsnmap64(struct socket *so, int off,
+    uint64_t *dsn, uint32_t *relseq,
+    uint16_t *data_len, uint16_t *dss_csum);
+extern void mptcp_output_getm_data_level_details(struct socket *so, int off,
+    uint16_t *data_len, uint16_t *dss_csum);
 extern void mptcp_act_on_txfail(struct socket *);
-extern struct mptsub *mptcp_get_subflow(struct mptses *, struct mptsub *);
-extern int mptcp_get_map_for_dsn(struct socket *, u_int64_t, u_int32_t *);
-extern int32_t mptcp_adj_sendlen(struct socket *so, int32_t off, int32_t len);
+extern struct mptsub *mptcp_get_subflow(struct mptses *mpte, struct mptsub **preferred);
+extern int mptcp_get_map_for_dsn(struct socket *so, uint64_t dsn_fail, uint32_t *tcp_seq);
+extern int32_t mptcp_adj_sendlen(struct socket *so, int32_t off);
+extern void mptcp_sbrcv_grow(struct mptcb *mp_tp);
 extern int32_t mptcp_sbspace(struct mptcb *);
 extern void mptcp_notify_mpready(struct socket *);
 extern void mptcp_notify_mpfail(struct socket *);
 extern void mptcp_notify_close(struct socket *);
+extern boolean_t mptcp_no_rto_spike(struct socket*);
+extern int mptcp_set_notsent_lowat(struct mptses *mpte, int optval);
+extern u_int32_t mptcp_get_notsent_lowat(struct mptses *mpte);
+extern int mptcp_notsent_lowat_check(struct socket *so);
+extern void mptcp_ask_symptoms(struct mptses *mpte);
+extern void mptcp_control_register(void);
+extern mptcp_wifi_quality_t mptcp_wifi_quality_for_session(struct mptses *mpte);
+extern boolean_t symptoms_is_wifi_lossy(void);
+extern void mptcp_session_necp_cb(void *, int, uint32_t, uint32_t, bool *);
+extern struct sockaddr *mptcp_get_session_dst(struct mptses *mpte,
+    boolean_t has_v6, boolean_t has_v4);
+extern void mptcp_set_restrictions(struct socket *mp_so);
+extern void mptcp_clear_cellicon(void);
+extern void mptcp_unset_cellicon(struct mptses *mpte, struct mptsub *mpts, uint32_t val);
+extern void mptcp_reset_rexmit_state(struct tcpcb *tp);
+extern void mptcp_reset_keepalive(struct tcpcb *tp);
+extern int mptcp_validate_csum(struct tcpcb *tp, struct mbuf *m, uint64_t dsn,
+    uint32_t sseq, uint16_t dlen, uint16_t csum, int dfin);
 __END_DECLS
 
 #endif /* BSD_KERNEL_PRIVATE */
 #ifdef PRIVATE
+
 typedef struct mptcp_flow {
-	uint32_t		flow_flags;
-	connid_t		flow_cid;
+	uint64_t                flow_len;
+	uint64_t                flow_tcpci_offset;
+	uint32_t                flow_flags;
+	sae_connid_t            flow_cid;
 	struct sockaddr_storage flow_src;
 	struct sockaddr_storage flow_dst;
-	conninfo_tcp_t		flow_ci;
+	uint32_t                flow_relseq;    /* last subflow rel seq# */
+	int32_t                 flow_soerror;   /* subflow level error */
+	uint32_t                flow_probecnt;  /* number of probes sent */
+	conninfo_tcp_t          flow_ci;        /* must be the last field */
 } mptcp_flow_t;
 
 typedef struct conninfo_mptcp {
-	size_t		mptcpci_len;
-	size_t		mptcpci_nflows;
-	uint32_t	mptcpci_state;
-	mptcp_flow_t	mptcpci_flows[1];
+	uint64_t        mptcpci_len;
+	uint64_t        mptcpci_flow_offset;    /* offsetof first flow */
+	uint64_t        mptcpci_nflows;         /* number of subflows */
+	uint32_t        mptcpci_state;          /* MPTCP level state */
+	uint32_t        mptcpci_mpte_flags;     /* Session flags */
+	uint32_t        mptcpci_flags;          /* MPTCB flags */
+	uint32_t        mptcpci_ltoken;         /* local token */
+	uint32_t        mptcpci_rtoken;         /* remote token */
+	uint32_t        mptcpci_notsent_lowat;  /* NOTSENT_LOWAT */
+
+	/* Send side */
+	uint64_t        mptcpci_snduna;         /* DSN of last unacked byte */
+	uint64_t        mptcpci_sndnxt;         /* DSN of next byte to send */
+	uint64_t        mptcpci_sndmax;         /* DSN of max byte sent */
+	uint64_t        mptcpci_lidsn;          /* Local IDSN */
+	uint32_t        mptcpci_sndwnd;         /* Send window snapshot */
+
+	/* Receive side */
+	uint64_t        mptcpci_rcvnxt;         /* Next expected DSN */
+	uint64_t        mptcpci_rcvatmark;      /* Session level rcvnxt */
+	uint64_t        mptcpci_ridsn;          /* Peer's IDSN */
+	uint32_t        mptcpci_rcvwnd;         /* Receive window */
+
+	uint8_t         mptcpci_mpte_addrid;    /* last addr id */
+
+	mptcp_flow_t    mptcpci_flows[1];
 } conninfo_mptcp_t;
+
+/* Use SymptomsD notifications of wifi and cell status in subflow selection */
+#define MPTCP_KERN_CTL_NAME    "com.apple.network.advisory"
+typedef struct symptoms_advisory {
+	union {
+		uint32_t        sa_nwk_status_int;
+		struct {
+			union {
+#define SYMPTOMS_ADVISORY_NOCOMMENT     0x0000
+#define SYMPTOMS_ADVISORY_USEAPP        0xFFFF /* Very ugly workaround to avoid breaking backwards compatibility - ToDo: Fix it in +1 */
+				uint16_t        sa_nwk_status;
+				struct {
+#define SYMPTOMS_ADVISORY_WIFI_BAD     0x01
+#define SYMPTOMS_ADVISORY_WIFI_OK      0x02
+					uint8_t sa_wifi_status;
+#define SYMPTOMS_ADVISORY_CELL_BAD     0x01
+#define SYMPTOMS_ADVISORY_CELL_OK      0x02
+					uint8_t sa_cell_status;
+				};
+			};
+			uint16_t        sa_unused;
+		};
+	};
+} symptoms_advisory_t;
+
+#define MPTCP_TARGET_BASED_RSSI_THRESHOLD -75
+struct mptcp_symptoms_answer {
+	struct symptoms_advisory advisory;
+	uuid_t  uuid;
+	int32_t rssi;
+};
+
+struct mptcp_symptoms_ask_uuid {
+	uint32_t        cmd;
+#define MPTCP_SYMPTOMS_ASK_UUID         1
+	uuid_t          uuid;
+	uint32_t        priority;
+#define MPTCP_SYMPTOMS_UNKNOWN          0
+#define MPTCP_SYMPTOMS_BACKGROUND       1
+#define MPTCP_SYMPTOMS_FOREGROUND       2
+};
+
+struct kev_mptcp_data {
+	int value;
+};
 
 #endif /* PRIVATE */
 #endif /* _NETINET_MPTCP_VAR_H_ */

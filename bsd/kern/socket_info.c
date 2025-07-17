@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2005-2013 Apple Inc. All rights reserved.
+ * Copyright (c) 2005-2020 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -42,11 +42,14 @@
 #include <sys/unpcb.h>
 #include <sys/sys_domain.h>
 #include <sys/kern_event.h>
+#include <sys/vsock_domain.h>
 #include <mach/vm_param.h>
 #include <net/ndrv_var.h>
 #include <netinet/in_pcb.h>
 #include <netinet/tcp_var.h>
 #include <string.h>
+
+#include <net/sockaddr_utils.h>
 
 static void fill_sockbuf_info(struct sockbuf *sb, struct sockbuf_info *sbi);
 static void fill_common_sockinfo(struct socket *so, struct socket_info *si);
@@ -59,28 +62,30 @@ fill_sockbuf_info(struct sockbuf *sb, struct sockbuf_info *sbi)
 	sbi->sbi_mbcnt = sb->sb_mbcnt;
 	sbi->sbi_mbmax = sb->sb_mbmax;
 	sbi->sbi_lowat = sb->sb_lowat;
-	sbi->sbi_flags = sb->sb_flags;
-	sbi->sbi_timeo = (u_int32_t)(sb->sb_timeo.tv_sec * hz) +
-	    sb->sb_timeo.tv_usec / tick;
-	if (sbi->sbi_timeo == 0 && sb->sb_timeo.tv_usec != 0)
+	sbi->sbi_flags = (short)sb->sb_flags;
+	sbi->sbi_timeo = (short)((sb->sb_timeo.tv_sec * hz) +
+	    sb->sb_timeo.tv_usec / tick);
+	if (sbi->sbi_timeo == 0 && sb->sb_timeo.tv_usec != 0) {
 		sbi->sbi_timeo = 1;
+	}
 }
 
 static void
 fill_common_sockinfo(struct socket *so, struct socket_info *si)
 {
-	si->soi_so = (u_int64_t)VM_KERNEL_ADDRPERM(so);
+	si->soi_so = (u_int64_t)VM_KERNEL_ADDRHASH(so);
 	si->soi_type = so->so_type;
 	si->soi_options = (short)(so->so_options & 0xffff);
 	si->soi_linger = so->so_linger;
 	si->soi_state = so->so_state;
-	si->soi_pcb = (u_int64_t)VM_KERNEL_ADDRPERM(so->so_pcb);
+	si->soi_pcb = (u_int64_t)VM_KERNEL_ADDRHASH(so->so_pcb);
 	if (so->so_proto) {
 		si->soi_protocol = SOCK_PROTO(so);
-		if (so->so_proto->pr_domain)
+		if (so->so_proto->pr_domain) {
 			si->soi_family = SOCK_DOM(so);
-		else
+		} else {
 			si->soi_family = 0;
+		}
 	} else {
 		si->soi_protocol = si->soi_family = 0;
 	}
@@ -109,8 +114,9 @@ fill_socketinfo(struct socket *so, struct socket_info *si)
 	fill_common_sockinfo(so, si);
 
 	if (so->so_pcb == NULL || so->so_proto == 0 ||
-	    so->so_proto->pr_domain == NULL)
+	    so->so_proto->pr_domain == NULL) {
 		goto out;
+	}
 
 	/*
 	 * The kind of socket is determined by the triplet
@@ -149,16 +155,18 @@ fill_socketinfo(struct socket *so, struct socket_info *si)
 			si->soi_kind = SOCKINFO_TCP;
 
 			tcpsi->tcpsi_state = tp->t_state;
-			tcpsi->tcpsi_timer[TCPT_REXMT] =
+			tcpsi->tcpsi_timer[TSI_T_REXMT] =
 			    tp->t_timer[TCPT_REXMT];
-			tcpsi->tcpsi_timer[TCPT_PERSIST] =
+			tcpsi->tcpsi_timer[TSI_T_PERSIST] =
 			    tp->t_timer[TCPT_PERSIST];
-			tcpsi->tcpsi_timer[TCPT_KEEP] = tp->t_timer[TCPT_KEEP];
-			tcpsi->tcpsi_timer[TCPT_2MSL] = tp->t_timer[TCPT_2MSL];
+			tcpsi->tcpsi_timer[TSI_T_KEEP] =
+			    tp->t_timer[TCPT_KEEP];
+			tcpsi->tcpsi_timer[TSI_T_2MSL] =
+			    tp->t_timer[TCPT_2MSL];
 			tcpsi->tcpsi_mss = tp->t_maxseg;
 			tcpsi->tcpsi_flags = tp->t_flags;
 			tcpsi->tcpsi_tp =
-			    (u_int64_t)VM_KERNEL_ADDRPERM(tp);
+			    (u_int64_t)VM_KERNEL_ADDRHASH(tp);
 		}
 		break;
 	}
@@ -169,24 +177,28 @@ fill_socketinfo(struct socket *so, struct socket_info *si)
 		si->soi_kind = SOCKINFO_UN;
 
 		unsi->unsi_conn_pcb =
-		    (uint64_t)VM_KERNEL_ADDRPERM(unp->unp_conn);
-		if (unp->unp_conn)
+		    (uint64_t)VM_KERNEL_ADDRHASH(unp->unp_conn);
+		if (unp->unp_conn) {
 			unsi->unsi_conn_so = (uint64_t)
-			    VM_KERNEL_ADDRPERM(unp->unp_conn->unp_socket);
+			    VM_KERNEL_ADDRHASH(unp->unp_conn->unp_socket);
+		}
 
 		if (unp->unp_addr) {
-			size_t	addrlen = unp->unp_addr->sun_len;
+			size_t  addrlen = unp->unp_addr->sun_len;
 
-			if (addrlen > SOCK_MAXADDRLEN)
+			if (addrlen > SOCK_MAXADDRLEN) {
 				addrlen = SOCK_MAXADDRLEN;
-			bcopy(unp->unp_addr, &unsi->unsi_addr, addrlen);
+			}
+			SOCKADDR_COPY(unp->unp_addr, &unsi->unsi_addr.ua_sun,
+			    addrlen);
 		}
 		if (unp->unp_conn && unp->unp_conn->unp_addr) {
-			size_t	addrlen = unp->unp_conn->unp_addr->sun_len;
+			size_t  addrlen = unp->unp_conn->unp_addr->sun_len;
 
-			if (addrlen > SOCK_MAXADDRLEN)
+			if (addrlen > SOCK_MAXADDRLEN) {
 				addrlen = SOCK_MAXADDRLEN;
-			bcopy(unp->unp_conn->unp_addr, &unsi->unsi_caddr,
+			}
+			SOCKADDR_COPY(unp->unp_conn->unp_addr, &unsi->unsi_caddr.ua_sun,
 			    addrlen);
 		}
 		break;
@@ -207,6 +219,19 @@ fill_socketinfo(struct socket *so, struct socket_info *si)
 		}
 		break;
 	}
+	case PF_VSOCK: {
+		const struct vsockpcb *pcb = (struct vsockpcb *)(so)->so_pcb;
+		struct vsock_sockinfo *vsocksi = &si->soi_proto.pri_vsock;
+
+		si->soi_kind = SOCKINFO_VSOCK;
+
+		vsocksi->local_cid = pcb->local_address.cid;
+		vsocksi->local_port = pcb->local_address.port;
+		vsocksi->remote_cid = pcb->remote_address.cid;
+		vsocksi->remote_port = pcb->remote_address.port;
+
+		break;
+	}
 	case PF_SYSTEM:
 		if (SOCK_PROTO(so) == SYSPROTO_EVENT) {
 			struct kern_event_pcb *ev_pcb =
@@ -220,24 +245,8 @@ fill_socketinfo(struct socket *so, struct socket_info *si)
 			    ev_pcb->evp_vendor_code_filter;
 			kesi->kesi_class_filter = ev_pcb->evp_class_filter;
 			kesi->kesi_subclass_filter = ev_pcb->evp_subclass_filter;
-
 		} else if (SOCK_PROTO(so) == SYSPROTO_CONTROL) {
-			struct ctl_cb *kcb = (struct ctl_cb *)so->so_pcb;
-			struct kern_ctl_info *kcsi =
-			    &si->soi_proto.pri_kern_ctl;
-			struct kctl *kctl = kcb->kctl;
-
-			si->soi_kind = SOCKINFO_KERN_CTL;
-
-			if (kctl == 0)
-				break;
-			kcsi->kcsi_id = kctl->id;
-			kcsi->kcsi_reg_unit = kctl->id;
-			kcsi->kcsi_flags = kctl->flags;
-			kcsi->kcsi_recvbufsize = kctl->recvbufsize;
-			kcsi->kcsi_sendbufsize = kctl->sendbufsize;
-			kcsi->kcsi_unit = kcb->unit;
-			strlcpy(kcsi->kcsi_name, kctl->name, MAX_KCTL_NAME);
+			kctl_fill_socketinfo(so, si);
 		}
 		break;
 
@@ -249,5 +258,5 @@ fill_socketinfo(struct socket *so, struct socket_info *si)
 out:
 	socket_unlock(so, 0);
 
-	return (error);
+	return error;
 }

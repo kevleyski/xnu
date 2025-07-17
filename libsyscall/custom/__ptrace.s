@@ -49,7 +49,27 @@ LEAF(___ptrace, 0)
 	movl	%eax,(%r11)
 	UNIX_SYSCALL_NONAME(ptrace, 4, cerror)
 	ret
+	UNWIND_EPILOGUE
 
+#elif defined(__arm__)
+
+MI_ENTRY_POINT(___ptrace)
+	MI_GET_ADDRESS(ip,_errno)
+	str	r8, [sp, #-4]!
+	mov     r8, #0
+	str     r8, [ip]
+	ldr	r8, [sp], #4	
+	SYSCALL_NONAME(ptrace, 4, cerror)
+	bx		lr
+
+#elif defined(__arm64__)
+
+MI_ENTRY_POINT(___ptrace)
+	MI_GET_ADDRESS(x9,_errno)
+	str		wzr, [x9]
+	SYSCALL_NONAME(ptrace, 4, cerror)
+	ret
+	
 #else
 #error Unsupported architecture
 #endif

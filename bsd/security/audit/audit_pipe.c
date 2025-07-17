@@ -65,17 +65,17 @@ static MALLOC_DEFINE(M_AUDIT_PIPE_PRESELECT, "audit_pipe_presel",
 /*
  * Audit pipe buffer parameters.
  */
-#define	AUDIT_PIPE_QLIMIT_DEFAULT	(128)
-#define	AUDIT_PIPE_QLIMIT_MIN		(1)
-#define	AUDIT_PIPE_QLIMIT_MAX		(1024)
+#define AUDIT_PIPE_QLIMIT_DEFAULT       (128)
+#define AUDIT_PIPE_QLIMIT_MIN           (1)
+#define AUDIT_PIPE_QLIMIT_MAX           (1024)
 
 /*
  * Description of an entry in an audit_pipe.
  */
 struct audit_pipe_entry {
-	void				*ape_record;
-	u_int				 ape_record_len;
-	TAILQ_ENTRY(audit_pipe_entry)	 ape_queue;
+	void                            *ape_record;
+	u_int                            ape_record_len;
+	TAILQ_ENTRY(audit_pipe_entry)    ape_queue;
 };
 
 /*
@@ -90,28 +90,28 @@ struct audit_pipe_entry {
  * usage patterns for per-auid specifications are clear.
  */
 struct audit_pipe_preselect {
-	au_id_t					 app_auid;
-	au_mask_t				 app_mask;
-	TAILQ_ENTRY(audit_pipe_preselect)	 app_list;
+	au_id_t                                  app_auid;
+	au_mask_t                                app_mask;
+	TAILQ_ENTRY(audit_pipe_preselect)        app_list;
 };
 
 /*
  * Description of an individual audit_pipe.  Consists largely of a bounded
  * length queue.
  */
-#define	AUDIT_PIPE_ASYNC	0x00000001
-#define	AUDIT_PIPE_NBIO		0x00000002
+#define AUDIT_PIPE_ASYNC        0x00000001
+#define AUDIT_PIPE_NBIO         0x00000002
 struct audit_pipe {
-	int				 ap_open;	/* Device open? */
-	u_int				 ap_flags;
+	int                              ap_open;       /* Device open? */
+	u_int                            ap_flags;
 
-	struct selinfo			 ap_selinfo;
-	pid_t				 ap_sigio;
+	struct selinfo                   ap_selinfo;
+	pid_t                            ap_sigio;
 
 	/*
 	 * Per-pipe mutex protecting most fields in this data structure.
 	 */
-	struct mtx			 ap_mtx;
+	struct mtx                       ap_mtx;
 
 	/*
 	 * Per-pipe sleep lock serializing user-generated reads and flushes.
@@ -119,13 +119,13 @@ struct audit_pipe {
 	 * while the record remains in the queue, so we prevent other threads
 	 * from removing it using this lock.
 	 */
-	struct slck			 ap_sx;
+	struct slck                      ap_sx;
 
 	/*
 	 * Condition variable to signal when data has been delivered to a
 	 * pipe.
 	 */
-	struct cv			 ap_cv;
+	struct cv                        ap_cv;
 
 	/*
 	 * Various queue-related variables:  qlen and qlimit are a count of
@@ -134,27 +134,27 @@ struct audit_pipe {
 	 * first record in the queue.  The number of bytes available for
 	 * reading in the queue is qbyteslen - qoffset.
 	 */
-	u_int				 ap_qlen;
-	u_int				 ap_qlimit;
-	u_int				 ap_qbyteslen;
-	u_int				 ap_qoffset;
+	u_int                            ap_qlen;
+	u_int                            ap_qlimit;
+	u_int                            ap_qbyteslen;
+	u_int                            ap_qoffset;
 
 	/*
 	 * Per-pipe operation statistics.
 	 */
-	u_int64_t			 ap_inserts;	/* Records added. */
-	u_int64_t			 ap_reads;	/* Records read. */
-	u_int64_t			 ap_drops;	/* Records dropped. */
+	u_int64_t                        ap_inserts;    /* Records added. */
+	u_int64_t                        ap_reads;      /* Records read. */
+	u_int64_t                        ap_drops;      /* Records dropped. */
 
 	/*
 	 * Fields relating to pipe interest: global masks for unmatched
 	 * processes (attributable, non-attributable), and a list of specific
 	 * interest specifications by auid.
 	 */
-	int				 ap_preselect_mode;
-	au_mask_t			 ap_preselect_flags;
-	au_mask_t			 ap_preselect_naflags;
-	TAILQ_HEAD(, audit_pipe_preselect)	ap_preselect_list;
+	int                              ap_preselect_mode;
+	au_mask_t                        ap_preselect_flags;
+	au_mask_t                        ap_preselect_naflags;
+	TAILQ_HEAD(, audit_pipe_preselect)      ap_preselect_list;
 
 	/*
 	 * Current pending record list.  Protected by a combination of ap_mtx
@@ -162,27 +162,27 @@ struct audit_pipe {
 	 * remove a record from the head of the queue, as an in-progress read
 	 * may sleep while copying and therefore cannot hold ap_mtx.
 	 */
-	TAILQ_HEAD(, audit_pipe_entry)	 ap_queue;
+	TAILQ_HEAD(, audit_pipe_entry)   ap_queue;
 
 	/*
 	 * Global pipe list.
 	 */
-	TAILQ_ENTRY(audit_pipe)		 ap_list;
+	TAILQ_ENTRY(audit_pipe)          ap_list;
 };
 
-#define	AUDIT_PIPE_LOCK(ap)		mtx_lock(&(ap)->ap_mtx)
-#define	AUDIT_PIPE_LOCK_ASSERT(ap)	mtx_assert(&(ap)->ap_mtx, MA_OWNED)
-#define	AUDIT_PIPE_LOCK_DESTROY(ap)	mtx_destroy(&(ap)->ap_mtx)
-#define	AUDIT_PIPE_LOCK_INIT(ap)	mtx_init(&(ap)->ap_mtx, \
-					    "audit_pipe_mtx", NULL, MTX_DEF)
-#define	AUDIT_PIPE_UNLOCK(ap)		mtx_unlock(&(ap)->ap_mtx)
-#define	AUDIT_PIPE_MTX(ap)		(&(ap)->ap_mtx)
+#define AUDIT_PIPE_LOCK(ap)             mtx_lock(&(ap)->ap_mtx)
+#define AUDIT_PIPE_LOCK_ASSERT(ap)      mtx_assert(&(ap)->ap_mtx, MA_OWNED)
+#define AUDIT_PIPE_LOCK_DESTROY(ap)     mtx_destroy(&(ap)->ap_mtx)
+#define AUDIT_PIPE_LOCK_INIT(ap)        mtx_init(&(ap)->ap_mtx, \
+	                                    "audit_pipe_mtx", NULL, MTX_DEF)
+#define AUDIT_PIPE_UNLOCK(ap)           mtx_unlock(&(ap)->ap_mtx)
+#define AUDIT_PIPE_MTX(ap)              (&(ap)->ap_mtx)
 
-#define	AUDIT_PIPE_SX_LOCK_DESTROY(ap)	slck_destroy(&(ap)->ap_sx)
-#define	AUDIT_PIPE_SX_LOCK_INIT(ap)	slck_init(&(ap)->ap_sx, "audit_pipe_sx")
-#define	AUDIT_PIPE_SX_XLOCK_ASSERT(ap)	slck_assert(&(ap)->ap_sx, SA_XLOCKED)
-#define	AUDIT_PIPE_SX_XLOCK_SIG(ap)	slck_lock_sig(&(ap)->ap_sx)
-#define	AUDIT_PIPE_SX_XUNLOCK(ap)	slck_unlock(&(ap)->ap_sx)
+#define AUDIT_PIPE_SX_LOCK_DESTROY(ap)  slck_destroy(&(ap)->ap_sx)
+#define AUDIT_PIPE_SX_LOCK_INIT(ap)     slck_init(&(ap)->ap_sx, "audit_pipe_sx")
+#define AUDIT_PIPE_SX_XLOCK_ASSERT(ap)  slck_assert(&(ap)->ap_sx, SA_XLOCKED)
+#define AUDIT_PIPE_SX_XLOCK_SIG(ap)     slck_lock_sig(&(ap)->ap_sx)
+#define AUDIT_PIPE_SX_XUNLOCK(ap)       slck_unlock(&(ap)->ap_sx)
 
 
 /*
@@ -191,23 +191,23 @@ struct audit_pipe {
  * between threads walking the list to deliver to individual pipes and add/
  * remove of pipes, and are mostly acquired for read.
  */
-static TAILQ_HEAD(, audit_pipe)	 audit_pipe_list;
-static struct rwlock		 audit_pipe_lock;
+static TAILQ_HEAD(, audit_pipe)  audit_pipe_list;
+static struct rwlock             audit_pipe_lock;
 
-#define	AUDIT_PIPE_LIST_LOCK_INIT()	rw_init(&audit_pipe_lock, \
-					    "audit_pipe_list_lock")
-#define	AUDIT_PIPE_LIST_RLOCK()  	rw_rlock(&audit_pipe_lock)
-#define	AUDIT_PIPE_LIST_RUNLOCK()	rw_runlock(&audit_pipe_lock)
-#define	AUDIT_PIPE_LIST_WLOCK()		rw_wlock(&audit_pipe_lock)
-#define	AUDIT_PIPE_LIST_WLOCK_ASSERT()	rw_assert(&audit_pipe_lock, \
-					    RA_WLOCKED)
-#define	AUDIT_PIPE_LIST_WUNLOCK()	rw_wunlock(&audit_pipe_lock)
+#define AUDIT_PIPE_LIST_LOCK_INIT()     rw_init(&audit_pipe_lock, \
+	                                    "audit_pipe_list_lock")
+#define AUDIT_PIPE_LIST_RLOCK()         rw_rlock(&audit_pipe_lock)
+#define AUDIT_PIPE_LIST_RUNLOCK()       rw_runlock(&audit_pipe_lock)
+#define AUDIT_PIPE_LIST_WLOCK()         rw_wlock(&audit_pipe_lock)
+#define AUDIT_PIPE_LIST_WLOCK_ASSERT()  rw_assert(&audit_pipe_lock, \
+	                                    RA_WLOCKED)
+#define AUDIT_PIPE_LIST_WUNLOCK()       rw_wunlock(&audit_pipe_lock)
 
 /*
  * Cloning related variables and constants.
  */
-#define	AUDIT_PIPE_NAME		"auditpipe"
-#define	MAX_AUDIT_PIPES		32
+#define AUDIT_PIPE_NAME         "auditpipe"
+#define MAX_AUDIT_PIPES         32
 static int audit_pipe_major;
 
 /*
@@ -216,19 +216,19 @@ static int audit_pipe_major;
  *
  * XXX We may want to dynamically grow this as needed.
  */
-static struct audit_pipe	*audit_pipe_dtab[MAX_AUDIT_PIPES];
+static struct audit_pipe        *audit_pipe_dtab[MAX_AUDIT_PIPES];
 
 
 /*
  * Special device methods and definition.
  */
-static open_close_fcn_t		audit_pipe_open;
-static open_close_fcn_t		audit_pipe_close;
-static read_write_fcn_t		audit_pipe_read;
-static ioctl_fcn_t		audit_pipe_ioctl;
-static select_fcn_t		audit_pipe_poll;
+static open_close_fcn_t         audit_pipe_open;
+static open_close_fcn_t         audit_pipe_close;
+static read_write_fcn_t         audit_pipe_read;
+static ioctl_fcn_t              audit_pipe_ioctl;
+static select_fcn_t             audit_pipe_poll;
 
-static struct cdevsw audit_pipe_cdevsw = {
+static const struct cdevsw audit_pipe_cdevsw = {
 	.d_open      =          audit_pipe_open,
 	.d_close     =          audit_pipe_close,
 	.d_read      =          audit_pipe_read,
@@ -246,10 +246,10 @@ static struct cdevsw audit_pipe_cdevsw = {
 /*
  * Some global statistics on audit pipes.
  */
-static int		audit_pipe_count;	/* Current number of pipes. */
-static u_int64_t	audit_pipe_ever;	/* Pipes ever allocated. */
-static u_int64_t	audit_pipe_records;	/* Records seen. */
-static u_int64_t	audit_pipe_drops;	/* Global record drop count. */
+static int              audit_pipe_count;       /* Current number of pipes. */
+static u_int64_t        audit_pipe_ever;        /* Pipes ever allocated. */
+static u_int64_t        audit_pipe_records;     /* Records seen. */
+static u_int64_t        audit_pipe_drops;       /* Global record drop count. */
 
 /*
  * Free an audit pipe entry.
@@ -257,9 +257,8 @@ static u_int64_t	audit_pipe_drops;	/* Global record drop count. */
 static void
 audit_pipe_entry_free(struct audit_pipe_entry *ape)
 {
-
-	free(ape->ape_record, M_AUDIT_PIPE_ENTRY);
-	free(ape, M_AUDIT_PIPE_ENTRY);
+	kfree_data(ape->ape_record, ape->ape_record_len);
+	kfree_type(struct audit_pipe_entry, ape);
 }
 
 /*
@@ -273,10 +272,11 @@ audit_pipe_preselect_find(struct audit_pipe *ap, au_id_t auid)
 	AUDIT_PIPE_LOCK_ASSERT(ap);
 
 	TAILQ_FOREACH(app, &ap->ap_preselect_list, app_list) {
-		if (app->app_auid == auid)
-			return (app);
+		if (app->app_auid == auid) {
+			return app;
+		}
 	}
-	return (NULL);
+	return NULL;
 }
 
 /*
@@ -294,10 +294,11 @@ audit_pipe_preselect_get(struct audit_pipe *ap, au_id_t auid,
 	if (app != NULL) {
 		*maskp = app->app_mask;
 		error = 0;
-	} else
+	} else {
 		error = ENOENT;
+	}
 	AUDIT_PIPE_UNLOCK(ap);
-	return (error);
+	return error;
 }
 
 /*
@@ -313,7 +314,7 @@ audit_pipe_preselect_set(struct audit_pipe *ap, au_id_t auid, au_mask_t mask)
 	 * Pessimistically assume that the auid doesn't already have a mask
 	 * set, and allocate.  We will free it if it is unneeded.
 	 */
-	app_new = malloc(sizeof(*app_new), M_AUDIT_PIPE_PRESELECT, M_WAITOK);
+	app_new = kalloc_type(struct audit_pipe_preselect, Z_WAITOK | Z_NOFAIL);
 	AUDIT_PIPE_LOCK(ap);
 	app = audit_pipe_preselect_find(ap, auid);
 	if (app == NULL) {
@@ -324,8 +325,7 @@ audit_pipe_preselect_set(struct audit_pipe *ap, au_id_t auid, au_mask_t mask)
 	}
 	app->app_mask = mask;
 	AUDIT_PIPE_UNLOCK(ap);
-	if (app_new != NULL)
-		free(app_new, M_AUDIT_PIPE_PRESELECT);
+	kfree_type(struct audit_pipe_preselect, app_new);
 }
 
 /*
@@ -342,12 +342,12 @@ audit_pipe_preselect_delete(struct audit_pipe *ap, au_id_t auid)
 	if (app != NULL) {
 		TAILQ_REMOVE(&ap->ap_preselect_list, app, app_list);
 		error = 0;
-	} else
+	} else {
 		error = ENOENT;
+	}
 	AUDIT_PIPE_UNLOCK(ap);
-	if (app != NULL)
-		free(app, M_AUDIT_PIPE_PRESELECT);
-	return (error);
+	kfree_type(struct audit_pipe_preselect, app);
+	return error;
 }
 
 /*
@@ -362,14 +362,13 @@ audit_pipe_preselect_flush_locked(struct audit_pipe *ap)
 
 	while ((app = TAILQ_FIRST(&ap->ap_preselect_list)) != NULL) {
 		TAILQ_REMOVE(&ap->ap_preselect_list, app, app_list);
-		free(app, M_AUDIT_PIPE_PRESELECT);
+		kfree_type(struct audit_pipe_preselect, app);
 	}
 }
 
 static void
 audit_pipe_preselect_flush(struct audit_pipe *ap)
 {
-
 	AUDIT_PIPE_LOCK(ap);
 	audit_pipe_preselect_flush_locked(ap);
 	AUDIT_PIPE_UNLOCK(ap);
@@ -395,27 +394,29 @@ audit_pipe_preselect_check(struct audit_pipe *ap, au_id_t auid,
 
 	switch (ap->ap_preselect_mode) {
 	case AUDITPIPE_PRESELECT_MODE_TRAIL:
-		return (trail_preselect);
+		return trail_preselect;
 
 	case AUDITPIPE_PRESELECT_MODE_LOCAL:
 		app = audit_pipe_preselect_find(ap, auid);
 		if (app == NULL) {
-			if (auid == (uid_t)AU_DEFAUDITID)
-				return (au_preselect(event, class,
-				    &ap->ap_preselect_naflags, sorf));
-			else
-				return (au_preselect(event, class,
-				    &ap->ap_preselect_flags, sorf));
-		} else
-			return (au_preselect(event, class, &app->app_mask,
-			    sorf));
+			if (auid == (uid_t)AU_DEFAUDITID) {
+				return au_preselect(event, class,
+				           &ap->ap_preselect_naflags, sorf);
+			} else {
+				return au_preselect(event, class,
+				           &ap->ap_preselect_flags, sorf);
+			}
+		} else {
+			return au_preselect(event, class, &app->app_mask,
+			           sorf);
+		}
 
 	default:
 		panic("audit_pipe_preselect_check: mode %d",
 		    ap->ap_preselect_mode);
 	}
 
-	return (0);
+	return 0;
 }
 
 /*
@@ -429,22 +430,23 @@ audit_pipe_preselect(au_id_t auid, au_event_t event, au_class_t class,
 	struct audit_pipe *ap;
 
 	/* Lockless read to avoid acquiring the global lock if not needed. */
-	if (TAILQ_EMPTY(&audit_pipe_list))
-		return (0);
+	if (TAILQ_EMPTY(&audit_pipe_list)) {
+		return 0;
+	}
 
 	AUDIT_PIPE_LIST_RLOCK();
 	TAILQ_FOREACH(ap, &audit_pipe_list, ap_list) {
-		 AUDIT_PIPE_LOCK(ap);
+		AUDIT_PIPE_LOCK(ap);
 		if (audit_pipe_preselect_check(ap, auid, event, class, sorf,
 		    trail_preselect)) {
 			AUDIT_PIPE_UNLOCK(ap);
 			AUDIT_PIPE_LIST_RUNLOCK();
-			return (1);
+			return 1;
 		}
 		AUDIT_PIPE_UNLOCK(ap);
 	}
 	AUDIT_PIPE_LIST_RUNLOCK();
-	return (0);
+	return 0;
 }
 
 /*
@@ -465,16 +467,16 @@ audit_pipe_append(struct audit_pipe *ap, void *record, u_int record_len)
 		return;
 	}
 
-	ape = malloc(sizeof(*ape), M_AUDIT_PIPE_ENTRY, M_NOWAIT | M_ZERO);
+	ape = kalloc_type(struct audit_pipe_entry, Z_NOWAIT | Z_ZERO);
 	if (ape == NULL) {
 		ap->ap_drops++;
 		audit_pipe_drops++;
 		return;
 	}
 
-	ape->ape_record = malloc(record_len, M_AUDIT_PIPE_ENTRY, M_NOWAIT);
+	ape->ape_record = kalloc_data(record_len, Z_NOWAIT);
 	if (ape->ape_record == NULL) {
-		free(ape, M_AUDIT_PIPE_ENTRY);
+		kfree_type(struct audit_pipe_entry, ape);
 		ap->ap_drops++;
 		audit_pipe_drops++;
 		return;
@@ -488,13 +490,15 @@ audit_pipe_append(struct audit_pipe *ap, void *record, u_int record_len)
 	ap->ap_qlen++;
 	ap->ap_qbyteslen += ape->ape_record_len;
 	selwakeup(&ap->ap_selinfo);
-	if (ap->ap_flags & AUDIT_PIPE_ASYNC)
+	if (ap->ap_flags & AUDIT_PIPE_ASYNC) {
 		pgsigio(ap->ap_sigio, SIGIO);
+	}
 #if 0  /* XXX - fix select */
 	selwakeuppri(&ap->ap_selinfo, PSOCK);
 	KNOTE_LOCKED(&ap->ap_selinfo.si_note, 0);
-	if (ap->ap_flags & AUDIT_PIPE_ASYNC)
+	if (ap->ap_flags & AUDIT_PIPE_ASYNC) {
 		pgsigio(&ap->ap_sigio, SIGIO, 0);
+	}
 #endif
 	cv_broadcast(&ap->ap_cv);
 }
@@ -512,15 +516,17 @@ audit_pipe_submit(au_id_t auid, au_event_t event, au_class_t class, int sorf,
 	/*
 	 * Lockless read to avoid lock overhead if pipes are not in use.
 	 */
-	if (TAILQ_FIRST(&audit_pipe_list) == NULL)
+	if (TAILQ_FIRST(&audit_pipe_list) == NULL) {
 		return;
+	}
 
 	AUDIT_PIPE_LIST_RLOCK();
 	TAILQ_FOREACH(ap, &audit_pipe_list, ap_list) {
 		AUDIT_PIPE_LOCK(ap);
 		if (audit_pipe_preselect_check(ap, auid, event, class, sorf,
-		    trail_select))
+		    trail_select)) {
 			audit_pipe_append(ap, record, record_len);
+		}
 		AUDIT_PIPE_UNLOCK(ap);
 	}
 	AUDIT_PIPE_LIST_RUNLOCK();
@@ -545,8 +551,9 @@ audit_pipe_submit_user(void *record, u_int record_len)
 	/*
 	 * Lockless read to avoid lock overhead if pipes are not in use.
 	 */
-	if (TAILQ_FIRST(&audit_pipe_list) == NULL)
+	if (TAILQ_FIRST(&audit_pipe_list) == NULL) {
 		return;
+	}
 
 	AUDIT_PIPE_LIST_RLOCK();
 	TAILQ_FOREACH(ap, &audit_pipe_list, ap_list) {
@@ -571,10 +578,7 @@ audit_pipe_alloc(void)
 
 	AUDIT_PIPE_LIST_WLOCK_ASSERT();
 
-	ap = malloc(sizeof(*ap), M_AUDIT_PIPE, M_WAITOK | M_ZERO);
-	if (ap == NULL)
-		return (NULL);
-
+	ap = kalloc_type(struct audit_pipe, Z_WAITOK | Z_ZERO | Z_NOFAIL);
 	ap->ap_qlimit = AUDIT_PIPE_QLIMIT_DEFAULT;
 	TAILQ_INIT(&ap->ap_queue);
 #ifndef  __APPLE__
@@ -604,7 +608,7 @@ audit_pipe_alloc(void)
 	audit_pipe_count++;
 	audit_pipe_ever++;
 
-	return (ap);
+	return ap;
 }
 
 /*
@@ -638,7 +642,6 @@ audit_pipe_flush(struct audit_pipe *ap)
 static void
 audit_pipe_free(struct audit_pipe *ap)
 {
-
 	AUDIT_PIPE_LIST_WLOCK_ASSERT();
 	AUDIT_PIPE_LOCK_ASSERT(ap);
 
@@ -652,7 +655,7 @@ audit_pipe_free(struct audit_pipe *ap)
 	knlist_destroy(&ap->ap_selinfo.si_note);
 #endif
 	TAILQ_REMOVE(&audit_pipe_list, ap, ap_list);
-	free(ap, M_AUDIT_PIPE);
+	kfree_type(struct audit_pipe, ap);
 	audit_pipe_count--;
 }
 
@@ -666,19 +669,21 @@ audit_pipe_clone(__unused dev_t dev, int action)
 	int i;
 
 	if (action == DEVFS_CLONE_ALLOC) {
-		for(i = 0; i < MAX_AUDIT_PIPES; i++)
-			if (audit_pipe_dtab[i] == NULL)
-				return (i);
+		for (i = 0; i < MAX_AUDIT_PIPES; i++) {
+			if (audit_pipe_dtab[i] == NULL) {
+				return i;
+			}
+		}
 
 		/*
 		 * XXX Should really return -1 here but that seems to hang
 		 * things in devfs.  Instead return 0 and let _open() tell
 		 * userland the bad news.
 		 */
-		return (0);
+		return 0;
 	}
 
-	return (-1);
+	return -1;
 }
 
 /*
@@ -687,15 +692,16 @@ audit_pipe_clone(__unused dev_t dev, int action)
  * review access.  Those file permissions should be managed carefully.
  */
 static int
-audit_pipe_open(dev_t dev, __unused int flags,  __unused int devtype,
+audit_pipe_open(dev_t dev, __unused int flags, __unused int devtype,
     __unused proc_t p)
 {
 	struct audit_pipe *ap;
 	int u;
 
 	u = minor(dev);
-	if (u < 0 || u > MAX_AUDIT_PIPES)
-		return (ENXIO);
+	if (u < 0 || u >= MAX_AUDIT_PIPES) {
+		return ENXIO;
+	}
 
 	AUDIT_PIPE_LIST_WLOCK();
 	ap = audit_pipe_dtab[u];
@@ -703,20 +709,20 @@ audit_pipe_open(dev_t dev, __unused int flags,  __unused int devtype,
 		ap = audit_pipe_alloc();
 		if (ap == NULL) {
 			AUDIT_PIPE_LIST_WUNLOCK();
-			return (ENOMEM);
+			return ENOMEM;
 		}
 		audit_pipe_dtab[u] = ap;
 	} else {
 		KASSERT(ap->ap_open, ("audit_pipe_open: ap && !ap_open"));
 		AUDIT_PIPE_LIST_WUNLOCK();
-		return (EBUSY);
+		return EBUSY;
 	}
 	ap->ap_open = 1;
 	AUDIT_PIPE_LIST_WUNLOCK();
 #ifndef __APPLE__
-	fsetown(td->td_proc->p_pid, &ap->ap_sigio);
+	proc_getpid(fsetown(td->td_proc), &ap->ap_sigio);
 #endif
-	return (0);
+	return 0;
 }
 
 /*
@@ -743,7 +749,7 @@ audit_pipe_close(dev_t dev, __unused int flags, __unused int devtype,
 	audit_pipe_free(ap);
 	audit_pipe_dtab[u] = NULL;
 	AUDIT_PIPE_LIST_WUNLOCK();
-	return (0);
+	return 0;
 }
 
 /*
@@ -771,10 +777,11 @@ audit_pipe_ioctl(dev_t dev, u_long cmd, caddr_t data,
 	switch (cmd) {
 	case FIONBIO:
 		AUDIT_PIPE_LOCK(ap);
-		if (*(int *)data)
+		if (*(int *)data) {
 			ap->ap_flags |= AUDIT_PIPE_NBIO;
-		else
+		} else {
 			ap->ap_flags &= ~AUDIT_PIPE_NBIO;
+		}
 		AUDIT_PIPE_UNLOCK(ap);
 		error = 0;
 		break;
@@ -788,10 +795,11 @@ audit_pipe_ioctl(dev_t dev, u_long cmd, caddr_t data,
 
 	case FIOASYNC:
 		AUDIT_PIPE_LOCK(ap);
-		if (*(int *)data)
+		if (*(int *)data) {
 			ap->ap_flags |= AUDIT_PIPE_ASYNC;
-		else
+		} else {
 			ap->ap_flags &= ~AUDIT_PIPE_ASYNC;
+		}
 		AUDIT_PIPE_UNLOCK(ap);
 		error = 0;
 		break;
@@ -823,8 +831,9 @@ audit_pipe_ioctl(dev_t dev, u_long cmd, caddr_t data,
 		    *(u_int *)data <= AUDIT_PIPE_QLIMIT_MAX) {
 			ap->ap_qlimit = *(u_int *)data;
 			error = 0;
-		} else
+		} else {
 			error = EINVAL;
+		}
 		break;
 
 	case AUDITPIPE_GET_QLIMIT_MIN:
@@ -917,8 +926,9 @@ audit_pipe_ioctl(dev_t dev, u_long cmd, caddr_t data,
 		break;
 
 	case AUDITPIPE_FLUSH:
-		if (AUDIT_PIPE_SX_XLOCK_SIG(ap) != 0)
-			return (EINTR);
+		if (AUDIT_PIPE_SX_XLOCK_SIG(ap) != 0) {
+			return EINTR;
+		}
 		AUDIT_PIPE_LOCK(ap);
 		audit_pipe_flush(ap);
 		AUDIT_PIPE_UNLOCK(ap);
@@ -954,7 +964,7 @@ audit_pipe_ioctl(dev_t dev, u_long cmd, caddr_t data,
 	default:
 		error = ENOTTY;
 	}
-	return (error);
+	return error;
 }
 
 /*
@@ -976,20 +986,21 @@ audit_pipe_read(dev_t dev, struct uio *uio, __unused int flag)
 	 * We hold an sleep lock over read and flush because we rely on the
 	 * stability of a record in the queue during uiomove(9).
 	 */
-	if (AUDIT_PIPE_SX_XLOCK_SIG(ap) != 0)
-		return (EINTR);
+	if (AUDIT_PIPE_SX_XLOCK_SIG(ap) != 0) {
+		return EINTR;
+	}
 	AUDIT_PIPE_LOCK(ap);
 	while (TAILQ_EMPTY(&ap->ap_queue)) {
 		if (ap->ap_flags & AUDIT_PIPE_NBIO) {
 			AUDIT_PIPE_UNLOCK(ap);
 			AUDIT_PIPE_SX_XUNLOCK(ap);
-			return (EAGAIN);
+			return EAGAIN;
 		}
 		error = cv_wait_sig(&ap->ap_cv, AUDIT_PIPE_MTX(ap));
 		if (error) {
 			AUDIT_PIPE_UNLOCK(ap);
 			AUDIT_PIPE_SX_XUNLOCK(ap);
-			return (error);
+			return error;
 		}
 	}
 
@@ -1014,7 +1025,7 @@ audit_pipe_read(dev_t dev, struct uio *uio, __unused int flag)
 		    toread, uio);
 		if (error) {
 			AUDIT_PIPE_SX_XUNLOCK(ap);
-			return (error);
+			return error;
 		}
 
 		/*
@@ -1037,7 +1048,7 @@ audit_pipe_read(dev_t dev, struct uio *uio, __unused int flag)
 	}
 	AUDIT_PIPE_UNLOCK(ap);
 	AUDIT_PIPE_SX_XUNLOCK(ap);
-	return (0);
+	return 0;
 }
 
 /*
@@ -1055,53 +1066,15 @@ audit_pipe_poll(dev_t dev, int events, void *wql, struct proc *p)
 
 	if (events & (POLLIN | POLLRDNORM)) {
 		AUDIT_PIPE_LOCK(ap);
-		if (TAILQ_FIRST(&ap->ap_queue) != NULL)
+		if (TAILQ_FIRST(&ap->ap_queue) != NULL) {
 			revents |= events & (POLLIN | POLLRDNORM);
-		else
+		} else {
 			selrecord(p, &ap->ap_selinfo, wql);
+		}
 		AUDIT_PIPE_UNLOCK(ap);
 	}
-	return (revents);
+	return revents;
 }
-
-#ifndef __APPLE__
-/*
- * Return true if there are records available for reading on the pipe.
- */
-static int
-audit_pipe_kqread(struct knote *kn, long hint)
-{
-	struct audit_pipe *ap;
-
-	ap = (struct audit_pipe *)kn->kn_hook;
-	KASSERT(ap != NULL, ("audit_pipe_kqread: ap == NULL"));
-	AUDIT_PIPE_LOCK_ASSERT(ap);
-
-	if (ap->ap_qlen != 0) {
-		kn->kn_data = ap->ap_qbyteslen - ap->ap_qoffset;
-		return (1);
-	} else {
-		kn->kn_data = 0;
-		return (0);
-	}
-}
-
-/*
- * Detach kqueue state from audit pipe.
- */
-static void
-audit_pipe_kqdetach(struct knote *kn)
-{
-	struct audit_pipe *ap;
-
-	ap = (struct audit_pipe *)kn->kn_hook;
-	KASSERT(ap != NULL, ("audit_pipe_kqdetach: ap == NULL"));
-
-	AUDIT_PIPE_LOCK(ap);
-	knlist_remove(&ap->ap_selinfo.si_note, kn, 1);
-	AUDIT_PIPE_UNLOCK(ap);
-}
-#endif /* !__APPLE__ */
 
 static void *devnode;
 
@@ -1114,28 +1087,29 @@ audit_pipe_init(void)
 	AUDIT_PIPE_LIST_LOCK_INIT();
 
 	audit_pipe_major = cdevsw_add(-1, &audit_pipe_cdevsw);
-	if (audit_pipe_major < 0)
-	  return (KERN_FAILURE);
+	if (audit_pipe_major < 0) {
+		return KERN_FAILURE;
+	}
 
 	dev = makedev(audit_pipe_major, 0);
 	devnode = devfs_make_node_clone(dev, DEVFS_CHAR, UID_ROOT, GID_WHEEL,
-	    0600, audit_pipe_clone, "auditpipe", 0);
+	    0600, audit_pipe_clone, "auditpipe");
 
-	if (devnode == NULL)
-		return (KERN_FAILURE);
+	if (devnode == NULL) {
+		return KERN_FAILURE;
+	}
 
-	return (KERN_SUCCESS);
+	return KERN_SUCCESS;
 }
 
 int
 audit_pipe_shutdown(void)
 {
-
 	/* unwind everything */
 	devfs_remove(devnode);
 	(void) cdevsw_remove(audit_pipe_major, &audit_pipe_cdevsw);
 
-	return (KERN_SUCCESS);
+	return KERN_SUCCESS;
 }
 
 #endif /* CONFIG_AUDIT */

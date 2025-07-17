@@ -2,7 +2,7 @@
  * Copyright (c) 1998-2012 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
- * 
+ *
  * This file contains Original Code and/or Modifications of Original Code
  * as defined in and that are subject to the Apple Public Source License
  * Version 2.0 (the 'License'). You may not use this file except in
@@ -11,10 +11,10 @@
  * unlawful or unlicensed copies of an Apple operating system, or to
  * circumvent, violate, or enable the circumvention or violation of, any
  * terms of an Apple operating system software license agreement.
- * 
+ *
  * Please obtain a copy of the License at
  * http://www.opensource.apple.com/apsl/ and read it before using this file.
- * 
+ *
  * The Original Code and all software distributed under the License are
  * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
@@ -22,11 +22,11 @@
  * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
  * Please see the License for the specific language governing rights and
  * limitations under the License.
- * 
+ *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
 /*
- * Copyright (c) 1998 Apple Inc.  All rights reserved. 
+ * Copyright (c) 1998 Apple Inc.  All rights reserved.
  *
  * HISTORY
  *
@@ -38,16 +38,19 @@
  * Version 2.0.
  */
 
+#define IOKIT_ENABLE_SHARED_PTR
+
 extern "C" {
-#include <machine/machine_routines.h>
 #include <libkern/kernel_mach_header.h>
 #include <kern/host.h>
 #include <security/mac_data.h>
 };
 
+#include <machine/machine_routines.h>
 #include <libkern/c++/OSContainers.h>
 #include <libkern/c++/OSUnserialize.h>
 #include <libkern/c++/OSKext.h>
+#include <libkern/c++/OSSharedPtr.h>
 #include <libkern/OSKextLibPrivate.h>
 #include <libkern/OSDebug.h>
 
@@ -57,6 +60,7 @@ extern "C" {
 
 #include <IOKit/IOLib.h>
 #include <IOKit/assert.h>
+#include <IOKit/IOKitKeysPrivate.h>
 
 #if PRAGMA_MARK
 #pragma mark Internal Declarations
@@ -64,11 +68,13 @@ extern "C" {
 /*********************************************************************
 *********************************************************************/
 
-IOCatalogue    * gIOCatalogue;
-const OSSymbol * gIOClassKey;
-const OSSymbol * gIOProbeScoreKey;
-const OSSymbol * gIOModuleIdentifierKey;
-IORWLock         * gIOCatalogLock;
+OSSharedPtr<IOCatalogue> gIOCatalogue;
+OSSharedPtr<const OSSymbol> gIOClassKey;
+OSSharedPtr<const OSSymbol> gIOProbeScoreKey;
+OSSharedPtr<const OSSymbol> gIOModuleIdentifierKey;
+OSSharedPtr<const OSSymbol> gIOModuleIdentifierKernelKey;
+OSSharedPtr<const OSSymbol> gIOHIDInterfaceClassName;
+IORWLock       * gIOCatalogLock;
 
 #if PRAGMA_MARK
 #pragma mark Utility functions
@@ -83,196 +89,310 @@ IORWLock         * gIOCatalogLock;
 #define super OSObject
 OSDefineMetaClassAndStructors(IOCatalogue, OSObject)
 
+static bool isModuleLoadedNoOSKextLock(OSDictionary *theKexts,
+    OSDictionary *theModuleDict);
+
+
 /*********************************************************************
 *********************************************************************/
-void IOCatalogue::initialize(void)
+void
+IOCatalogue::initialize(void)
 {
-    OSArray              * array;
-    OSString             * errorString;
-    bool		   rc;
+	OSSharedPtr<OSArray> array;
+	OSSharedPtr<OSString> errorString;
+	bool                   rc;
 
-    extern const char * gIOKernelConfigTables;
+	extern const char * gIOKernelConfigTables;
 
-    array = OSDynamicCast(OSArray, OSUnserialize(gIOKernelConfigTables, &errorString));
-    if (!array && errorString) {
-        IOLog("KernelConfigTables syntax error: %s\n",
-            errorString->getCStringNoCopy());
-        errorString->release();
-    }
+	array = OSDynamicPtrCast<OSArray>(OSUnserialize(gIOKernelConfigTables, errorString));
+	if (!array && errorString) {
+		IOLog("KernelConfigTables syntax error: %s\n",
+		    errorString->getCStringNoCopy());
+	}
 
-    gIOClassKey              = OSSymbol::withCStringNoCopy( kIOClassKey );
-    gIOProbeScoreKey 	     = OSSymbol::withCStringNoCopy( kIOProbeScoreKey );
-    gIOModuleIdentifierKey   = OSSymbol::withCStringNoCopy( kCFBundleIdentifierKey );
+	gIOClassKey                  = OSSymbol::withCStringNoCopy( kIOClassKey );
+	gIOProbeScoreKey             = OSSymbol::withCStringNoCopy( kIOProbeScoreKey );
+	gIOModuleIdentifierKey       = OSSymbol::withCStringNoCopy( kCFBundleIdentifierKey );
+	gIOModuleIdentifierKernelKey = OSSymbol::withCStringNoCopy( kCFBundleIdentifierKernelKey );
+	gIOHIDInterfaceClassName     = OSSymbol::withCStringNoCopy( "IOHIDInterface" );
 
-    assert( array && gIOClassKey && gIOProbeScoreKey 
+
+	assert( array && gIOClassKey && gIOProbeScoreKey
 	    && gIOModuleIdentifierKey);
 
-    gIOCatalogue = new IOCatalogue;
-    assert(gIOCatalogue);
-    rc = gIOCatalogue->init(array);
-    assert(rc);
-    array->release();
+	gIOCatalogue = OSMakeShared<IOCatalogue>();
+	assert(gIOCatalogue);
+	rc = gIOCatalogue->init(array.get());
+	assert(rc);
 }
 
 /*********************************************************************
 * Initialize the IOCatalog object.
 *********************************************************************/
-OSArray * IOCatalogue::arrayForPersonality(OSDictionary * dict)
+OSArray *
+IOCatalogue::arrayForPersonality(OSDictionary * dict)
 {
-    const OSSymbol * sym;
+	const OSSymbol * sym;
 
-    sym = OSDynamicCast(OSSymbol, dict->getObject(gIOProviderClassKey));
-    if (!sym) 	return (0);
-
-    return ((OSArray *) personalities->getObject(sym));
-}
-
-void IOCatalogue::addPersonality(OSDictionary * dict)
-{
-    const OSSymbol * sym;
-    OSArray * arr;
-
-    sym = OSDynamicCast(OSSymbol, dict->getObject(gIOProviderClassKey));
-    if (!sym) return;
-    arr = (OSArray *) personalities->getObject(sym);
-    if (arr) arr->setObject(dict);
-    else
-    {
-        arr = OSArray::withObjects((const OSObject **)&dict, 1, 2);
-        personalities->setObject(sym, arr);
-        arr->release();
-    }
-}
-
-/*********************************************************************
-* Initialize the IOCatalog object.
-*********************************************************************/
-bool IOCatalogue::init(OSArray * initArray)
-{
-    OSDictionary         * dict;
-    OSObject * obj;
-
-    if ( !super::init() )
-        return false;
-
-    generation = 1;
-    
-    personalities = OSDictionary::withCapacity(32);
-    personalities->setOptions(OSCollection::kSort, OSCollection::kSort);
-    for (unsigned int idx = 0; (obj = initArray->getObject(idx)); idx++)
-    {
-	dict = OSDynamicCast(OSDictionary, obj);
-	if (!dict) continue;
-	OSKext::uniquePersonalityProperties(dict);
-        if( 0 == dict->getObject( gIOClassKey ))
-        {
-            IOLog("Missing or bad \"%s\" key\n",
-                    gIOClassKey->getCStringNoCopy());
-	    continue;
+	sym = OSDynamicCast(OSSymbol, dict->getObject(gIOProviderClassKey));
+	if (!sym) {
+		return NULL;
 	}
-	dict->setObject("KernelConfigTable", kOSBooleanTrue);
-        addPersonality(dict);
-    }
 
-    gIOCatalogLock = IORWLockAlloc();
-    lock = gIOCatalogLock;
+	return (OSArray *) personalities->getObject(sym);
+}
 
-    return true;
+void
+IOCatalogue::addPersonality(OSDictionary * dict)
+{
+	const OSSymbol * sym;
+	OSArray * arr;
+
+	sym = OSDynamicCast(OSSymbol, dict->getObject(gIOProviderClassKey));
+	if (!sym) {
+		return;
+	}
+	arr = (OSArray *) personalities->getObject(sym);
+	if (arr) {
+		arr->setObject(dict);
+	} else {
+		OSSharedPtr<OSArray> sharedArr = OSArray::withObjects((const OSObject **)&dict, 1, 2);
+		personalities->setObject(sym, sharedArr.get());
+	}
+}
+
+/*********************************************************************
+* Initialize the IOCatalog object.
+*********************************************************************/
+bool
+IOCatalogue::init(OSArray * initArray)
+{
+	OSDictionary         * dict;
+	OSObject * obj;
+
+	if (!super::init()) {
+		return false;
+	}
+
+	generation = 1;
+
+	personalities = OSDictionary::withCapacity(32);
+	personalities->setOptions(OSCollection::kSort, OSCollection::kSort);
+	for (unsigned int idx = 0; (obj = initArray->getObject(idx)); idx++) {
+		dict = OSDynamicCast(OSDictionary, obj);
+		if (!dict) {
+			continue;
+		}
+		OSKext::uniquePersonalityProperties(dict);
+		if (NULL == dict->getObject( gIOClassKey.get())) {
+			IOLog("Missing or bad \"%s\" key\n",
+			    gIOClassKey->getCStringNoCopy());
+			continue;
+		}
+		dict->setObject("KernelConfigTable", kOSBooleanTrue);
+		addPersonality(dict);
+	}
+
+	gIOCatalogLock = IORWLockAlloc();
+	lock = gIOCatalogLock;
+
+	return true;
 }
 
 /*********************************************************************
 * Release all resources used by IOCatalogue and deallocate.
 * This will probably never be called.
 *********************************************************************/
-void IOCatalogue::free( void )
+void
+IOCatalogue::free( void )
 {
-    panic("");
+	panic("");
 }
 
 /*********************************************************************
 *********************************************************************/
-OSOrderedSet *
+OSPtr<OSOrderedSet>
 IOCatalogue::findDrivers(
-    IOService * service,
-    SInt32 * generationCount)
+	IOService * service,
+	SInt32 * generationCount)
 {
-    OSDictionary         * nextTable;
-    OSOrderedSet         * set;
-    OSArray              * array;
-    const OSMetaClass    * meta;
-    unsigned int           idx;
+	OSDictionary         * nextTable;
+	OSSharedPtr<OSOrderedSet> set;
+	OSArray              * array;
+	const OSMetaClass    * meta;
+	unsigned int           idx;
 
-    set = OSOrderedSet::withCapacity( 1, IOServiceOrdering,
-                                      (void *)gIOProbeScoreKey );
-    if( !set )
-	return( 0 );
-
-    IORWLockRead(lock);
-
-    meta = service->getMetaClass();
-    while (meta)
-    {
-    	array = (OSArray *) personalities->getObject(meta->getClassNameSymbol());
-	if (array) for (idx = 0; (nextTable = (OSDictionary *) array->getObject(idx)); idx++)
-	{
-            set->setObject(nextTable);
+	set = OSOrderedSet::withCapacity( 1, IOServiceOrdering,
+	    (void *)(gIOProbeScoreKey.get()));
+	if (!set) {
+		return NULL;
 	}
-	if (meta == &IOService::gMetaClass) break;
-	meta = meta->getSuperClass();
-    }
 
-    *generationCount = getGenerationCount();
+	IORWLockRead(lock);
 
-    IORWLockUnlock(lock);
+	meta = service->getMetaClass();
+	while (meta) {
+		array = (OSArray *) personalities->getObject(meta->getClassNameSymbol());
+		if (array) {
+			for (idx = 0; (nextTable = (OSDictionary *) array->getObject(idx)); idx++) {
+				set->setObject(nextTable);
+			}
+		}
+		if (meta == &IOService::gMetaClass) {
+			break;
+		}
+		meta = meta->getSuperClass();
+	}
 
-    return( set );
+	*generationCount = getGenerationCount();
+
+	IORWLockUnlock(lock);
+
+	return set;
 }
 
 /*********************************************************************
 * Is personality already in the catalog?
 *********************************************************************/
-OSOrderedSet *
+OSPtr<OSOrderedSet>
 IOCatalogue::findDrivers(
-    OSDictionary * matching,
-    SInt32 * generationCount)
+	OSDictionary * matching,
+	SInt32 * generationCount)
 {
-    OSCollectionIterator * iter;
-    OSDictionary         * dict;
-    OSOrderedSet         * set;
-    OSArray              * array;
-    const OSSymbol       * key;
-    unsigned int           idx;
+	OSSharedPtr<OSCollectionIterator> iter;
+	OSDictionary         * dict;
+	OSSharedPtr<OSOrderedSet> set;
+	OSArray              * array;
+	const OSSymbol       * key;
+	unsigned int           idx;
 
-    OSKext::uniquePersonalityProperties(matching);
+	OSKext::uniquePersonalityProperties(matching);
 
-    set = OSOrderedSet::withCapacity( 1, IOServiceOrdering,
-                                      (void *)gIOProbeScoreKey );
-    if (!set) return (0);
-    iter = OSCollectionIterator::withCollection(personalities);
-    if (!iter) 
-    {
-    	set->release();
-    	return (0);
-    }
-
-    IORWLockRead(lock);
-    while ((key = (const OSSymbol *) iter->getNextObject()))
-    {
-        array = (OSArray *) personalities->getObject(key);
-        if (array) for (idx = 0; (dict = (OSDictionary *) array->getObject(idx)); idx++)
-        {
-	   /* This comparison must be done with only the keys in the
-	    * "matching" dict to enable general searches.
-	    */
-	    if ( dict->isEqualTo(matching, matching) )
-		set->setObject(dict);
+	set = OSOrderedSet::withCapacity( 1, IOServiceOrdering,
+	    (void *)(gIOProbeScoreKey.get()));
+	if (!set) {
+		return NULL;
 	}
-    }
-    *generationCount = getGenerationCount();
-    IORWLockUnlock(lock);
+	iter = OSCollectionIterator::withCollection(personalities.get());
+	if (!iter) {
+		return nullptr;
+	}
 
-    iter->release();
-    return set;
+	IORWLockRead(lock);
+	while ((key = (const OSSymbol *) iter->getNextObject())) {
+		array = (OSArray *) personalities->getObject(key);
+		if (array) {
+			for (idx = 0; (dict = (OSDictionary *) array->getObject(idx)); idx++) {
+				/* This comparison must be done with only the keys in the
+				 * "matching" dict to enable general searches.
+				 */
+				if (dict->isEqualTo(matching, matching)) {
+					set->setObject(dict);
+				}
+			}
+		}
+	}
+	*generationCount = getGenerationCount();
+	IORWLockUnlock(lock);
+
+	return set;
+}
+
+bool
+IOCatalogue::exchangeDrivers(
+	OSDictionary *matchingForRemove,
+	OSArray *personalitiesToAdd,
+	bool doNubMatching)
+{
+	OSSharedPtr<OSOrderedSet> set;
+	OSSharedPtr<OSCollectionIterator> iter_new, iter_all_personalities;
+
+	set = OSOrderedSet::withCapacity(10, IOServiceOrdering,
+	    (void *)(gIOProbeScoreKey.get()));
+	if (!set) {
+		goto finish;
+	}
+
+	iter_new = OSCollectionIterator::withCollection(personalitiesToAdd);
+	if (!iter_new) {
+		goto finish;
+	}
+
+	IORWLockWrite(lock);
+
+	iter_all_personalities = OSCollectionIterator::withCollection(personalities.get());
+	if (!iter_all_personalities) {
+		IORWLockUnlock(lock);
+		goto finish;
+	}
+
+	/*
+	 * Remove personalities first.
+	 * We get a dictionary that has only some keys that could belong to a personality.
+	 * Every personality that will match those keys will be removed.
+	 */
+	const OSSymbol * key;
+	while ((key = (const OSSymbol *) iter_all_personalities->getNextObject())) {
+		OSArray *array = (OSArray *) personalities->getObject(key);
+		if (array) {
+			unsigned int idx;
+			OSDictionary *dict;
+			for (idx = 0; (dict = (OSDictionary *) array->getObject(idx)); idx++) {
+				if (dict->isEqualTo(matchingForRemove, matchingForRemove)) {
+					set->setObject(dict);
+					array->removeObject(idx);
+					idx--;
+				}
+			}
+		}
+	}
+
+	/*
+	 * Add new personalities.
+	 */
+	OSObject *object;
+	while ((object = iter_new->getNextObject())) {
+		OSDictionary * personality = OSDynamicCast(OSDictionary, object);
+		if (personality) {
+			OSKext::uniquePersonalityProperties(personality);
+			OSArray * array = arrayForPersonality(personality);
+			if (!array) {
+				addPersonality(personality);
+			} else {
+				SInt count = array->getCount();
+				while (count--) {
+					OSDictionary * driver;
+					// Be sure not to double up on personalities.
+					driver = (OSDictionary *)array->getObject(count);
+					/* Unlike in other functions, this comparison must be exact!
+					 * The catalogue must be able to contain personalities that
+					 * are proper supersets of others.
+					 * Do not compare just the properties present in one driver
+					 * personality or the other.
+					 */
+					if (personality->isEqualTo(driver)) {
+						break;
+					}
+				}
+				if (count >= 0) {
+					// its a dup
+					continue;
+				}
+				array->setObject(personality);
+			}
+			set->setObject(personality);
+		}
+	}
+
+	if (doNubMatching && (set->getCount() > 0)) {
+		IOService::catalogNewDrivers(set.get());
+		generation++;
+	}
+
+	IORWLockUnlock(lock);
+
+finish:
+	return true;
 }
 
 /*********************************************************************
@@ -287,100 +407,142 @@ IOCatalogue::findDrivers(
 * xxx - during safe boot. That would be better implemented here.
 *********************************************************************/
 
-bool IOCatalogue::addDrivers(
-    OSArray * drivers,
-    bool doNubMatching)
+bool
+IOCatalogue::addDrivers(
+	OSArray * drivers,
+	bool doNubMatching)
 {
-    bool                   result = false;
-    OSCollectionIterator * iter = NULL;       // must release
-    OSOrderedSet         * set = NULL;        // must release
-    OSObject             * object = NULL;       // do not release
-    OSArray              * persons = NULL;    // do not release
-    
-    persons = OSDynamicCast(OSArray, drivers);
-    if (!persons) {
-        goto finish;
-    }
-    
-    set = OSOrderedSet::withCapacity( 10, IOServiceOrdering,
-        (void *)gIOProbeScoreKey );
-    if (!set) {
-        goto finish;
-    }
+	bool                   result = false;
+	OSSharedPtr<OSOrderedSet> set;
+	OSSharedPtr<OSCollectionIterator> iter;
+	OSObject             * object = NULL;   // do not release
+	OSArray              * persons = NULL;// do not release
 
-    iter = OSCollectionIterator::withCollection(persons);
-    if (!iter) {
-        goto finish;
-    }
+	persons = OSDynamicCast(OSArray, drivers);
+	if (!persons) {
+		goto finish;
+	}
 
-   /* Start with success; clear it on an error.
-    */
-    result = true;
+	set = OSOrderedSet::withCapacity( 10, IOServiceOrdering,
+	    (void *)(gIOProbeScoreKey.get()));
+	if (!set) {
+		goto finish;
+	}
 
-    IORWLockWrite(lock);
-    while ( (object = iter->getNextObject()) ) {
-    
-        // xxx Deleted OSBundleModuleDemand check; will handle in other ways for SL
+	iter = OSCollectionIterator::withCollection(persons);
+	if (!iter) {
+		goto finish;
+	}
 
-        OSDictionary * personality = OSDynamicCast(OSDictionary, object);
+	/* Start with success; clear it on an error.
+	 */
+	result = true;
 
-        SInt count;
+	IORWLockWrite(lock);
+	while ((object = iter->getNextObject())) {
+		// xxx Deleted OSBundleModuleDemand check; will handle in other ways for SL
 
-        if (!personality) {
-            IOLog("IOCatalogue::addDrivers() encountered non-dictionary; bailing.\n");
-            result = false;
-            break;
-        }
+		OSDictionary * personality = OSDynamicCast(OSDictionary, object);
 
-        OSKext::uniquePersonalityProperties(personality);
+		SInt count;
 
-        // Add driver personality to catalogue.
-
-	OSArray * array = arrayForPersonality(personality);
-	if (!array) addPersonality(personality);
-	else
-	{       
-	    count = array->getCount();
-	    while (count--) {
-		OSDictionary * driver;
-		
-		// Be sure not to double up on personalities.
-		driver = (OSDictionary *)array->getObject(count);
-		
-	       /* Unlike in other functions, this comparison must be exact!
-		* The catalogue must be able to contain personalities that
-		* are proper supersets of others.
-		* Do not compare just the properties present in one driver
-		* personality or the other.
-		*/
-		if (personality->isEqualTo(driver)) {
-		    break;
+		if (!personality) {
+			IOLog("IOCatalogue::addDrivers() encountered non-dictionary; bailing.\n");
+			result = false;
+			break;
 		}
-	    }
-	    if (count >= 0) {
-		// its a dup
-		continue;
-	    }
-	    result = array->setObject(personality);
-	    if (!result) {
-		break;
-	    }
-        }
 
-	set->setObject(personality);        
-    }
-    // Start device matching.
-    if (result && doNubMatching && (set->getCount() > 0)) {
-        IOService::catalogNewDrivers(set);
-        generation++;
-    }
-    IORWLockUnlock(lock);
+		OSKext::uniquePersonalityProperties(personality);
+
+		// Add driver personality to catalogue.
+
+		OSArray * array = arrayForPersonality(personality);
+		if (!array) {
+			addPersonality(personality);
+		} else {
+			count = array->getCount();
+			while (count--) {
+				OSDictionary * driver;
+
+				// Be sure not to double up on personalities.
+				driver = (OSDictionary *)array->getObject(count);
+
+				/* Unlike in other functions, this comparison must be exact!
+				 * The catalogue must be able to contain personalities that
+				 * are proper supersets of others.
+				 * Do not compare just the properties present in one driver
+				 * personality or the other.
+				 */
+				if (personality->isEqualTo(driver)) {
+					break;
+				}
+			}
+			if (count >= 0) {
+				// its a dup
+				continue;
+			}
+			result = array->setObject(personality);
+			if (!result) {
+				break;
+			}
+		}
+
+		set->setObject(personality);
+	}
+	// Start device matching.
+	if (result && doNubMatching && (set->getCount() > 0)) {
+		IOService::catalogNewDrivers(set.get());
+		generation++;
+	}
+	IORWLockUnlock(lock);
 
 finish:
-    if (set)  set->release();
-    if (iter) iter->release();
 
-    return result;
+	return result;
+}
+
+bool
+IOCatalogue::removeDrivers(bool doNubMatching, bool (^shouldRemove)(OSDictionary *personality))
+{
+	OSSharedPtr<OSOrderedSet> set;
+	OSSharedPtr<OSCollectionIterator> iter;
+	OSDictionary         * dict;
+	OSArray              * array;
+	const OSSymbol       * key;
+	unsigned int           idx;
+
+	set = OSOrderedSet::withCapacity(10,
+	    IOServiceOrdering,
+	    (void *)(gIOProbeScoreKey.get()));
+	if (!set) {
+		return false;
+	}
+	iter = OSCollectionIterator::withCollection(personalities.get());
+	if (!iter) {
+		return false;
+	}
+
+	IORWLockWrite(lock);
+	while ((key = (const OSSymbol *) iter->getNextObject())) {
+		array = (OSArray *) personalities->getObject(key);
+		if (array) {
+			for (idx = 0; (dict = (OSDictionary *) array->getObject(idx)); idx++) {
+				if (shouldRemove(dict)) {
+					set->setObject(dict);
+					array->removeObject(idx);
+					idx--;
+				}
+			}
+		}
+		// Start device matching.
+		if (doNubMatching && (set->getCount() > 0)) {
+			IOService::catalogNewDrivers(set.get());
+			generation++;
+		}
+	}
+	IORWLockUnlock(lock);
+
+	return true;
 }
 
 /*********************************************************************
@@ -389,534 +551,870 @@ finish:
 *********************************************************************/
 bool
 IOCatalogue::removeDrivers(
-    OSDictionary * matching,
-    bool doNubMatching)
+	OSDictionary * matching,
+	bool doNubMatching)
 {
-    OSOrderedSet         * set;
-    OSCollectionIterator * iter;
-    OSDictionary         * dict;
-    OSArray              * array;
-    const OSSymbol       * key;
-    unsigned int           idx;
-
-    if ( !matching )
-        return false;
-    
-    set = OSOrderedSet::withCapacity(10,
-                                     IOServiceOrdering,
-                                     (void *)gIOProbeScoreKey);
-    if ( !set )
-        return false;
-    iter = OSCollectionIterator::withCollection(personalities);
-    if (!iter) 
-    {
-    	set->release();
-    	return (false);
-    }
-
-    IORWLockWrite(lock);
-    while ((key = (const OSSymbol *) iter->getNextObject()))
-    {
-        array = (OSArray *) personalities->getObject(key);
-        if (array) for (idx = 0; (dict = (OSDictionary *) array->getObject(idx)); idx++)
-        {
-           /* This comparison must be done with only the keys in the
-            * "matching" dict to enable general searches.
-            */
-            if ( dict->isEqualTo(matching, matching) ) {
-                set->setObject(dict);        
-                array->removeObject(idx);
-                idx--;
-            }
-        }
-        // Start device matching.
-        if ( doNubMatching && (set->getCount() > 0) ) {
-            IOService::catalogNewDrivers(set);
-            generation++;
-        }
-    }
-    IORWLockUnlock(lock);
-   
-    set->release();
-    iter->release();
-    
-    return true;
+	if (!matching) {
+		return false;
+	}
+	return removeDrivers(doNubMatching, ^(OSDictionary *dict) {
+		/* This comparison must be done with only the keys in the
+		 * "matching" dict to enable general searches.
+		 */
+		return dict->isEqualTo(matching, matching);
+	});
 }
 
 // Return the generation count.
-SInt32 IOCatalogue::getGenerationCount(void) const
+SInt32
+IOCatalogue::getGenerationCount(void) const
 {
-    return( generation );
+	return generation;
+}
+/*********************************************************************
+*********************************************************************/
+/* static */
+
+bool
+IOCatalogue::personalityIsBoot(OSDictionary * match)
+{
+	OSString * moduleName;
+	OSSharedPtr<OSKext> theKext;
+
+	moduleName = OSDynamicCast(OSString, match->getObject(gIOModuleIdentifierKey.get()));
+	if (!moduleName) {
+		return true;
+	}
+	theKext = OSKext::lookupKextWithIdentifier(moduleName->getCStringNoCopy());
+	if (!theKext) {
+		return true;
+	}
+	switch (theKext->kc_type) {
+	case KCKindPrimary:
+		return true;
+	case KCKindUnknown:
+		return true;
+	case KCKindNone:
+		return false;
+	case KCKindAuxiliary:
+		return false;
+	case KCKindPageable:
+		return false;
+	default:
+		assert(false);
+		return false;
+	}
 }
 
-bool IOCatalogue::isModuleLoaded(OSString * moduleName) const
+// Check to see if kernel module has been loaded already, and request its load.
+bool
+IOCatalogue::isModuleLoaded(OSDictionary * driver, OSObject ** kextRef) const
 {
-    return isModuleLoaded(moduleName->getCStringNoCopy());
+	OSString * moduleName = NULL;
+	OSString * publisherName = NULL;
+	OSReturn   ret;
+
+	if (kextRef) {
+		*kextRef = NULL;
+	}
+	if (!driver) {
+		return false;
+	}
+
+	/* The personalities of codeless kexts often contain the bundle ID of the
+	 * kext they reference, and not the bundle ID of the codeless kext itself.
+	 * The prelinked kernel needs to know the bundle ID of the codeless kext
+	 * so it can include these personalities, so OSKext stores that bundle ID
+	 * in the IOPersonalityPublisher key, and we record it as requested here.
+	 */
+	publisherName = OSDynamicCast(OSString,
+	    driver->getObject(kIOPersonalityPublisherKey));
+	OSKext::recordIdentifierRequest(publisherName);
+
+	moduleName = OSDynamicCast(OSString, driver->getObject(gIOModuleIdentifierKernelKey.get()));
+	if (moduleName) {
+		ret = OSKext::loadKextWithIdentifier(moduleName, kextRef);
+		if (kOSKextReturnDeferred == ret) {
+			// a request has been queued but the module isn't necessarily
+			// loaded yet, so stall.
+			return false;
+		}
+		OSString *moduleDextName = OSDynamicCast(OSString, driver->getObject(gIOModuleIdentifierKey.get()));
+		if (moduleDextName && !(moduleName->isEqualTo(moduleDextName))) {
+			OSSharedPtr<OSObject> dextRef;
+			ret = OSKext::loadKextWithIdentifier(moduleDextName, dextRef);
+		}
+		// module is present or never will be
+		return true;
+	}
+
+	/* If a personality doesn't hold the "CFBundleIdentifier" or "CFBundleIdentifierKernel" key
+	 * it is assumed to be an "in-kernel" driver.
+	 */
+	return true;
 }
 
-bool IOCatalogue::isModuleLoaded(const char * moduleName) const
+bool
+IOCatalogue::isModuleLoaded(OSDictionary * driver, OSSharedPtr<OSObject>& kextRef) const
 {
-    OSReturn ret;
-    ret = OSKext::loadKextWithIdentifier(moduleName);
-    if (kOSKextReturnDeferred == ret) {
-        // a request has been queued but the module isn't necessarily 
-        // loaded yet, so stall.
-        return false;
-    }
-    // module is present or never will be 
-    return true;
-}
-
-// Check to see if module has been loaded already.
-bool IOCatalogue::isModuleLoaded(OSDictionary * driver) const
-{
-    OSString             * moduleName = NULL;
-    OSString             * publisherName = NULL;
-
-    if ( !driver )
-        return false;
-
-    /* The personalities of codeless kexts often contain the bundle ID of the
-     * kext they reference, and not the bundle ID of the codeless kext itself.
-     * The prelinked kernel needs to know the bundle ID of the codeless kext
-     * so it can include these personalities, so OSKext stores that bundle ID
-     * in the IOPersonalityPublisher key, and we record it as requested here.
-     */
-    publisherName = OSDynamicCast(OSString, 
-        driver->getObject(kIOPersonalityPublisherKey));
-    OSKext::recordIdentifierRequest(publisherName);
-
-    moduleName = OSDynamicCast(OSString, driver->getObject(gIOModuleIdentifierKey));
-    if ( moduleName )
-        return isModuleLoaded(moduleName);
-
-   /* If a personality doesn't hold the "CFBundleIdentifier" key
-    * it is assumed to be an "in-kernel" driver.
-    */
-    return true;
+	OSObject* kextRefRaw = NULL;
+	bool result = isModuleLoaded(driver, &kextRefRaw);
+	kextRef.reset(kextRefRaw, OSNoRetain);
+	return result;
 }
 
 /* This function is called after a module has been loaded.
  * Is invoked from user client call, ultimately from IOKitLib's
  * IOCatalogueModuleLoaded(). Sent from kextd.
  */
-void IOCatalogue::moduleHasLoaded(OSString * moduleName)
+void
+IOCatalogue::moduleHasLoaded(const OSSymbol * moduleName)
 {
-    OSDictionary * dict;
+	startMatching(moduleName);
 
-    dict = OSDictionary::withCapacity(2);
-    dict->setObject(gIOModuleIdentifierKey, moduleName);
-    startMatching(dict);
-    dict->release();
-
-    (void) OSKext::setDeferredLoadSucceeded();
-    (void) OSKext::considerRebuildOfPrelinkedKernel();
+	(void) OSKext::setDeferredLoadSucceeded();
+	(void) OSKext::considerRebuildOfPrelinkedKernel();
 }
 
-void IOCatalogue::moduleHasLoaded(const char * moduleName)
+void
+IOCatalogue::moduleHasLoaded(const char * moduleName)
 {
-    OSString * name;
+	OSSharedPtr<const OSSymbol> name;
 
-    name = OSString::withCString(moduleName);
-    moduleHasLoaded(name);
-    name->release();
+	name = OSSymbol::withCString(moduleName);
+	moduleHasLoaded(name.get());
 }
 
 // xxx - return is really OSReturn/kern_return_t
-IOReturn IOCatalogue::unloadModule(OSString * moduleName) const
+IOReturn
+IOCatalogue::unloadModule(OSString * moduleName) const
 {
-    return OSKext::removeKextWithIdentifier(moduleName->getCStringNoCopy());
+	return OSKext::removeKextWithIdentifier(moduleName->getCStringNoCopy());
 }
 
-IOReturn IOCatalogue::_terminateDrivers(OSDictionary * matching)
+IOReturn
+IOCatalogue::terminateDrivers(OSDictionary * matching, io_name_t className, bool asynchronous)
 {
-    OSDictionary         * dict;
-    OSIterator           * iter;
-    IOService            * service;
-    IOReturn               ret;
+	OSDictionary         * dict;
+	OSSharedPtr<OSIterator> iter;
+	IOService            * service;
+	IOReturn               ret;
 
-    if ( !matching )
-        return kIOReturnBadArgument;
+	ret = kIOReturnSuccess;
+	dict = NULL;
+	iter = IORegistryIterator::iterateOver(gIOServicePlane,
+	    kIORegistryIterateRecursively);
+	if (!iter) {
+		return kIOReturnNoMemory;
+	}
 
-    ret = kIOReturnSuccess;
-    dict = 0;
-    iter = IORegistryIterator::iterateOver(gIOServicePlane,
-                                kIORegistryIterateRecursively);
-    if ( !iter )
-        return kIOReturnNoMemory;
+	if (matching) {
+		OSKext::uniquePersonalityProperties( matching, false );
+	}
 
-    OSKext::uniquePersonalityProperties( matching );
+	// terminate instances.
+	do {
+		iter->reset();
+		while ((service = (IOService *)iter->getNextObject())) {
+			if (className && !service->metaCast(className)) {
+				continue;
+			}
+			if (matching) {
+				/* Terminate only for personalities that match the matching dictionary.
+				 * This comparison must be done with only the keys in the
+				 * "matching" dict to enable general matching.
+				 */
+				dict = service->getPropertyTable();
+				if (!dict) {
+					continue;
+				}
+				if (!dict->isEqualTo(matching, matching)) {
+					continue;
+				}
+			}
 
-    // terminate instances.
-    do {
-        iter->reset();
-        while( (service = (IOService *)iter->getNextObject()) ) {
-            dict = service->getPropertyTable();
-            if ( !dict )
-                continue;
+			OSKext     * kext;
+			OSSharedPtr<OSString> dextBundleID;
+			const char * bundleIDStr;
+			OSObject   * prop;
+			bool         okToTerminate;
+			bool         isDext = service->hasUserServer();
+			for (okToTerminate = true;;) {
+				if (isDext) {
+					dextBundleID = OSDynamicPtrCast<OSString>(service->copyProperty(gIOModuleIdentifierKey.get()));
+					if (!dextBundleID) {
+						break;
+					}
+					bundleIDStr = dextBundleID->getCStringNoCopy();
+				} else {
+					kext = service->getMetaClass()->getKext();
+					if (!kext) {
+						break;
+					}
+					bundleIDStr = kext->getIdentifierCString();
+					prop = kext->getPropertyForHostArch(kOSBundleAllowUserTerminateKey);
+					if (prop) {
+						okToTerminate = (kOSBooleanTrue == prop);
+						break;
+					}
+				}
+				if (!bundleIDStr) {
+					break;
+				}
+				if (!strcmp(kOSKextKernelIdentifier, bundleIDStr)) {
+					okToTerminate = false;
+					break;
+				}
+				if (!strncmp("com.apple.", bundleIDStr, strlen("com.apple."))) {
+					okToTerminate = false;
+					break;
+				}
+				break;
+			}
+			if (!okToTerminate) {
+#if DEVELOPMENT || DEBUG
+				okToTerminate = true;
+#endif /* DEVELOPMENT || DEBUG */
+				IOLog("%sallowing kextunload terminate for bundleID %s\n",
+				    okToTerminate ? "" : "dis", bundleIDStr ? bundleIDStr : "?");
+				if (!okToTerminate) {
+					ret = kIOReturnUnsupported;
+					break;
+				}
+			}
+			IOOptionBits terminateOptions = kIOServiceRequired;
+			if (!asynchronous) {
+				terminateOptions |= kIOServiceSynchronous;
+			}
+			if (isDext) {
+				terminateOptions |= kIOServiceTerminateNeedWillTerminate;
+			}
+			if (!service->terminate(terminateOptions)) {
+				ret = kIOReturnUnsupported;
+				break;
+			}
+		}
+	} while (!service && !iter->isValid());
 
-           /* Terminate only for personalities that match the matching dictionary.
-            * This comparison must be done with only the keys in the
-            * "matching" dict to enable general matching.
-            */
-            if ( !dict->isEqualTo(matching, matching) )
-                 continue;
-
-            if ( !service->terminate(kIOServiceRequired|kIOServiceSynchronous) ) {
-                ret = kIOReturnUnsupported;
-                break;
-            }
-        }
-    } while( !service && !iter->isValid());
-    iter->release();
-
-    return ret;
+	return ret;
 }
 
-IOReturn IOCatalogue::_removeDrivers(OSDictionary * matching)
+IOReturn
+IOCatalogue::_removeDrivers(OSDictionary * matching)
 {
-    IOReturn               ret = kIOReturnSuccess;
-    OSCollectionIterator * iter;
-    OSDictionary         * dict;
-    OSArray              * array;
-    const OSSymbol       * key;
-    unsigned int           idx;
+	IOReturn               ret = kIOReturnSuccess;
+	OSSharedPtr<OSCollectionIterator> iter;
+	OSDictionary         * dict;
+	OSArray              * array;
+	const OSSymbol       * key;
+	unsigned int           idx;
 
-    // remove configs from catalog.
+	// remove configs from catalog.
 
-    iter = OSCollectionIterator::withCollection(personalities);
-    if (!iter) return (kIOReturnNoMemory);
+	iter = OSCollectionIterator::withCollection(personalities.get());
+	if (!iter) {
+		return kIOReturnNoMemory;
+	}
 
-    while ((key = (const OSSymbol *) iter->getNextObject()))
-    {
-        array = (OSArray *) personalities->getObject(key);
-        if (array) for (idx = 0; (dict = (OSDictionary *) array->getObject(idx)); idx++)
-        {
+	while ((key = (const OSSymbol *) iter->getNextObject())) {
+		array = (OSArray *) personalities->getObject(key);
+		if (array) {
+			for (idx = 0; (dict = (OSDictionary *) array->getObject(idx)); idx++) {
+				/* Remove from the catalogue's array any personalities
+				 * that match the matching dictionary.
+				 * This comparison must be done with only the keys in the
+				 * "matching" dict to enable general matching.
+				 */
+				if (dict->isEqualTo(matching, matching)) {
+					array->removeObject(idx);
+					idx--;
+				}
+			}
+		}
+	}
 
-	    /* Remove from the catalogue's array any personalities
-	     * that match the matching dictionary.
-	     * This comparison must be done with only the keys in the
-	     * "matching" dict to enable general matching.
-	     */
-            if (dict->isEqualTo(matching, matching))
-            {
-                array->removeObject(idx);
-                idx--;
-            }
-        }
-    }
-    iter->release();
-
-    return ret;
+	return ret;
 }
 
-IOReturn IOCatalogue::terminateDrivers(OSDictionary * matching)
+IOReturn
+IOCatalogue::terminateDrivers(OSDictionary * matching)
 {
-    IOReturn ret;
+	IOReturn ret;
 
-    ret = _terminateDrivers(matching);
-    IORWLockWrite(lock);
-    if (kIOReturnSuccess == ret)
-	ret = _removeDrivers(matching);
-    IORWLockUnlock(lock);
+	if (!matching) {
+		return kIOReturnBadArgument;
+	}
+	ret = terminateDrivers(matching, NULL, false);
+	IORWLockWrite(lock);
+	if (kIOReturnSuccess == ret) {
+		ret = _removeDrivers(matching);
+	}
+	IORWLockUnlock(lock);
 
-    return ret;
+	return ret;
 }
 
-IOReturn IOCatalogue::terminateDriversForModule(
-    OSString * moduleName,
-    bool unload)
+IOReturn
+IOCatalogue::terminateDriversForUserspaceReboot()
 {
-    IOReturn ret;
-    OSDictionary * dict;
-    bool isLoaded = false;
+	IOReturn                ret = kIOReturnSuccess;
 
-   /* Check first if the kext currently has any linkage dependents;
-    * in such a case the unload would fail so let's not terminate any
-    * IOServices (since doing so typically results in a panic when there
-    * are loaded dependencies). Note that we aren't locking the kext here
-    * so it might lose or gain dependents by the time we call unloadModule();
-    * I think that's ok, our unload can fail if a kext comes in on top of
-    * this one even after we've torn down IOService objects. Conversely,
-    * if we fail the unload here and then lose a library, the autounload
-    * thread will get us in short order.
-    */
-    if (OSKext::isKextWithIdentifierLoaded(moduleName->getCStringNoCopy())) {
-    
-        isLoaded = true;
+#if !NO_KEXTD
+	OSSharedPtr<OSIterator> iter;
+	IOService             * service;
+	bool                    isDeferredMatch;
+	bool                    isDext;
+	bool                    preserveDuringUserspaceReboot;
+	IOOptionBits            terminateOptions;
 
-        if (!OSKext::canUnloadKextWithIdentifier(moduleName,
-            /* checkClasses */ false)) {
-            ret = kOSKextReturnInUse;
-            goto finish;
-        }
-    }
-    dict = OSDictionary::withCapacity(1);
-    if (!dict) {
-        ret = kIOReturnNoMemory;
-        goto finish;
-    }
+	iter = IORegistryIterator::iterateOver(gIOServicePlane,
+	    kIORegistryIterateRecursively);
+	if (!iter) {
+		return kIOReturnNoMemory;
+	}
 
-    dict->setObject(gIOModuleIdentifierKey, moduleName);
+	do {
+		iter->reset();
+		while ((service = (IOService *)iter->getNextObject())) {
+			isDeferredMatch = service->propertyHasValue(gIOMatchDeferKey, kOSBooleanTrue);
+			isDext = service->hasUserServer();
+			if (isDeferredMatch || isDext) {
+				OSSharedPtr<OSObject> prop = service->copyProperty(gIOUserServerPreserveUserspaceRebootKey, gIOServicePlane, kIORegistryIterateRecursively | kIORegistryIterateParents);
+				preserveDuringUserspaceReboot = prop == kOSBooleanTrue;
+				if (preserveDuringUserspaceReboot) {
+					IOLog("preserving service %s-0x%llx during userspace reboot\n", service->getName(), service->getRegistryEntryID());
+					continue;
+				}
 
-    ret = _terminateDrivers(dict);
-    
-   /* No goto between IOLock calls!
-    */
-    IORWLockWrite(lock);
-    if (kIOReturnSuccess == ret) {
-        ret = _removeDrivers(dict);
-    }
+				if (isDext) {
+					OSSharedPtr<OSString> name = OSDynamicPtrCast<OSString>(service->copyProperty(gIOUserServerNameKey));
+					const char *userServerName = NULL;
+					if (name) {
+						userServerName = name->getCStringNoCopy();
+					}
+					IOLog("terminating service %s-0x%llx [dext %s]\n", service->getName(), service->getRegistryEntryID(), userServerName ? userServerName : "(null)");
+				} else {
+					OSKext *kext = service->getMetaClass()->getKext();
+					const char *bundleID = NULL;
+					if (kext) {
+						bundleID = kext->getIdentifierCString();
+					}
+					IOLog("terminating service %s-0x%llx [kext %s]\n", service->getName(), service->getRegistryEntryID(), bundleID ? bundleID : "(null)");
+				}
+				terminateOptions = kIOServiceRequired | kIOServiceSynchronous;
+				if (isDext) {
+					terminateOptions |= kIOServiceTerminateNeedWillTerminate;
+				}
+				if (!service->terminate(terminateOptions)) {
+					IOLog("failed to terminate service %s-0x%llx\n", service->getName(), service->getRegistryEntryID());
+					ret = kIOReturnUnsupported;
+					break;
+				}
+			}
+		}
+	} while (!service && !iter->isValid());
+#endif
 
-    // Unload the module itself.
-    if (unload && isLoaded && ret == kIOReturnSuccess) {
-        ret = unloadModule(moduleName);
-    }
+	return ret;
+}
 
-    IORWLockUnlock(lock);
+IOReturn
+IOCatalogue::resetAfterUserspaceReboot(void)
+{
+	OSSharedPtr<OSIterator> iter;
+	IOService             * service;
 
-    dict->release();
+	iter = IORegistryIterator::iterateOver(gIOServicePlane,
+	    kIORegistryIterateRecursively);
+	if (!iter) {
+		return kIOReturnNoMemory;
+	}
+
+	do {
+		iter->reset();
+		while ((service = (IOService *)iter->getNextObject())) {
+			service->resetRematchProperties();
+		}
+	} while (!service && !iter->isValid());
+
+	/* Remove all dext personalities */
+	removeDrivers(false, ^(OSDictionary *dict) {
+		return dict->getObject(gIOUserServerNameKey) != NULL;
+	});
+
+	return kIOReturnSuccess;
+}
+
+IOReturn
+IOCatalogue::terminateDriversForModule(
+	OSString * moduleName,
+	bool unload,
+	bool asynchronous)
+{
+	IOReturn ret;
+	OSSharedPtr<OSDictionary> dict;
+	OSSharedPtr<OSKext> kext;
+	bool isLoaded = false;
+	bool isDext = false;
+
+	/* Check first if the kext currently has any linkage dependents;
+	 * in such a case the unload would fail so let's not terminate any
+	 * IOServices (since doing so typically results in a panic when there
+	 * are loaded dependencies). Note that we aren't locking the kext here
+	 * so it might lose or gain dependents by the time we call unloadModule();
+	 * I think that's ok, our unload can fail if a kext comes in on top of
+	 * this one even after we've torn down IOService objects. Conversely,
+	 * if we fail the unload here and then lose a library, the autounload
+	 * thread will get us in short order.
+	 */
+	if (OSKext::isKextWithIdentifierLoaded(moduleName->getCStringNoCopy())) {
+		isLoaded = true;
+
+		if (!OSKext::canUnloadKextWithIdentifier(moduleName,
+		    /* checkClasses */ false)) {
+			ret = kOSKextReturnInUse;
+			goto finish;
+		}
+	}
+	kext = OSKext::lookupKextWithIdentifier(moduleName->getCStringNoCopy());
+	if (kext) {
+		isDext = kext->isDriverKit();
+	}
+
+	dict = OSDictionary::withCapacity(1);
+	if (!dict) {
+		ret = kIOReturnNoMemory;
+		goto finish;
+	}
+
+	dict->setObject(gIOModuleIdentifierKey.get(), moduleName);
+
+	ret = terminateDrivers(dict.get(), NULL, asynchronous);
+
+	if (isDext) {
+		/* Force rematching after removing personalities. Dexts are never considered to be "loaded" (from OSKext),
+		 * so we can't call unloadModule() to remove personalities and start rematching. */
+		removeDrivers(dict.get(), true);
+	} else {
+		/* No goto between IOLock calls!
+		 */
+		IORWLockWrite(lock);
+		if (kIOReturnSuccess == ret) {
+			ret = _removeDrivers(dict.get());
+		}
+
+		// Unload the module itself.
+		if (unload && isLoaded && ret == kIOReturnSuccess) {
+			ret = unloadModule(moduleName);
+		}
+		IORWLockUnlock(lock);
+	}
 
 finish:
-    return ret;
+	return ret;
 }
 
-IOReturn IOCatalogue::terminateDriversForModule(
-    const char * moduleName,
-    bool unload)
+IOReturn
+IOCatalogue::terminateDriversForModule(
+	const char * moduleName,
+	bool unload,
+	bool asynchronous)
 {
-    OSString * name;
-    IOReturn ret;
+	OSSharedPtr<OSString> name;
+	IOReturn ret;
 
-    name = OSString::withCString(moduleName);
-    if ( !name )
-        return kIOReturnNoMemory;
+	name = OSString::withCString(moduleName);
+	if (!name) {
+		return kIOReturnNoMemory;
+	}
 
-    ret = terminateDriversForModule(name, unload);
-    name->release();
+	ret = terminateDriversForModule(name.get(), unload, asynchronous);
 
-    return ret;
+	return ret;
 }
 
-bool IOCatalogue::startMatching( OSDictionary * matching )
+#if defined(__i386__) || defined(__x86_64__)
+bool
+IOCatalogue::startMatching( OSDictionary * matching )
 {
-    OSCollectionIterator * iter;
-    OSDictionary         * dict;
-    OSOrderedSet         * set;
-    OSArray              * array;
-    const OSSymbol *       key;
-    unsigned int           idx;
-    
-    if ( !matching )
-        return false;
+	OSSharedPtr<OSOrderedSet> set;
 
-    set = OSOrderedSet::withCapacity(10, IOServiceOrdering,
-                                     (void *)gIOProbeScoreKey);
-    if ( !set )
-        return false;
+	if (!matching) {
+		return false;
+	}
 
-    iter = OSCollectionIterator::withCollection(personalities);
-    if (!iter) 
-    {
-    	set->release();
-        return false;
-    }
+	set = OSOrderedSet::withCapacity(10, IOServiceOrdering,
+	    (void *)(gIOProbeScoreKey.get()));
+	if (!set) {
+		return false;
+	}
 
-    IORWLockRead(lock);
+	IORWLockRead(lock);
 
-    while ((key = (const OSSymbol *) iter->getNextObject()))
-    {
-        array = (OSArray *) personalities->getObject(key);
-        if (array) for (idx = 0; (dict = (OSDictionary *) array->getObject(idx)); idx++)
-        {
-	   /* This comparison must be done with only the keys in the
-	    * "matching" dict to enable general matching.
-	    */
-            if (dict->isEqualTo(matching, matching)) {
-                set->setObject(dict);
-            }        
-        }
-    }
+	personalities->iterateObjects(^bool (const OSSymbol * key, OSObject * value) {
+		OSArray      * array;
+		OSDictionary * dict;
+		unsigned int   idx;
 
-    // Start device matching.
-    if ( set->getCount() > 0 ) {
-        IOService::catalogNewDrivers(set);
-        generation++;
-    }
+		array = (OSArray *) value;
+		for (idx = 0; (dict = (OSDictionary *) array->getObject(idx)); idx++) {
+		        /* This comparison must be done with only the keys in the
+		         * "matching" dict to enable general matching.
+		         */
+		        if (dict->isEqualTo(matching, matching)) {
+		                set->setObject(dict);
+			}
+		}
+		return false;
+	});
 
-    IORWLockUnlock(lock);
+	// Start device matching.
+	if (set->getCount() > 0) {
+		IOService::catalogNewDrivers(set.get());
+		generation++;
+	}
 
-    set->release();
-    iter->release();
+	IORWLockUnlock(lock);
 
-    return true;
+	return true;
+}
+#endif /* defined(__i386__) || defined(__x86_64__) */
+
+bool
+IOCatalogue::startMatching( const OSSymbol * moduleName )
+{
+	OSSharedPtr<OSOrderedSet> set;
+	OSSharedPtr<OSKext>       kext;
+	OSSharedPtr<OSArray>      servicesToTerminate;
+
+	if (!moduleName) {
+		return false;
+	}
+
+	set = OSOrderedSet::withCapacity(10, IOServiceOrdering,
+	    (void *)(gIOProbeScoreKey.get()));
+	if (!set) {
+		return false;
+	}
+
+	/*
+	 * Be sure to call into OSKext outside of
+	 * IORWLock, otherwise it can trigger a lock
+	 * inversion.
+	 */
+	kext = OSKext::lookupKextWithIdentifier(moduleName->getCStringNoCopy());
+
+	IORWLockRead(lock);
+
+	if (kext && kext->isDriverKit()) {
+		/* We're here because kernelmanagerd called IOCatalogueModuleLoaded after launching a dext.
+		 * Determine what providers the dext would match against. If there's something already attached
+		 * to the provider, terminate it.
+		 *
+		 * This is only safe to do for HID dexts.
+		 */
+		OSSharedPtr<OSArray> dextPersonalities = kext->copyPersonalitiesArray();
+
+		if (!dextPersonalities) {
+			return false;
+		}
+
+		servicesToTerminate = OSArray::withCapacity(1);
+		if (!servicesToTerminate) {
+			return false;
+		}
+
+		dextPersonalities->iterateObjects(^bool (OSObject * obj) {
+			OSDictionary * personality = OSDynamicCast(OSDictionary, obj);
+			OSSharedPtr<OSIterator> iter;
+			IOService * provider;
+			OSSharedPtr<IOService> service;
+			const OSSymbol * category;
+
+			if (personality) {
+			        category = OSDynamicCast(OSSymbol, personality->getObject(gIOMatchCategoryKey));
+			        if (!category) {
+			                category = gIODefaultMatchCategoryKey;
+				}
+			        iter = IOService::getMatchingServices(personality);
+
+			        while (iter && (provider = OSDynamicCast(IOService, iter->getNextObject()))) {
+			                if (provider->metaCast(gIOHIDInterfaceClassName.get()) != NULL) {
+			                        service.reset(provider->copyClientWithCategory(category), OSNoRetain);
+			                        if (service) {
+			                                servicesToTerminate->setObject(service);
+						}
+					}
+				}
+			}
+
+			return false;
+		});
+	}
+
+	personalities->iterateObjects(^bool (const OSSymbol * key, OSObject * value) {
+		OSArray      * array;
+		OSDictionary * dict;
+		OSObject     * moduleIdentifierKernel;
+		OSObject     * moduleIdentifier;
+		unsigned int   idx;
+
+		array = (OSArray *) value;
+		for (idx = 0; (dict = (OSDictionary *) array->getObject(idx)); idx++) {
+		        moduleIdentifierKernel = dict->getObject(gIOModuleIdentifierKernelKey.get());
+		        moduleIdentifier = dict->getObject(gIOModuleIdentifierKey.get());
+		        if ((moduleIdentifierKernel && moduleName->isEqualTo(moduleIdentifierKernel)) ||
+		        (moduleIdentifier && moduleName->isEqualTo(moduleIdentifier))) {
+		                set->setObject(dict);
+			}
+		}
+		return false;
+	});
+
+	if (servicesToTerminate) {
+		servicesToTerminate->iterateObjects(^bool (OSObject * obj) {
+			IOService * service = OSDynamicCast(IOService, obj);
+			if (service) {
+			        IOOptionBits terminateOptions = kIOServiceRequired;
+			        if (service->hasUserServer()) {
+			                terminateOptions |= kIOServiceTerminateNeedWillTerminate;
+				}
+			        if (!service->terminate(terminateOptions)) {
+			                IOLog("%s: failed to terminate service %s-0x%qx with options %08llx for new dext %s\n", __FUNCTION__, service->getName(), service->getRegistryEntryID(), (long long)terminateOptions, moduleName->getCStringNoCopy());
+				}
+			}
+			return false;
+		});
+	}
+
+	// Start device matching.
+	if (set->getCount() > 0) {
+		IOService::catalogNewDrivers(set.get());
+		generation++;
+	}
+
+	IORWLockUnlock(lock);
+
+	return true;
 }
 
-void IOCatalogue::reset(void)
+void
+IOCatalogue::reset(void)
 {
-    IOCatalogue::resetAndAddDrivers(/* no drivers; true reset */ NULL,
-        /* doMatching */ false);
-    return;
+	IOCatalogue::resetAndAddDrivers(/* no drivers; true reset */ NULL,
+	    /* doMatching */ false);
+	return;
 }
 
-bool IOCatalogue::resetAndAddDrivers(OSArray * drivers, bool doNubMatching)
+bool
+IOCatalogue::resetAndAddDrivers(OSArray * drivers, bool doNubMatching)
 {
-    bool                   result              = false;
-    OSArray              * newPersonalities    = NULL;  // do not release
-    OSCollectionIterator * iter                = NULL;  // must release
-    OSOrderedSet         * matchSet            = NULL;  // must release
-    const OSSymbol       * key;
-    OSArray              * array;
-    OSDictionary         * thisNewPersonality  = NULL;  // do not release
-    OSDictionary         * thisOldPersonality  = NULL;  // do not release
-    signed int             idx, newIdx;
+	bool                   result              = false;
+	OSArray              * newPersonalities    = NULL;// do not release
+	const OSSymbol       * key;
+	OSArray              * array;
+	OSDictionary         * thisNewPersonality   = NULL;// do not release
+	OSDictionary         * thisOldPersonality   = NULL;// do not release
+	OSSharedPtr<OSDictionary> myKexts;
+	OSSharedPtr<OSCollectionIterator> iter;
+	OSSharedPtr<OSOrderedSet> matchSet;
+	signed int             idx, newIdx;
 
-    if (drivers) {
-        newPersonalities = OSDynamicCast(OSArray, drivers);
-        if (!newPersonalities) {
-            goto finish;
-        }
-        
-        matchSet = OSOrderedSet::withCapacity(10, IOServiceOrdering,
-            (void *)gIOProbeScoreKey);
-        if (!matchSet) {
-            goto finish;
-        }
-        iter = OSCollectionIterator::withCollection(personalities);
-        if (!iter) {
-            goto finish;
-        }
-    }
+	if (drivers) {
+		newPersonalities = OSDynamicCast(OSArray, drivers);
+		if (!newPersonalities) {
+			goto finish;
+		}
+	}
+	matchSet = OSOrderedSet::withCapacity(10, IOServiceOrdering,
+	    (void *)(gIOProbeScoreKey.get()));
+	if (!matchSet) {
+		goto finish;
+	}
+	iter = OSCollectionIterator::withCollection(personalities.get());
+	if (!iter) {
+		goto finish;
+	}
 
-    result = true;
+	/* need copy of loaded kexts so we can check if for loaded modules without
+	 * taking the OSKext lock.  There is a potential of deadlocking if we get
+	 * an OSKext via the normal path.  See 14672140.
+	 */
+	myKexts = OSKext::copyKexts();
 
-    IOLog("Resetting IOCatalogue.\n");
+	result = true;
 
-   /* No goto finish from here to unlock.
-    */
-    IORWLockWrite(lock);
-    
-    while ((key = (const OSSymbol *) iter->getNextObject()))
-    {
-        array = (OSArray *) personalities->getObject(key);
-        if (!array) continue;
-        for (idx = 0; (thisOldPersonality = (OSDictionary *) array->getObject(idx)); idx++)
-        {
-            if (thisOldPersonality->getObject("KernelConfigTable")) continue;
-            if (newPersonalities)
-            for  (newIdx = 0;
-                 (thisNewPersonality = (OSDictionary *) newPersonalities->getObject(newIdx));
-                 newIdx++)
-            {
-	       /* Unlike in other functions, this comparison must be exact!
-            * The catalogue must be able to contain personalities that
-            * are proper supersets of others.
-            * Do not compare just the properties present in one driver
-            * personality or the other.
-            */
-                if (OSDynamicCast(OSDictionary, thisNewPersonality) == NULL) {
-                    /* skip thisNewPersonality if it is not an OSDictionary */
-                    continue;
-                }
-                if (thisNewPersonality->isEqualTo(thisOldPersonality))
-                    break;
-            }
-            if (thisNewPersonality)
-            {
-                // dup, ignore
-                newPersonalities->removeObject(newIdx);
-            }
-            else
-            {
-                // not in new set - remove
-                // only remove dictionary if this module in not loaded - 9953845
-                if ( isModuleLoaded(thisOldPersonality) == false ) 
-                {
-                    if (matchSet)  matchSet->setObject(thisOldPersonality);
-                    array->removeObject(idx);
-                    idx--;
-                }
-            }
-        }
-    }
+	IOLog("Resetting IOCatalogue.\n");
 
-    // add new
-    for (newIdx = 0;
-         (thisNewPersonality = (OSDictionary *) newPersonalities->getObject(newIdx));
-         newIdx++)
-    {
-         if (OSDynamicCast(OSDictionary, thisNewPersonality) == NULL) {
-             /* skip thisNewPersonality if it is not an OSDictionary */
-             continue;
-         }
+	/* No goto finish from here to unlock.
+	 */
+	IORWLockWrite(lock);
 
-         OSKext::uniquePersonalityProperties(thisNewPersonality);
-         addPersonality(thisNewPersonality);
-         matchSet->setObject(thisNewPersonality);
-    }
+	while ((key = (const OSSymbol *) iter->getNextObject())) {
+		array = (OSArray *) personalities->getObject(key);
+		if (!array) {
+			continue;
+		}
 
-   /* Finally, start device matching on all new & removed personalities.
-    */
-    if (result && doNubMatching && (matchSet->getCount() > 0)) {
-        IOService::catalogNewDrivers(matchSet);
-        generation++;
-    }
+		for (idx = 0;
+		    (thisOldPersonality = (OSDictionary *) array->getObject(idx));
+		    idx++) {
+			if (thisOldPersonality->getObject("KernelConfigTable")) {
+				continue;
+			}
+			thisNewPersonality = NULL;
 
-    IORWLockUnlock(lock);
+			if (newPersonalities) {
+				for (newIdx = 0;
+				    (thisNewPersonality = (OSDictionary *) newPersonalities->getObject(newIdx));
+				    newIdx++) {
+					/* Unlike in other functions, this comparison must be exact!
+					 * The catalogue must be able to contain personalities that
+					 * are proper supersets of others.
+					 * Do not compare just the properties present in one driver
+					 * personality or the other.
+					 */
+					if (OSDynamicCast(OSDictionary, thisNewPersonality) == NULL) {
+						/* skip thisNewPersonality if it is not an OSDictionary */
+						continue;
+					}
+					if (thisNewPersonality->isEqualTo(thisOldPersonality)) {
+						break;
+					}
+				}
+			}
+			if (thisNewPersonality) {
+				// dup, ignore
+				newPersonalities->removeObject(newIdx);
+			} else {
+				// not in new set - remove
+				// only remove dictionary if this module in not loaded - 9953845
+				if (isModuleLoadedNoOSKextLock(myKexts.get(), thisOldPersonality) == false) {
+					if (matchSet) {
+						matchSet->setObject(thisOldPersonality);
+					}
+					array->removeObject(idx);
+					idx--;
+				}
+			}
+		} // for...
+	} // while...
+
+	// add new
+	if (newPersonalities) {
+		for (newIdx = 0;
+		    (thisNewPersonality = (OSDictionary *) newPersonalities->getObject(newIdx));
+		    newIdx++) {
+			if (OSDynamicCast(OSDictionary, thisNewPersonality) == NULL) {
+				/* skip thisNewPersonality if it is not an OSDictionary */
+				continue;
+			}
+
+			OSKext::uniquePersonalityProperties(thisNewPersonality);
+			addPersonality(thisNewPersonality);
+			matchSet->setObject(thisNewPersonality);
+		}
+	}
+
+	/* Finally, start device matching on all new & removed personalities.
+	 */
+	if (result && doNubMatching && (matchSet->getCount() > 0)) {
+		IOService::catalogNewDrivers(matchSet.get());
+		generation++;
+	}
+
+	IORWLockUnlock(lock);
 
 finish:
-    if (matchSet) matchSet->release();
-    if (iter)     iter->release();
 
-    return result;
+	return result;
 }
 
-bool IOCatalogue::serialize(OSSerialize * s) const
+bool
+IOCatalogue::serialize(OSSerialize * s) const
 {
-    if ( !s )
-        return false;
+	if (!s) {
+		return false;
+	}
 
-    return super::serialize(s);
+	return super::serialize(s);
 }
 
-bool IOCatalogue::serializeData(IOOptionBits kind, OSSerialize * s) const
+bool
+IOCatalogue::serializeData(IOOptionBits kind, OSSerialize * s) const
 {
-    kern_return_t kr = kIOReturnSuccess;
+	kern_return_t kr = kIOReturnSuccess;
 
-    switch ( kind )
-    {
-        case kIOCatalogGetContents:
-            kr = KERN_NOT_SUPPORTED;
-            break;
+	switch (kind) {
+	case kIOCatalogGetContents:
+		kr = KERN_NOT_SUPPORTED;
+		break;
 
-        case kIOCatalogGetModuleDemandList:
-            kr = KERN_NOT_SUPPORTED;
-            break;
+	case kIOCatalogGetModuleDemandList:
+		kr = KERN_NOT_SUPPORTED;
+		break;
 
-        case kIOCatalogGetCacheMissList:
-            kr = KERN_NOT_SUPPORTED;
-            break;
+	case kIOCatalogGetCacheMissList:
+		kr = KERN_NOT_SUPPORTED;
+		break;
 
-        case kIOCatalogGetROMMkextList:
-            kr = KERN_NOT_SUPPORTED;
-            break;
+	case kIOCatalogGetROMMkextList:
+		kr = KERN_NOT_SUPPORTED;
+		break;
 
-        default:
-            kr = kIOReturnBadArgument;
-            break;
-    }
+	default:
+		kr = kIOReturnBadArgument;
+		break;
+	}
 
-    return kr;
+	return kr;
 }
+
+/* isModuleLoadedNoOSKextLock - used to check to see if a kext is loaded
+ * without taking the OSKext lock.  We use this to avoid the problem
+ * where taking the IOCatalog lock then the OSKext lock will dealock when
+ * a kext load or unload is happening at the same time as IOCatalog changing.
+ *
+ * theKexts - is a dictionary of current kexts (from OSKext::copyKexts) with
+ *      key set to the kext bundle ID and value set to an OSKext object
+ * theModuleDict - is an IOKit personality dictionary for a given module (kext)
+ */
+static bool
+isModuleLoadedNoOSKextLock(OSDictionary *theKexts,
+    OSDictionary *theModuleDict)
+{
+	bool                    myResult = false;
+	const OSString *        myBundleID = NULL;// do not release
+	OSKext *                myKext = NULL;  // do not release
+
+	if (theKexts == NULL || theModuleDict == NULL) {
+		return myResult;
+	}
+
+	// gIOModuleIdentifierKey is "CFBundleIdentifier"
+	myBundleID = OSDynamicCast(OSString,
+	    theModuleDict->getObject(gIOModuleIdentifierKey.get()));
+	if (myBundleID == NULL) {
+		return myResult;
+	}
+
+	myKext = OSDynamicCast(OSKext, theKexts->getObject(myBundleID->getCStringNoCopy()));
+	if (myKext) {
+		myResult = myKext->isLoaded();
+	}
+
+	return myResult;
+}
+
 
 #if PRAGMA_MARK
 #pragma mark Obsolete Kext Loading Stuff
 #endif
 /*********************************************************************
-**********************************************************************
-***                  BINARY COMPATIBILITY SECTION                  ***
-**********************************************************************
-**********************************************************************
-* These functions are no longer used are necessary for C++ binary
-* compatibility on i386.
-**********************************************************************/
+ **********************************************************************
+ ***                  BINARY COMPATIBILITY SECTION                  ***
+ **********************************************************************
+ **********************************************************************
+ * These functions are no longer used are necessary for C++ binary
+ * compatibility on i386.
+ **********************************************************************/

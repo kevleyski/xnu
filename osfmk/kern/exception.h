@@ -2,7 +2,7 @@
  * Copyright (c) 2000-2004 Apple Computer, Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
- * 
+ *
  * This file contains Original Code and/or Modifications of Original Code
  * as defined in and that are subject to the Apple Public Source License
  * Version 2.0 (the 'License'). You may not use this file except in
@@ -11,10 +11,10 @@
  * unlawful or unlicensed copies of an Apple operating system, or to
  * circumvent, violate, or enable the circumvention or violation of, any
  * terms of an Apple operating system software license agreement.
- * 
+ *
  * Please obtain a copy of the License at
  * http://www.opensource.apple.com/apsl/ and read it before using this file.
- * 
+ *
  * The Original Code and all software distributed under the License are
  * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
@@ -22,7 +22,7 @@
  * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
  * Please see the License for the specific language governing rights and
  * limitations under the License.
- * 
+ *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
 /*
@@ -36,29 +36,54 @@
 #include <mach/thread_status.h>
 #include <mach/exception_types.h>
 #include <kern/kern_types.h>
+#include <security/_label.h>
 
 /*
  * Common storage for exception actions.
  * There are arrays of these maintained at the activation, task, and host.
  */
 struct exception_action {
-	struct ipc_port		*port;		/* exception port */
-	thread_state_flavor_t	flavor;		/* state flavor to send */
-	exception_behavior_t	behavior;	/* exception type to raise */
-	boolean_t		privileged;	/* survives ipc_task_reset */
+	struct ipc_port         * XNU_PTRAUTH_SIGNED_PTR("exception_action.port") port; /* exception port */
+	thread_state_flavor_t   flavor;         /* state flavor to send */
+	exception_behavior_t    behavior;       /* exception type to raise */
+	boolean_t               privileged;     /* survives ipc_task_reset */
+	boolean_t               hardened;       /* associated with the task's hardened_exception_action */
+	struct label            *label;         /* MAC label associated with action */
+};
+struct hardened_exception_action {
+	struct exception_action ea;
+	uint32_t                signed_pc_key;
+	exception_mask_t        exception;
 };
 
+/* Initialize global state needed for exceptions. */
+extern void exception_init(void);
+
+extern ipc_port_t exception_port_copy_send(ipc_port_t port);
+
 /* Make an up-call to a thread's exception server */
-extern void exception_triage(
-	exception_type_t	exception,
-	mach_exception_data_t	code,
-	mach_msg_type_number_t	codeCnt);
+extern kern_return_t exception_triage(
+	exception_type_t        exception,
+	mach_exception_data_t   code,
+	mach_msg_type_number_t  codeCnt);
+
+extern kern_return_t exception_triage_thread(
+	exception_type_t        exception,
+	mach_exception_data_t   code,
+	mach_msg_type_number_t  codeCnt,
+	thread_t                thread);
+
+#define BT_EXC_PORTS_COUNT 3
+extern void exception_deliver_backtrace(
+	kcdata_object_t bt_object,
+	ipc_port_t      exc_ports[static BT_EXC_PORTS_COUNT],
+	exception_type_t exception);
 
 /* Notify system performance monitor */
 extern kern_return_t sys_perf_notify(thread_t thread, int pid);
 
 /* Notify crash reporter */
 extern kern_return_t task_exception_notify(exception_type_t exception,
-	mach_exception_data_type_t code, mach_exception_data_type_t subcode);
+    mach_exception_data_type_t code, mach_exception_data_type_t subcode, const bool fatal);
 
-#endif	/* _KERN_EXCEPTION_H_ */
+#endif  /* _KERN_EXCEPTION_H_ */

@@ -2,7 +2,7 @@
  * Copyright (c) 1998-2000 Apple Computer, Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
- * 
+ *
  * This file contains Original Code and/or Modifications of Original Code
  * as defined in and that are subject to the Apple Public Source License
  * Version 2.0 (the 'License'). You may not use this file except in
@@ -11,10 +11,10 @@
  * unlawful or unlicensed copies of an Apple operating system, or to
  * circumvent, violate, or enable the circumvention or violation of, any
  * terms of an Apple operating system software license agreement.
- * 
+ *
  * Please obtain a copy of the License at
  * http://www.opensource.apple.com/apsl/ and read it before using this file.
- * 
+ *
  * The Original Code and all software distributed under the License are
  * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
@@ -22,14 +22,29 @@
  * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
  * Please see the License for the specific language governing rights and
  * limitations under the License.
- * 
+ *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
 
+#define IOKIT_ENABLE_SHARED_PTR
+
+#define DISABLE_DATAQUEUE_WARNING
+
 #include <IOKit/IODataQueue.h>
+
+#undef DISABLE_DATAQUEUE_WARNING
+#include <vm/vm_kern_xnu.h>
+
 #include <IOKit/IODataQueueShared.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <libkern/OSAtomic.h>
+#include <libkern/c++/OSSharedPtr.h>
+
+struct IODataQueueInternal {
+	mach_msg_header_t msg;
+	UInt32            queueSize;
+};
 
 #ifdef enqueue
 #undef enqueue
@@ -43,201 +58,249 @@
 
 OSDefineMetaClassAndStructors(IODataQueue, OSObject)
 
-IODataQueue *IODataQueue::withCapacity(UInt32 size)
+OSSharedPtr<IODataQueue>
+IODataQueue::withCapacity(UInt32 size)
 {
-    IODataQueue *dataQueue = new IODataQueue;
+	OSSharedPtr<IODataQueue> dataQueue = OSMakeShared<IODataQueue>();
 
-    if (dataQueue) {
-        if  (!dataQueue->initWithCapacity(size)) {
-            dataQueue->release();
-            dataQueue = 0;
-        }
-    }
+	if (dataQueue) {
+		if (!dataQueue->initWithCapacity(size)) {
+			return nullptr;
+		}
+	}
 
-    return dataQueue;
+	return dataQueue;
 }
 
-IODataQueue *IODataQueue::withEntries(UInt32 numEntries, UInt32 entrySize)
+OSSharedPtr<IODataQueue>
+IODataQueue::withEntries(UInt32 numEntries, UInt32 entrySize)
 {
-    IODataQueue *dataQueue = new IODataQueue;
+	OSSharedPtr<IODataQueue> dataQueue = OSMakeShared<IODataQueue>();
 
-    if (dataQueue) {
-        if (!dataQueue->initWithEntries(numEntries, entrySize)) {
-            dataQueue->release();
-            dataQueue = 0;
-        }
-    }
+	if (dataQueue) {
+		if (!dataQueue->initWithEntries(numEntries, entrySize)) {
+			return nullptr;
+		}
+	}
 
-    return dataQueue;
+	return dataQueue;
 }
 
-Boolean IODataQueue::initWithCapacity(UInt32 size)
+Boolean
+IODataQueue::initWithCapacity(UInt32 size)
 {
-    vm_size_t allocSize = 0;
+	vm_size_t allocSize = 0;
+	kern_return_t kr;
 
-    if (!super::init()) {
-        return false;
-    }
+	if (!super::init()) {
+		return false;
+	}
 
-    allocSize = round_page(size + DATA_QUEUE_MEMORY_HEADER_SIZE);
+	if (size > UINT32_MAX - DATA_QUEUE_MEMORY_HEADER_SIZE) {
+		return false;
+	}
 
-    if (allocSize < size) {
-        return false;
-    }
+	allocSize = round_page(size + DATA_QUEUE_MEMORY_HEADER_SIZE);
 
-    dataQueue = (IODataQueueMemory *)IOMallocAligned(allocSize, PAGE_SIZE);
-    if (dataQueue == 0) {
-        return false;
-    }
+	if (allocSize < size) {
+		return false;
+	}
 
-    dataQueue->queueSize    = size;
-    dataQueue->head         = 0;
-    dataQueue->tail         = 0;
+	assert(!notifyMsg);
+	notifyMsg = IOMallocType(IODataQueueInternal);
+	((IODataQueueInternal *)notifyMsg)->queueSize = size;
 
-    return true;
+	kr = kmem_alloc(kernel_map, (vm_offset_t *)&dataQueue, allocSize,
+	    (kma_flags_t)(KMA_DATA | KMA_ZERO), IOMemoryTag(kernel_map));
+	if (kr != KERN_SUCCESS) {
+		return false;
+	}
+
+	dataQueue->queueSize    = size;
+//  dataQueue->head         = 0;
+//  dataQueue->tail         = 0;
+
+	return true;
 }
 
-Boolean IODataQueue::initWithEntries(UInt32 numEntries, UInt32 entrySize)
+Boolean
+IODataQueue::initWithEntries(UInt32 numEntries, UInt32 entrySize)
 {
-    return (initWithCapacity((numEntries + 1) * (DATA_QUEUE_ENTRY_HEADER_SIZE + entrySize)));
+	// Checking overflow for (numEntries + 1)*(entrySize + DATA_QUEUE_ENTRY_HEADER_SIZE):
+	//  check (entrySize + DATA_QUEUE_ENTRY_HEADER_SIZE)
+	if ((entrySize > UINT32_MAX - DATA_QUEUE_ENTRY_HEADER_SIZE) ||
+	    //  check (numEntries + 1)
+	    (numEntries > UINT32_MAX - 1) ||
+	    //  check (numEntries + 1)*(entrySize + DATA_QUEUE_ENTRY_HEADER_SIZE)
+	    (entrySize + DATA_QUEUE_ENTRY_HEADER_SIZE > UINT32_MAX / (numEntries + 1))) {
+		return false;
+	}
+
+	return initWithCapacity((numEntries + 1) * (DATA_QUEUE_ENTRY_HEADER_SIZE + entrySize));
 }
 
-void IODataQueue::free()
+void
+IODataQueue::free()
 {
-    if (dataQueue) {
-        IOFreeAligned(dataQueue, round_page(dataQueue->queueSize + DATA_QUEUE_MEMORY_HEADER_SIZE));
-    }
+	if (notifyMsg) {
+		if (dataQueue) {
+			kmem_free(kernel_map, (vm_offset_t)dataQueue,
+			    round_page(((IODataQueueInternal *)notifyMsg)->queueSize +
+			    DATA_QUEUE_MEMORY_HEADER_SIZE));
+			dataQueue = NULL;
+		}
 
-    super::free();
+		IOFreeType(notifyMsg, IODataQueueInternal);
+		notifyMsg = NULL;
+	}
 
-    return;
+	super::free();
+
+	return;
 }
 
-Boolean IODataQueue::enqueue(void * data, UInt32 dataSize)
+Boolean
+IODataQueue::enqueue(void * data, UInt32 dataSize)
 {
-    const UInt32       head      = dataQueue->head;  // volatile
-    const UInt32       tail      = dataQueue->tail;
-    const UInt32       entrySize = dataSize + DATA_QUEUE_ENTRY_HEADER_SIZE;
-    IODataQueueEntry * entry;
+	UInt32             head;
+	UInt32             tail;
+	UInt32             newTail;
+	const UInt32       entrySize = dataSize + DATA_QUEUE_ENTRY_HEADER_SIZE;
+	UInt32             queueSize;
+	IODataQueueEntry * entry;
 
-    if ( tail >= head )
-    {
-        // Is there enough room at the end for the entry?
-        if ( (tail + entrySize) <= dataQueue->queueSize )
-        {
-            entry = (IODataQueueEntry *)((UInt8 *)dataQueue->queue + tail);
+	// Check for overflow of entrySize
+	if (dataSize > UINT32_MAX - DATA_QUEUE_ENTRY_HEADER_SIZE) {
+		return false;
+	}
 
-            entry->size = dataSize;
-            memcpy(&entry->data, data, dataSize);
+	// Force a single read of head and tail
+	// See rdar://problem/40780584 for an explanation of relaxed/acquire barriers
+	tail = __c11_atomic_load((_Atomic UInt32 *)&dataQueue->tail, __ATOMIC_RELAXED);
+	head = __c11_atomic_load((_Atomic UInt32 *)&dataQueue->head, __ATOMIC_ACQUIRE);
 
-            // The tail can be out of bound when the size of the new entry
-            // exactly matches the available space at the end of the queue.
-            // The tail can range from 0 to dataQueue->queueSize inclusive.
+	// Check for underflow of (dataQueue->queueSize - tail)
+	queueSize = ((IODataQueueInternal *) notifyMsg)->queueSize;
+	if ((queueSize < tail) || (queueSize < head)) {
+		return false;
+	}
 
-            dataQueue->tail += entrySize;
-        }
-        else if ( head > entrySize ) 	// Is there enough room at the beginning?
-        {
-            // Wrap around to the beginning, but do not allow the tail to catch
-            // up to the head.
+	if (tail >= head) {
+		// Is there enough room at the end for the entry?
+		if ((entrySize <= UINT32_MAX - tail) &&
+		    ((tail + entrySize) <= queueSize)) {
+			entry = (IODataQueueEntry *)((UInt8 *)dataQueue->queue + tail);
 
-            dataQueue->queue->size = dataSize;
+			entry->size = dataSize;
+			__nochk_memcpy(&entry->data, data, dataSize);
 
-            // We need to make sure that there is enough room to set the size before
-            // doing this. The user client checks for this and will look for the size
-            // at the beginning if there isn't room for it at the end.
+			// The tail can be out of bound when the size of the new entry
+			// exactly matches the available space at the end of the queue.
+			// The tail can range from 0 to dataQueue->queueSize inclusive.
 
-            if ( ( dataQueue->queueSize - tail ) >= DATA_QUEUE_ENTRY_HEADER_SIZE )
-            {
-                ((IODataQueueEntry *)((UInt8 *)dataQueue->queue + tail))->size = dataSize;
-            }
+			newTail = tail + entrySize;
+		} else if (head > entrySize) { // Is there enough room at the beginning?
+			// Wrap around to the beginning, but do not allow the tail to catch
+			// up to the head.
 
-            memcpy(&dataQueue->queue->data, data, dataSize);
-            dataQueue->tail = entrySize;
-        }
-        else
-        {
-            return false;	// queue is full
-        }
-    }
-    else
-    {
-        // Do not allow the tail to catch up to the head when the queue is full.
-        // That's why the comparison uses a '>' rather than '>='.
+			dataQueue->queue->size = dataSize;
 
-        if ( (head - tail) > entrySize )
-        {
-            entry = (IODataQueueEntry *)((UInt8 *)dataQueue->queue + tail);
+			// We need to make sure that there is enough room to set the size before
+			// doing this. The user client checks for this and will look for the size
+			// at the beginning if there isn't room for it at the end.
 
-            entry->size = dataSize;
-            memcpy(&entry->data, data, dataSize);
-            dataQueue->tail += entrySize;
-        }
-        else
-        {
-            return false;	// queue is full
-        }
-    }
+			if ((queueSize - tail) >= DATA_QUEUE_ENTRY_HEADER_SIZE) {
+				((IODataQueueEntry *)((UInt8 *)dataQueue->queue + tail))->size = dataSize;
+			}
 
-    // Send notification (via mach message) that data is available.
+			__nochk_memcpy(&dataQueue->queue->data, data, dataSize);
+			newTail = entrySize;
+		} else {
+			return false; // queue is full
+		}
+	} else {
+		// Do not allow the tail to catch up to the head when the queue is full.
+		// That's why the comparison uses a '>' rather than '>='.
 
-    if ( ( head == tail )                /* queue was empty prior to enqueue() */
-    ||   ( dataQueue->head == tail ) )   /* queue was emptied during enqueue() */
-    {
-        sendDataAvailableNotification();
-    }
+		if ((head - tail) > entrySize) {
+			entry = (IODataQueueEntry *)((UInt8 *)dataQueue->queue + tail);
 
-    return true;
+			entry->size = dataSize;
+			__nochk_memcpy(&entry->data, data, dataSize);
+			newTail = tail + entrySize;
+		} else {
+			return false; // queue is full
+		}
+	}
+
+	// Publish the data we just enqueued
+	__c11_atomic_store((_Atomic UInt32 *)&dataQueue->tail, newTail, __ATOMIC_RELEASE);
+
+	if (tail != head) {
+		//
+		// The memory barrier below paris with the one in ::dequeue
+		// so that either our store to the tail cannot be missed by
+		// the next dequeue attempt, or we will observe the dequeuer
+		// making the queue empty.
+		//
+		// Of course, if we already think the queue is empty,
+		// there's no point paying this extra cost.
+		//
+		__c11_atomic_thread_fence(__ATOMIC_SEQ_CST);
+		head = __c11_atomic_load((_Atomic UInt32 *)&dataQueue->head, __ATOMIC_RELAXED);
+	}
+
+	if (tail == head) {
+		// Send notification (via mach message) that data is now available.
+		sendDataAvailableNotification();
+	}
+	return true;
 }
 
-void IODataQueue::setNotificationPort(mach_port_t port)
+void
+IODataQueue::setNotificationPort(mach_port_t port)
 {
-    static struct _notifyMsg init_msg = { {
-        MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0),
-        sizeof (struct _notifyMsg),
-        MACH_PORT_NULL,
-        MACH_PORT_NULL,
-        0,
-        0
-    } };
+	mach_msg_header_t * msgh;
 
-    if (notifyMsg == 0) {
-        notifyMsg = IOMalloc(sizeof(struct _notifyMsg));
-    }
-
-    *((struct _notifyMsg *)notifyMsg) = init_msg;
-
-    ((struct _notifyMsg *)notifyMsg)->h.msgh_remote_port = port;
+	msgh = &((IODataQueueInternal *) notifyMsg)->msg;
+	bzero(msgh, sizeof(mach_msg_header_t));
+	msgh->msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+	msgh->msgh_size = sizeof(mach_msg_header_t);
+	msgh->msgh_remote_port = port;
 }
 
-void IODataQueue::sendDataAvailableNotification()
+void
+IODataQueue::sendDataAvailableNotification()
 {
-    kern_return_t		kr;
-    mach_msg_header_t *	msgh;
+	kern_return_t       kr;
+	mach_msg_header_t * msgh;
 
-    msgh = (mach_msg_header_t *)notifyMsg;
-    if (msgh && msgh->msgh_remote_port) {
-        kr = mach_msg_send_from_kernel_with_options(msgh, msgh->msgh_size, MACH_SEND_TIMEOUT, MACH_MSG_TIMEOUT_NONE);
-        switch(kr) {
-            case MACH_SEND_TIMED_OUT:	// Notification already sent
-            case MACH_MSG_SUCCESS:
-            case MACH_SEND_NO_BUFFER:
-                break;
-            default:
-                IOLog("%s: dataAvailableNotification failed - msg_send returned: %d\n", /*getName()*/"IODataQueue", kr);
-                break;
-        }
-    }
+	msgh = &((IODataQueueInternal *) notifyMsg)->msg;
+	if (msgh->msgh_remote_port) {
+		kr = mach_msg_send_from_kernel_with_options(msgh, msgh->msgh_size,
+		    MACH64_SEND_TIMEOUT, MACH_MSG_TIMEOUT_NONE);
+		switch (kr) {
+		case MACH_SEND_TIMED_OUT: // Notification already sent
+		case MACH_MSG_SUCCESS:
+		case MACH_SEND_NO_BUFFER:
+			break;
+		default:
+			IOLog("%s: dataAvailableNotification failed - msg_send returned: %d\n", /*getName()*/ "IODataQueue", kr);
+			break;
+		}
+	}
 }
 
-IOMemoryDescriptor *IODataQueue::getMemoryDescriptor()
+OSSharedPtr<IOMemoryDescriptor>
+IODataQueue::getMemoryDescriptor()
 {
-    IOMemoryDescriptor *descriptor = 0;
+	OSSharedPtr<IOMemoryDescriptor> descriptor;
+	UInt32              queueSize;
 
-    if (dataQueue != 0) {
-        descriptor = IOMemoryDescriptor::withAddress(dataQueue, dataQueue->queueSize + DATA_QUEUE_MEMORY_HEADER_SIZE, kIODirectionOutIn);
-    }
+	queueSize = ((IODataQueueInternal *) notifyMsg)->queueSize;
+	if (dataQueue != NULL) {
+		descriptor = IOMemoryDescriptor::withAddress(dataQueue, queueSize + DATA_QUEUE_MEMORY_HEADER_SIZE, kIODirectionOutIn);
+	}
 
-    return descriptor;
+	return descriptor;
 }
-

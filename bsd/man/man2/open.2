@@ -56,11 +56,11 @@
 .\"
 .\"     @(#)open.2	8.2 (Berkeley) 11/16/93
 .\"
-.Dd November 10, 2010
+.Dd June 3, 2021
 .Dt OPEN 2
 .Os BSD 4
 .Sh NAME
-.Nm open
+.Nm open , openat
 .Nd open or create a file for reading or writing
 .Sh SYNOPSIS
 .\" OH??? .Fd #include <sys/stat.h>
@@ -71,6 +71,8 @@
 .Fa "int oflag"
 .Fa "..."
 .Fc
+.Ft int
+.Fn openat "int fd" "const char *path" "int oflag" "..."
 .Sh DESCRIPTION
 The file name specified by
 .Fa path
@@ -86,8 +88,10 @@ argument may indicate that the file is to be
 created if it does not exist (by specifying the
 .Dv O_CREAT
 flag).  In this case,
-.Nm
-requires a third argument
+.Fn open
+and
+.Fn openat
+require an additional argument
 .Fa "mode_t mode" ;
 the file is created with mode
 .Fa mode
@@ -96,14 +100,50 @@ as described in
 and modified by the process' umask value (see
 .Xr umask 2 ) .
 .Pp
-The flags specified are formed by
-.Em or Ns 'ing
-the following values:
+The
+.Fn openat
+function is equivalent to the
+.Fn open
+function except in the case where the
+.Fa path
+specifies a relative path.
+In this case the file to be opened is determined relative to the directory
+associated with the file descriptor
+.Fa fd
+instead of the current working directory.
+The
+.Fa oflag
+argument and the optional fourth argument correspond exactly to
+the arguments for
+.Fn open .
+If
+.Fn openat
+is passed the special value
+.Dv AT_FDCWD
+in the
+.Fa fd
+argument, the current working directory is used
+and the behavior is identical to a call to
+.Fn open .
+.Pp
+The flags specified
+for the
+.Fa oflag
+argument must include exactly one of the following file access modes:
 .Pp
 .Bd -literal -offset indent -compact
 O_RDONLY	open for reading only
 O_WRONLY	open for writing only
 O_RDWR		open for reading and writing
+O_SEARCH	open directory for searching
+O_EXEC		open for execute only
+.Ed
+.Pp
+In addition any combination of the following values can be
+.Em or Ns 'ed in
+.Fa oflag:
+.Pp
+.Bd -literal -offset indent -compact
 O_NONBLOCK	do not block on open or for data to become available
 O_APPEND	append on each write
 O_CREAT		create file if it does not exist
@@ -111,10 +151,13 @@ O_TRUNC		truncate size to 0
 O_EXCL		error if O_CREAT and the file exists
 O_SHLOCK	atomically obtain a shared lock
 O_EXLOCK	atomically obtain an exclusive lock
+O_DIRECTORY	restrict open to a directory
 O_NOFOLLOW	do not follow symlinks
 O_SYMLINK	allow open of symlinks
 O_EVTONLY	descriptor requested for event notifications only
 O_CLOEXEC	mark as close-on-exec
+O_NOFOLLOW_ANY	do not follow symlinks in the entire path
+O_RESOLVE_BENEATH	path must reside in the hierarchy beneath the starting directory
 .Ed
 .Pp
 Opening a file with
@@ -166,6 +209,14 @@ the request for the lock will never fail
 (provided that the underlying filesystem supports locking).
 .Pp
 If
+.Dv O_DIRECTORY
+is used in the mask and the target file passed to
+.Fn open
+is not a directory then the
+.Fn open
+will fail.
+.Pp
+If
 .Dv O_NOFOLLOW
 is used in the mask and the target file passed to
 .Fn open
@@ -196,6 +247,22 @@ flag.  The state of the file descriptor flags can be inspected
 using the F_GETFD fcntl.  See
 .Xr fcntl 2 .
 .Pp
+If
+.Dv O_NOFOLLOW_ANY
+is used in the mask and any component of the path passed to
+.Fn open
+is a symbolic link then the
+.Fn open
+will fail.
+.Pp
+If
+.Dv O_RESOLVE_BENEATH
+is used in the mask and the specified relative path does not reside in the directory hierarchy beneath the starting directory passed by
+.Fa fd
+then the
+.Fn openat
+will fail.
+.Pp
 If successful,
 .Fn open
 returns a non-negative integer, termed a file descriptor.
@@ -215,6 +282,8 @@ and
 .Pp
 The system imposes a limit on the number of file descriptors
 that can be held open simultaneously by one process.
+.Pp
+A file's metadata can be updated even if the file was opened in read-only mode.
 .Xr Getdtablesize 2
 returns the current system limit.
 .Sh RETURN VALUES
@@ -232,7 +301,7 @@ The named file is opened unless:
 Search permission is denied for a component of the path prefix.
 .\" ===========
 .It Bq Er EACCES
-The required permissions (for reading and/or writing)
+The required permissions (for reading and/or writing or search or executing)
 are denied for the given flags.
 .\" ===========
 .It Bq Er EACCES
@@ -295,6 +364,10 @@ allocating the inode for
 The named file is a directory, and the arguments specify
 that it is to be opened for writing.
 .\" ===========
+.It Bq Er EISDIR
+The named file is a directory, and the arguments specify
+that it is to be opened for executing.
+.\" ===========
 .It Bq Er ELOOP
 Too many symbolic links are encountered in translating the pathname.
 This is taken to be indicative of a looping symbolic link.
@@ -312,9 +385,22 @@ characters.
 .It Bq Er ENFILE
 The system file table is full.
 .\" ===========
+.It Bq Er ENOTDIR
+.Dv O_DIRECTORY
+was specified and the target is not a directory.
+.\" ===========
+.It Bq Er ENOTDIR
+.Dv O_SEARCH
+was specified and the target is not a directory.
+.\" ===========
 .It Bq Er ELOOP
 .Dv O_NOFOLLOW
 was specified and the target is a symbolic link.
+.\" ===========
+.\" ===========
+.It Bq Er ELOOP
+.Dv O_NOFOLLOW_ANY
+was specified and and a component of the path is a symbolic link.
 .\" ===========
 .It Bq Er ENOENT
 .Dv O_CREAT
@@ -340,6 +426,15 @@ file is being created.
 .\" ===========
 .It Bq Er ENOTDIR
 A component of the path prefix is not a directory.
+.\" ===========
+.It Bq Er EDEADLK
+A component of the pathname refers to a
+.Dq dataless
+directory that requires materialization and the I/O policy of the current
+thread or process disallows dataless directory materialization
+.Po see
+.Xr getiopolicy_np 3
+.Pc .
 .\" ===========
 .It Bq Er ENXIO
 The named file is a character-special or block-special file
@@ -371,6 +466,32 @@ The file is a pure procedure (shared text) file that is being
 executed and the
 .Fn open
 call requests write access.
+.It Bq Er EBADF
+The
+.Fa path
+argument does not specify an absolute path and the
+.Fa fd
+argument is
+neither
+.Dv AT_FDCWD
+nor a valid file descriptor open for searching.
+.It Bq Er ENOTDIR
+The
+.Fa path
+argument is not an absolute path and
+.Fa fd
+is neither
+.Dv AT_FDCWD
+nor a file descriptor associated with a directory.
+.It Bq Er EILSEQ
+The filename does not match the encoding rules.
+.It Bq Er EWOULDBLOCK
+O_SHLOCK or O_EXLOCK is specified, but the file is locked and the O_NONBLOCK option was specified.
+.It Bq Er EACCES
+.Fa path
+does not reside in the directory hierarchy beneath the starting directory passed by
+.Fa fd
+and O_RESOLVE_BENEATH option was specified.
 .El
 .Sh COMPATIBILITY
 .Fn open
@@ -392,3 +513,6 @@ An
 .Fn open
 function call appeared in 
 .At v6 .
+The
+.Fn openat
+function was introduced in OS X 10.10

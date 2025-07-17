@@ -2,8 +2,8 @@
 #
 # This tool is used to stamp kernel version information into files at kernel
 # build time.  Each argument provided on the command line is the path to a file
-# that needs to be updated with the current verison information.  The file
-# xnu/config/MasterVersion is read to determine the version number to use.
+# that needs to be updated with the current version information.  The file
+# $OBJROOT/xnuVersion is read to determine the version number to use.
 # Each file is read, and all occurrences of the following strings are replaced
 # in-place like so:
 #   ###KERNEL_VERSION_LONG###               1.2.3b4
@@ -14,6 +14,7 @@
 #   ###KERNEL_VERSION_REVISION###           3
 #   ###KERNEL_VERSION_STAGE###              VERSION_STAGE_BETA	(see libkern/version.h)
 #   ###KERNEL_VERSION_PRERELEASE_LEVEL###   4
+#   ###KERNEL_BUILD_CONFIG###               development
 #   ###KERNEL_BUILDER###                    root
 #   ###KERNEL_BUILD_OBJROOT###              xnu/xnu-690.obj~2/RELEASE_PPC
 #   ###KERNEL_BUILD_DATE###                 Sun Oct 24 05:33:28 PDT 2004
@@ -46,8 +47,8 @@ sub WriteFile {
 die("SRCROOT not defined") unless defined($ENV{'SRCROOT'});
 die("OBJROOT not defined") unless defined($ENV{'OBJROOT'});
 
-my $versfile = "MasterVersion";
-$versfile = "$ENV{'SRCROOT'}/config/$versfile" if ($ENV{'SRCROOT'});
+my $versfile = "xnuVersion";
+$versfile = "$ENV{'OBJROOT'}/$versfile" if ($ENV{'OBJROOT'});
 my $BUILD_SRCROOT=$ENV{'SRCROOT'};
 $BUILD_SRCROOT =~ s,/+$,,;
 my $BUILD_OBJROOT=$ENV{'OBJROOT'};
@@ -56,36 +57,84 @@ my $BUILD_OBJPATH=$ENV{'TARGET'} || $ENV{'OBJROOT'};
 $BUILD_OBJPATH =~ s,/+$,,;
 my $BUILD_DATE = `date`;
 $BUILD_DATE =~ s/[\n\t]//g;
+my $BUILD_CONFIG = "unknown";
+$BUILD_CONFIG = $ENV{'CURRENT_KERNEL_CONFIG_LC'} if defined($ENV{'CURRENT_KERNEL_CONFIG_LC'});
 my $BUILDER=`whoami`;
 $BUILDER =~ s/[\n\t]//g;
+my $RC_STRING = $ENV{'RC_ProjectNameAndSourceVersion'} . "~" . $ENV{'RC_ProjectBuildVersion'} if defined($ENV{'RC_XBS'});
 
-# Handle two scenarios:
+# Handle four scenarios:
 # SRCROOT=/tmp/xnu
 # OBJROOT=/tmp/xnu/BUILD/obj
 # OBJPATH=/tmp/xnu/BUILD/obj/RELEASE_X86_64
 #
-# SRCROOT=/SourceCache/xnu/xnu-1234
-# OBJROOT=/tmp/xnu/xnu-1234~1.obj
-# OBJPATH=/tmp/xnu/xnu-1234~1.obj/RELEASE_X86_64
+# SRCROOT=/SourceCache/xnu/xnu-2706
+# OBJROOT=/BinaryCache/xnu/xnu-2706~3/Objects
+# OBJPATH=/BinaryCache/xnu/xnu-2706~3/Objects/DEVELOPMENT_X86_64
+# RC_XBS=YES (XBS-16.3+)
+# RC_ProjectNameAndSourceVersion=xnu-2706
+# RC_ProjectBuildVersion=3
+#
+# SRCROOT=/SourceCache/xnu/xnu-2706
+# OBJROOT=/private/var/tmp/xnu/xnu-2706~2
+# OBJPATH=/private/var/tmp/xnu/xnu-2706~2/DEVELOPMENT_ARM_S5L8940X
+# RC_XBS=YES (<XBS-16.3)
+# RC_ProjectNameAndSourceVersion=xnu-2706
+# RC_ProjectBuildVersion=2
+#
+# SRCROOT=/tmp/xnu-2800.0.1_xnu-svn.roots/Sources/xnu-2800.0.1
+# OBJROOT=/private/tmp/xnu-2800.0.1_xnu-svn.roots/BuildRecords/xnu-2800.0.1_install/Objects
+# OBJPATH=/private/tmp/xnu-2800.0.1_xnu-svn.roots/BuildRecords/xnu-2800.0.1_install/Objects/DEVELOPMENT_X86_64
+# RC_XBS=YES (buildit)
+# RC_BUILDIT=YES
+# RC_ProjectNameAndSourceVersion=xnu-2800.0.1
+# RC_ProjectBuildVersion=1
+#
 #
 # If SRCROOT is a strict prefix of OBJPATH, we
 # want to preserve the "interesting" part
 # starting with "xnu". If it's not a prefix,
 # the basename of OBJROOT itself is "interesting".
+# Newer versions of XBS just set this to "Objects", so we
+# need to synthesize the directory name to be more interesting.
+#
+
+sub describe {
+  my ($basename) = @_;
+
+  # get a git tag if we can
+  my $tag = `git describe --dirty 2>/dev/null`;
+  chomp $tag;
+  if ($? != 0 or $tag !~ /^xnu-([^\s\n]+)$/) {
+    return $basename;
+  }
+
+  # If basename is just 'xnu' then replace it with the tag.  Otherwise add
+  # the tag in brackets.
+  if ($basename eq 'xnu') {
+    return $tag
+  } else {
+    return "${basename}[$tag]"
+  }
+}
 
 if ($BUILD_OBJPATH =~ m,^$BUILD_SRCROOT/(.*)$,) {
-    $BUILD_OBJROOT = basename($BUILD_SRCROOT) . "/" . $1;
+    $BUILD_OBJROOT = describe(basename($BUILD_SRCROOT)) . "/" . $1;
 } elsif ($BUILD_OBJPATH =~ m,^$BUILD_OBJROOT/(.*)$,) {
-    $BUILD_OBJROOT = basename($BUILD_OBJROOT) . "/" . $1;
+  if (defined($RC_STRING)) {
+	$BUILD_OBJROOT = $RC_STRING . "/" . $1;
+  } else {
+	$BUILD_OBJROOT = describe(basename($BUILD_OBJROOT)) . "/" . $1;
+  }
 } else {
-    # Use original OBJROOT
+  # Use original OBJROOT
 }
 
 my $rawvers = &ReadFile($versfile);
 #$rawvers =~ s/\s//g;
 ($rawvers) = split "\n", $rawvers;
 my ($VERSION_MAJOR, $VERSION_MINOR, $VERSION_VARIANT) = split /\./, $rawvers;
-die "newvers: Invalid MasterVersion \"$rawvers\"!!! " if (!$VERSION_MAJOR);
+die "newvers: Invalid xnuVersion \"$rawvers\"!!! " if (!$VERSION_MAJOR);
 $VERSION_MINOR = "0" unless ($VERSION_MINOR);
 $VERSION_VARIANT = "0" unless ($VERSION_VARIANT);
 $VERSION_VARIANT =~ tr/A-Z/a-z/;
@@ -107,6 +156,12 @@ my $VERSION_SHORT = "$VERSION_MAJOR.$VERSION_MINOR.$VERSION_REVISION";
 my $VERSION_LONG = $VERSION_SHORT;
 $VERSION_LONG .= "$stage$VERSION_PRERELEASE_LEVEL" if (($stage ne "r") || ($VERSION_PRERELEASE_LEVEL != 0));
 
+# Allow environment to override some versioning information (allowing for
+# reproducible builds or building with changes that shouldn't affect the
+# build artifacts).
+$BUILD_DATE    = $ENV{'KERNEL_BUILD_DATE'}    ? $ENV{'KERNEL_BUILD_DATE'}    : $BUILD_DATE;
+$BUILD_OBJROOT = $ENV{'KERNEL_BUILD_OBJROOT'} ? $ENV{'KERNEL_BUILD_OBJROOT'} : $BUILD_OBJROOT;
+
 my $file;
 foreach $file (@ARGV) {
   print "newvers.pl: Stamping version \"$VERSION_LONG\" into \"$file\" ...";
@@ -120,6 +175,7 @@ foreach $file (@ARGV) {
   $count += $data =~ s/###KERNEL_VERSION_REVISION###/$VERSION_REVISION/g;
   $count += $data =~ s/###KERNEL_VERSION_STAGE###/$VERSION_STAGE/g;
   $count += $data =~ s/###KERNEL_VERSION_PRERELEASE_LEVEL###/$VERSION_PRERELEASE_LEVEL/g;
+  $count += $data =~ s/###KERNEL_BUILD_CONFIG###/$BUILD_CONFIG/g;
   $count += $data =~ s/###KERNEL_BUILDER###/$BUILDER/g;
   $count += $data =~ s/###KERNEL_BUILD_OBJROOT###/$BUILD_OBJROOT/g;
   $count += $data =~ s/###KERNEL_BUILD_DATE###/$BUILD_DATE/g;
@@ -137,6 +193,7 @@ if (0==scalar @ARGV) {
   print "newvers.pl: ###KERNEL_VERSION_REVISION### = $VERSION_REVISION\n";
   print "newvers.pl: ###KERNEL_VERSION_STAGE### = $VERSION_STAGE\n";
   print "newvers.pl: ###KERNEL_VERSION_PRERELEASE_LEVEL### = $VERSION_PRERELEASE_LEVEL\n";
+  print "newvers.pl: ###KERNEL_BUILD_CONFIG### = $BUILD_CONFIG\n";
   print "newvers.pl: ###KERNEL_BUILDER### = $BUILDER\n";
   print "newvers.pl: ###KERNEL_BUILD_OBJROOT### = $BUILD_OBJROOT\n";
   print "newvers.pl: ###KERNEL_BUILD_DATE### = $BUILD_DATE\n";

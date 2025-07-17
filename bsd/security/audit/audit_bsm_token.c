@@ -56,11 +56,11 @@
 #include <string.h>
 
 #if CONFIG_AUDIT
-#define GET_TOKEN_AREA(t, dptr, length) do {				\
-	t = malloc(sizeof(token_t), M_AUDITBSM, M_WAITOK);		\
-	t->t_data = malloc(length, M_AUDITBSM, M_WAITOK | M_ZERO);	\
-	t->len = length;						\
-	dptr = t->t_data;						\
+#define GET_TOKEN_AREA(t, dptr, length) do {                       \
+	t = kalloc_type(token_t, Z_WAITOK | Z_NOFAIL);                 \
+	t->t_data = kalloc_data(length, Z_WAITOK | Z_ZERO | Z_NOFAIL); \
+	t->len = length;                                               \
+	dptr = t->t_data;                                              \
 } while (0)
 
 /*
@@ -76,12 +76,16 @@ au_to_arg32(char n, const char *text, u_int32_t v)
 	token_t *t;
 	u_char *dptr = NULL;
 	u_int16_t textlen;
+	size_t tokenlen;
 
 	textlen = strlen(text);
 	textlen += 1;
 
-	GET_TOKEN_AREA(t, dptr, 2 * sizeof(u_char) + sizeof(u_int32_t) +
-	    sizeof(u_int16_t) + textlen);
+	tokenlen = 2 * sizeof(u_char) + sizeof(u_int32_t) + sizeof(u_int16_t) + textlen;
+	KASSERT(tokenlen <= KALLOC_SAFE_ALLOC_SIZE,
+	    ("au_to_arg32: token length (%zu) exceeds maximum allowed size", tokenlen));
+
+	GET_TOKEN_AREA(t, dptr, tokenlen);
 
 	ADD_U_CHAR(dptr, AUT_ARG32);
 	ADD_U_CHAR(dptr, n);
@@ -89,7 +93,7 @@ au_to_arg32(char n, const char *text, u_int32_t v)
 	ADD_U_INT16(dptr, textlen);
 	ADD_STRING(dptr, text, textlen);
 
-	return (t);
+	return t;
 }
 
 token_t *
@@ -98,12 +102,16 @@ au_to_arg64(char n, const char *text, u_int64_t v)
 	token_t *t;
 	u_char *dptr = NULL;
 	u_int16_t textlen;
+	size_t tokenlen;
 
 	textlen = strlen(text);
 	textlen += 1;
 
-	GET_TOKEN_AREA(t, dptr, 2 * sizeof(u_char) + sizeof(u_int64_t) +
-	    sizeof(u_int16_t) + textlen);
+	tokenlen = 2 * sizeof(u_char) + sizeof(u_int64_t) + sizeof(u_int16_t) + textlen;
+	KASSERT(tokenlen <= KALLOC_SAFE_ALLOC_SIZE,
+	    ("au_to_arg64: token length (%zu) exceeds maximum allowed size", tokenlen));
+
+	GET_TOKEN_AREA(t, dptr, tokenlen);
 
 	ADD_U_CHAR(dptr, AUT_ARG64);
 	ADD_U_CHAR(dptr, n);
@@ -111,14 +119,13 @@ au_to_arg64(char n, const char *text, u_int64_t v)
 	ADD_U_INT16(dptr, textlen);
 	ADD_STRING(dptr, text, textlen);
 
-	return (t);
+	return t;
 }
 
 token_t *
 au_to_arg(char n, const char *text, u_int32_t v)
 {
-
-	return (au_to_arg32(n, text, v));
+	return au_to_arg32(n, text, v);
 }
 
 #if defined(_KERNEL) || defined(KERNEL)
@@ -164,14 +171,15 @@ au_to_attr32(struct vnode_au_info *vni)
 	if (sizeof(vni->vn_fileid) == sizeof(uint32_t)) {
 		ADD_U_INT32(dptr, pad0_32);
 		ADD_U_INT32(dptr, vni->vn_fileid);
-	} else if (sizeof(vni->vn_fileid) == sizeof(uint64_t))
+	} else if (sizeof(vni->vn_fileid) == sizeof(uint64_t)) {
 		ADD_U_INT64(dptr, vni->vn_fileid);
-	else
+	} else {
 		ADD_U_INT64(dptr, 0LL);
+	}
 
 	ADD_U_INT32(dptr, vni->vn_dev);
 
-	return (t);
+	return t;
 }
 
 token_t *
@@ -188,7 +196,7 @@ au_to_attr64(struct vnode_au_info *vni)
 	ADD_U_CHAR(dptr, AUT_ATTR64);
 
 	/*
-	 * Darwin defines the size for the file mode 
+	 * Darwin defines the size for the file mode
 	 * as 2 bytes; BSM defines 4 so pad with 0
 	 */
 	ADD_U_INT16(dptr, pad0_16);
@@ -207,21 +215,21 @@ au_to_attr64(struct vnode_au_info *vni)
 	if (sizeof(vni->vn_fileid) == sizeof(uint32_t)) {
 		ADD_U_INT32(dptr, pad0_32);
 		ADD_U_INT32(dptr, vni->vn_fileid);
-	} else if (sizeof(vni->vn_fileid) == sizeof(uint64_t))
+	} else if (sizeof(vni->vn_fileid) == sizeof(uint64_t)) {
 		ADD_U_INT64(dptr, vni->vn_fileid);
-	else
+	} else {
 		ADD_U_INT64(dptr, 0LL);
+	}
 
 	ADD_U_INT64(dptr, vni->vn_dev);
 
-	return (t);
+	return t;
 }
 
 token_t *
 au_to_attr(struct vnode_au_info *vni)
 {
-
-	return (au_to_attr32(vni));
+	return au_to_attr32(vni);
 }
 #endif /* defined(_KERNEL) || defined(KERNEL) */
 
@@ -237,12 +245,12 @@ au_to_data(char unit_print, char unit_type, char unit_count, const char *p)
 {
 	token_t *t;
 	u_char *dptr = NULL;
-	size_t datasize, totdata;
+	size_t datasize, totdata, tokenlen;
 
 	/* Determine the size of the basic unit. */
 	switch (unit_type) {
 	case AUR_BYTE:
-	/* case AUR_CHAR: */
+		/* case AUR_CHAR: */
 		datasize = AUR_BYTE_SIZE;
 		break;
 
@@ -251,7 +259,7 @@ au_to_data(char unit_print, char unit_type, char unit_count, const char *p)
 		break;
 
 	case AUR_INT32:
-	/* case AUR_INT: */
+		/* case AUR_INT: */
 		datasize = AUR_INT32_SIZE;
 		break;
 
@@ -267,7 +275,11 @@ au_to_data(char unit_print, char unit_type, char unit_count, const char *p)
 
 	totdata = datasize * (size_t)unit_count;
 
-	GET_TOKEN_AREA(t, dptr, 4 * sizeof(u_char) + totdata);
+	tokenlen = 4 * sizeof(u_char) + totdata;
+	KASSERT(tokenlen <= KALLOC_SAFE_ALLOC_SIZE,
+	    ("au_to_data: token length (%zu) exceeds maximum allowed size", tokenlen));
+
+	GET_TOKEN_AREA(t, dptr, tokenlen);
 
 	ADD_U_CHAR(dptr, AUT_DATA);
 	ADD_U_CHAR(dptr, unit_print);
@@ -275,7 +287,7 @@ au_to_data(char unit_print, char unit_type, char unit_count, const char *p)
 	ADD_U_CHAR(dptr, unit_count);
 	ADD_MEM(dptr, p, totdata);
 
-	return (t);
+	return t;
 }
 
 /*
@@ -295,7 +307,7 @@ au_to_exit(int retval, int err)
 	ADD_U_INT32(dptr, err);
 	ADD_U_INT32(dptr, retval);
 
-	return (t);
+	return t;
 }
 
 /*
@@ -303,8 +315,7 @@ au_to_exit(int retval, int err)
 token_t *
 au_to_groups(int *groups)
 {
-
-	return (au_to_newgroups(AUDIT_MAX_GROUPS, (gid_t *)groups));
+	return au_to_newgroups(AUDIT_MAX_GROUPS, (gid_t *)groups);
 }
 
 /*
@@ -318,16 +329,23 @@ au_to_newgroups(u_int16_t n, gid_t *groups)
 	token_t *t;
 	u_char *dptr = NULL;
 	int i;
+	size_t tokenlen;
 
-	GET_TOKEN_AREA(t, dptr, sizeof(u_char) + sizeof(u_int16_t) +
-	    n * sizeof(u_int32_t));
+	KASSERT(n <= AUDIT_MAX_GROUPS, "au_to_newgroups: groups exceed maximum number of those allowed");
+
+	tokenlen = sizeof(u_char) + sizeof(u_int16_t) + n * sizeof(u_int32_t);
+	KASSERT(tokenlen <= KALLOC_SAFE_ALLOC_SIZE,
+	    ("au_to_newgroups: token length (%zu) exceeds maximum allowed size", tokenlen));
+
+	GET_TOKEN_AREA(t, dptr, tokenlen);
 
 	ADD_U_CHAR(dptr, AUT_NEWGROUPS);
 	ADD_U_INT16(dptr, n);
-	for (i = 0; i < n; i++)
+	for (i = 0; i < n; i++) {
 		ADD_U_INT32(dptr, groups[i]);
+	}
 
-	return (t);
+	return t;
 }
 
 /*
@@ -345,7 +363,7 @@ au_to_in_addr(struct in_addr *internet_addr)
 	ADD_U_CHAR(dptr, AUT_IN_ADDR);
 	ADD_MEM(dptr, &internet_addr->s_addr, sizeof(uint32_t));
 
-	return (t);
+	return t;
 }
 
 /*
@@ -366,7 +384,7 @@ au_to_in_addr_ex(struct in6_addr *internet_addr)
 	ADD_U_INT32(dptr, type);
 	ADD_MEM(dptr, internet_addr, 4 * sizeof(uint32_t));
 
-	return (t);
+	return t;
 }
 
 /*
@@ -386,7 +404,7 @@ au_to_ip(struct ip *ip)
 	ADD_U_CHAR(dptr, AUT_IP);
 	ADD_MEM(dptr, ip, sizeof(struct ip));
 
-	return (t);
+	return t;
 }
 
 /*
@@ -406,7 +424,7 @@ au_to_ipc(char type, int id)
 	ADD_U_CHAR(dptr, type);
 	ADD_U_INT32(dptr, id);
 
-	return (t);
+	return t;
 }
 
 /*
@@ -426,8 +444,9 @@ au_to_ipc_perm(struct ipc_perm *perm)
 	u_char *dptr = NULL;
 	u_int16_t pad0 = 0;
 
-	if (perm == NULL)
+	if (perm == NULL) {
 		return NULL;
+	}
 
 	GET_TOKEN_AREA(t, dptr, sizeof(u_char) + 12 * sizeof(u_int16_t) +
 	    sizeof(u_int32_t));
@@ -435,7 +454,7 @@ au_to_ipc_perm(struct ipc_perm *perm)
 	ADD_U_CHAR(dptr, AUT_IPC_PERM);
 
 	/*
-	 * Darwin defines the size for the file mode 
+	 * Darwin defines the size for the file mode
 	 * as 2 bytes; BSM defines 4 so pad with 0
 	 */
 	ADD_U_INT32(dptr, perm->uid);
@@ -452,7 +471,7 @@ au_to_ipc_perm(struct ipc_perm *perm)
 	ADD_U_INT16(dptr, pad0);
 	ADD_U_INT16(dptr, perm->_key);
 
-	return (t);
+	return t;
 }
 
 /*
@@ -470,7 +489,7 @@ au_to_iport(u_int16_t iport)
 	ADD_U_CHAR(dptr, AUT_IPORT);
 	ADD_U_INT16(dptr, iport);
 
-	return (t);
+	return t;
 }
 
 /*
@@ -483,14 +502,19 @@ au_to_opaque(const char *data, uint16_t bytes)
 {
 	token_t *t;
 	u_char *dptr = NULL;
+	size_t tokenlen;
 
-	GET_TOKEN_AREA(t, dptr, sizeof(u_char) + sizeof(u_int16_t) + bytes);
+	tokenlen = sizeof(u_char) + sizeof(u_int16_t) + bytes;
+	KASSERT(tokenlen <= KALLOC_SAFE_ALLOC_SIZE,
+	    ("au_to_opaque: token length (%zu) exceeds maximum allowed size", tokenlen));
+
+	GET_TOKEN_AREA(t, dptr, tokenlen);
 
 	ADD_U_CHAR(dptr, AUT_OPAQUE);
 	ADD_U_INT16(dptr, bytes);
 	ADD_MEM(dptr, data, bytes);
 
-	return (t);
+	return t;
 }
 
 /*
@@ -507,22 +531,26 @@ au_to_file(const char *file, struct timeval tm)
 	u_char *dptr = NULL;
 	u_int16_t filelen;
 	u_int32_t timems;
+	size_t tokenlen;
 
 	filelen = strlen(file);
 	filelen += 1;
 
-	GET_TOKEN_AREA(t, dptr, sizeof(u_char) + 2 * sizeof(u_int32_t) +
-	    sizeof(u_int16_t) + filelen);
+	tokenlen = sizeof(u_char) + 2 * sizeof(u_int32_t) + sizeof(u_int16_t) + filelen;
+	KASSERT(tokenlen <= KALLOC_SAFE_ALLOC_SIZE,
+	    ("au_to_file: token length (%zu) exceeds maximum allowed size", tokenlen));
 
-	timems = tm.tv_usec/1000;
+	GET_TOKEN_AREA(t, dptr, tokenlen);
+
+	timems = tm.tv_usec / 1000;
 
 	ADD_U_CHAR(dptr, AUT_OTHER_FILE32);
 	ADD_U_INT32(dptr, tm.tv_sec);
-	ADD_U_INT32(dptr, timems);	/* We need time in ms. */
+	ADD_U_INT32(dptr, timems);      /* We need time in ms. */
 	ADD_U_INT16(dptr, filelen);
 	ADD_STRING(dptr, file, filelen);
 
-	return (t);
+	return t;
 }
 
 /*
@@ -536,17 +564,22 @@ au_to_text(const char *text)
 	token_t *t;
 	u_char *dptr = NULL;
 	u_int16_t textlen;
+	size_t tokenlen;
 
 	textlen = strlen(text);
 	textlen += 1;
 
-	GET_TOKEN_AREA(t, dptr, sizeof(u_char) + sizeof(u_int16_t) + textlen);
+	tokenlen = sizeof(u_char) + sizeof(u_int16_t) + textlen;
+	KASSERT(tokenlen <= KALLOC_SAFE_ALLOC_SIZE,
+	    ("au_to_text: token length (%zu) exceeds maximum allowed size", tokenlen));
+
+	GET_TOKEN_AREA(t, dptr, tokenlen);
 
 	ADD_U_CHAR(dptr, AUT_TEXT);
 	ADD_U_INT16(dptr, textlen);
 	ADD_STRING(dptr, text, textlen);
 
-	return (t);
+	return t;
 }
 
 /*
@@ -560,17 +593,22 @@ au_to_path(const char *text)
 	token_t *t;
 	u_char *dptr = NULL;
 	u_int16_t textlen;
+	size_t tokenlen;
 
 	textlen = strlen(text);
 	textlen += 1;
 
-	GET_TOKEN_AREA(t, dptr, sizeof(u_char) + sizeof(u_int16_t) + textlen);
+	tokenlen = sizeof(u_char) + sizeof(u_int16_t) + textlen;
+	KASSERT(tokenlen <= KALLOC_SAFE_ALLOC_SIZE,
+	    ("au_to_path: token length (%zu) exceeds maximum allowed size", tokenlen));
+
+	GET_TOKEN_AREA(t, dptr, tokenlen);
 
 	ADD_U_CHAR(dptr, AUT_PATH);
 	ADD_U_INT16(dptr, textlen);
 	ADD_STRING(dptr, text, textlen);
 
-	return (t);
+	return t;
 }
 
 /*
@@ -606,7 +644,7 @@ au_to_process32(au_id_t auid, uid_t euid, gid_t egid, uid_t ruid, gid_t rgid,
 	ADD_U_INT32(dptr, tid->port);
 	ADD_MEM(dptr, &tid->machine, sizeof(u_int32_t));
 
-	return (t);
+	return t;
 }
 
 token_t *
@@ -630,16 +668,15 @@ au_to_process64(au_id_t auid, uid_t euid, gid_t egid, uid_t ruid, gid_t rgid,
 	ADD_U_INT64(dptr, tid->port);
 	ADD_MEM(dptr, &tid->machine, sizeof(u_int32_t));
 
-	return (t);
+	return t;
 }
 
 token_t *
 au_to_process(au_id_t auid, uid_t euid, gid_t egid, uid_t ruid, gid_t rgid,
     pid_t pid, au_asid_t sid, au_tid_t *tid)
 {
-
-	return (au_to_process32(auid, euid, egid, ruid, rgid, pid, sid,
-	    tid));
+	return au_to_process32(auid, euid, egid, ruid, rgid, pid, sid,
+	           tid);
 }
 
 /*
@@ -665,12 +702,13 @@ au_to_process32_ex(au_id_t auid, uid_t euid, gid_t egid, uid_t ruid,
 
 	KASSERT((tid->at_type == AU_IPv4) || (tid->at_type == AU_IPv6),
 	    ("au_to_process32_ex: type %u", (unsigned int)tid->at_type));
-	if (tid->at_type == AU_IPv6)
+	if (tid->at_type == AU_IPv6) {
 		GET_TOKEN_AREA(t, dptr, sizeof(u_char) + 13 *
 		    sizeof(u_int32_t));
-	else
+	} else {
 		GET_TOKEN_AREA(t, dptr, sizeof(u_char) + 10 *
 		    sizeof(u_int32_t));
+	}
 
 	ADD_U_CHAR(dptr, AUT_PROCESS32_EX);
 	ADD_U_INT32(dptr, auid);
@@ -682,12 +720,13 @@ au_to_process32_ex(au_id_t auid, uid_t euid, gid_t egid, uid_t ruid,
 	ADD_U_INT32(dptr, sid);
 	ADD_U_INT32(dptr, tid->at_port);
 	ADD_U_INT32(dptr, tid->at_type);
-	if (tid->at_type == AU_IPv6)
+	if (tid->at_type == AU_IPv6) {
 		ADD_MEM(dptr, &tid->at_addr[0], 4 * sizeof(u_int32_t));
-	else
+	} else {
 		ADD_MEM(dptr, &tid->at_addr[0], sizeof(u_int32_t));
+	}
 
-	return (t);
+	return t;
 }
 
 token_t *
@@ -697,17 +736,18 @@ au_to_process64_ex(au_id_t auid, uid_t euid, gid_t egid, uid_t ruid,
 	token_t *t = NULL;
 	u_char *dptr = NULL;
 
-	if (tid->at_type == AU_IPv4)
+	if (tid->at_type == AU_IPv4) {
 		GET_TOKEN_AREA(t, dptr, sizeof(u_char) +
 		    7 * sizeof(u_int32_t) + sizeof(u_int64_t) +
 		    2 * sizeof(u_int32_t));
-	else if (tid->at_type == AU_IPv6)
+	} else if (tid->at_type == AU_IPv6) {
 		GET_TOKEN_AREA(t, dptr, sizeof(u_char) +
 		    7 * sizeof(u_int32_t) + sizeof(u_int64_t) +
 		    5 * sizeof(u_int32_t));
-	else
+	} else {
 		panic("au_to_process64_ex: invalidate at_type (%d)",
 		    tid->at_type);
+	}
 
 	ADD_U_CHAR(dptr, AUT_PROCESS64_EX);
 	ADD_U_INT32(dptr, auid);
@@ -726,16 +766,15 @@ au_to_process64_ex(au_id_t auid, uid_t euid, gid_t egid, uid_t ruid,
 		ADD_MEM(dptr, &tid->at_addr[3], sizeof(u_int32_t));
 	}
 
-	return (t);
+	return t;
 }
 
 token_t *
 au_to_process_ex(au_id_t auid, uid_t euid, gid_t egid, uid_t ruid,
     gid_t rgid, pid_t pid, au_asid_t sid, au_tid_addr_t *tid)
 {
-
-	return (au_to_process32_ex(auid, euid, egid, ruid, rgid, pid, sid,
-	    tid));
+	return au_to_process32_ex(auid, euid, egid, ruid, rgid, pid, sid,
+	           tid);
 }
 
 /*
@@ -755,7 +794,7 @@ au_to_return32(char status, u_int32_t ret)
 	ADD_U_CHAR(dptr, status);
 	ADD_U_INT32(dptr, ret);
 
-	return (t);
+	return t;
 }
 
 token_t *
@@ -770,14 +809,13 @@ au_to_return64(char status, u_int64_t ret)
 	ADD_U_CHAR(dptr, status);
 	ADD_U_INT64(dptr, ret);
 
-	return (t);
+	return t;
 }
 
 token_t *
 au_to_return(char status, u_int32_t ret)
 {
-
-	return (au_to_return32(status, ret));
+	return au_to_return32(status, ret);
 }
 
 /*
@@ -795,7 +833,7 @@ au_to_seq(long audit_count)
 	ADD_U_CHAR(dptr, AUT_SEQ);
 	ADD_U_INT32(dptr, (u_int32_t) audit_count);
 
-	return (t);
+	return t;
 }
 
 /*
@@ -817,14 +855,15 @@ au_to_socket_ex(u_short so_domain, u_short so_type,
 	struct sockaddr_in *sin;
 	struct sockaddr_in6 *sin6;
 
-	if (so_domain == AF_INET)
+	if (so_domain == AF_INET) {
 		GET_TOKEN_AREA(t, dptr, sizeof(u_char) +
 		    5 * sizeof(u_int16_t) + 2 * sizeof(u_int32_t));
-	else if (so_domain == AF_INET6)
+	} else if (so_domain == AF_INET6) {
 		GET_TOKEN_AREA(t, dptr, sizeof(u_char) +
 		    5 * sizeof(u_int16_t) + 8 * sizeof(u_int32_t));
-	else
-		return (NULL);
+	} else {
+		return NULL;
+	}
 
 	ADD_U_CHAR(dptr, AUT_SOCKET_EX);
 	ADD_U_INT16(dptr, au_domain_to_bsm(so_domain));
@@ -832,12 +871,12 @@ au_to_socket_ex(u_short so_domain, u_short so_type,
 	if (so_domain == AF_INET) {
 		ADD_U_INT16(dptr, AU_IPv4);
 		sin = (struct sockaddr_in *)sa_local;
-		ADD_MEM(dptr,  &sin->sin_port, sizeof(uint16_t));
+		ADD_MEM(dptr, &sin->sin_port, sizeof(uint16_t));
 		ADD_MEM(dptr, &sin->sin_addr.s_addr, sizeof(uint32_t));
 		sin = (struct sockaddr_in *)sa_remote;
 		ADD_MEM(dptr, &sin->sin_port, sizeof(uint16_t));
 		ADD_MEM(dptr, &sin->sin_addr.s_addr, sizeof(uint32_t));
-	} else /* if (so_domain == AF_INET6) */ {
+	} else { /* if (so_domain == AF_INET6) */
 		ADD_U_INT16(dptr, AU_IPv6);
 		sin6 = (struct sockaddr_in6 *)sa_local;
 		ADD_MEM(dptr, &sin6->sin6_port, sizeof(uint16_t));
@@ -847,7 +886,7 @@ au_to_socket_ex(u_short so_domain, u_short so_type,
 		ADD_MEM(dptr, &sin6->sin6_addr, 4 * sizeof(uint32_t));
 	}
 
-	return (t);
+	return t;
 }
 
 /*
@@ -862,15 +901,18 @@ au_to_sock_unix(struct sockaddr_un *so)
 	u_char *dptr;
 	size_t slen;
 
+	static_assert(3 * sizeof(u_char) + sizeof(so->sun_path) + 1 <= KALLOC_SAFE_ALLOC_SIZE);
+
 	/*
 	 * Please note that sun_len may not be correctly set and sun_path may
 	 * not be NULL terminated.
 	 */
-	if (so->sun_len >= offsetof(struct sockaddr_un, sun_path)) 
+	if (so->sun_len >= offsetof(struct sockaddr_un, sun_path)) {
 		slen = min(so->sun_len - offsetof(struct sockaddr_un, sun_path),
 		    strnlen(so->sun_path, sizeof(so->sun_path)));
-	else
+	} else {
 		slen = strnlen(so->sun_path, sizeof(so->sun_path));
+	}
 
 	GET_TOKEN_AREA(t, dptr, 3 * sizeof(u_char) + slen + 1);
 
@@ -878,11 +920,12 @@ au_to_sock_unix(struct sockaddr_un *so)
 	/* BSM token has two bytes for family */
 	ADD_U_CHAR(dptr, 0);
 	ADD_U_CHAR(dptr, so->sun_family);
-	if (slen)
+	if (slen) {
 		ADD_MEM(dptr, so->sun_path, slen);
+	}
 	ADD_U_CHAR(dptr, '\0'); /* make the path a null-terminated string */
 
-	return (t);
+	return t;
 }
 
 /*
@@ -910,7 +953,7 @@ au_to_sock_inet32(struct sockaddr_in *so)
 	ADD_MEM(dptr, &so->sin_port, sizeof(uint16_t));
 	ADD_MEM(dptr, &so->sin_addr.s_addr, sizeof(uint32_t));
 
-	return (t);
+	return t;
 }
 
 /*
@@ -934,14 +977,13 @@ au_to_sock_inet128(struct sockaddr_in6 *so)
 	ADD_U_INT16(dptr, so->sin6_port);
 	ADD_MEM(dptr, &so->sin6_addr, 4 * sizeof(uint32_t));
 
-	return (t);
+	return t;
 }
 
 token_t *
 au_to_sock_inet(struct sockaddr_in *so)
 {
-
-	return (au_to_sock_inet32(so));
+	return au_to_sock_inet32(so);
 }
 
 /*
@@ -977,7 +1019,7 @@ au_to_subject32(au_id_t auid, uid_t euid, gid_t egid, uid_t ruid, gid_t rgid,
 	ADD_U_INT32(dptr, tid->port);
 	ADD_MEM(dptr, &tid->machine, sizeof(u_int32_t));
 
-	return (t);
+	return t;
 }
 
 token_t *
@@ -1001,16 +1043,15 @@ au_to_subject64(au_id_t auid, uid_t euid, gid_t egid, uid_t ruid, gid_t rgid,
 	ADD_U_INT64(dptr, tid->port);
 	ADD_MEM(dptr, &tid->machine, sizeof(u_int32_t));
 
-	return (t);
+	return t;
 }
 
 token_t *
 au_to_subject(au_id_t auid, uid_t euid, gid_t egid, uid_t ruid, gid_t rgid,
     pid_t pid, au_asid_t sid, au_tid_t *tid)
 {
-
-	return (au_to_subject32(auid, euid, egid, ruid, rgid, pid, sid,
-	    tid));
+	return au_to_subject32(auid, euid, egid, ruid, rgid, pid, sid,
+	           tid);
 }
 
 /*
@@ -1036,12 +1077,13 @@ au_to_subject32_ex(au_id_t auid, uid_t euid, gid_t egid, uid_t ruid,
 
 	KASSERT((tid->at_type == AU_IPv4) || (tid->at_type == AU_IPv6),
 	    ("au_to_subject32_ex: type %u", (unsigned int)tid->at_type));
-	if (tid->at_type == AU_IPv6)
+	if (tid->at_type == AU_IPv6) {
 		GET_TOKEN_AREA(t, dptr, sizeof(u_char) + 13 *
 		    sizeof(u_int32_t));
-	else
+	} else {
 		GET_TOKEN_AREA(t, dptr, sizeof(u_char) + 10 *
 		    sizeof(u_int32_t));
+	}
 
 	ADD_U_CHAR(dptr, AUT_SUBJECT32_EX);
 	ADD_U_INT32(dptr, auid);
@@ -1053,12 +1095,13 @@ au_to_subject32_ex(au_id_t auid, uid_t euid, gid_t egid, uid_t ruid,
 	ADD_U_INT32(dptr, sid);
 	ADD_U_INT32(dptr, tid->at_port);
 	ADD_U_INT32(dptr, tid->at_type);
-	if (tid->at_type == AU_IPv6)
+	if (tid->at_type == AU_IPv6) {
 		ADD_MEM(dptr, &tid->at_addr[0], 4 * sizeof(u_int32_t));
-	else
+	} else {
 		ADD_MEM(dptr, &tid->at_addr[0], sizeof(u_int32_t));
+	}
 
-	return (t);
+	return t;
 }
 
 token_t *
@@ -1068,17 +1111,18 @@ au_to_subject64_ex(au_id_t auid, uid_t euid, gid_t egid, uid_t ruid,
 	token_t *t = NULL;
 	u_char *dptr = NULL;
 
-	if (tid->at_type == AU_IPv4)
+	if (tid->at_type == AU_IPv4) {
 		GET_TOKEN_AREA(t, dptr, sizeof(u_char) +
 		    7 * sizeof(u_int32_t) + sizeof(u_int64_t) +
 		    2 * sizeof(u_int32_t));
-	else if (tid->at_type == AU_IPv6)
+	} else if (tid->at_type == AU_IPv6) {
 		GET_TOKEN_AREA(t, dptr, sizeof(u_char) +
 		    7 * sizeof(u_int32_t) + sizeof(u_int64_t) +
 		    5 * sizeof(u_int32_t));
-	else
+	} else {
 		panic("au_to_subject64_ex: invalid at_type (%d)",
 		    tid->at_type);
+	}
 
 	ADD_U_CHAR(dptr, AUT_SUBJECT64_EX);
 	ADD_U_INT32(dptr, auid);
@@ -1090,21 +1134,21 @@ au_to_subject64_ex(au_id_t auid, uid_t euid, gid_t egid, uid_t ruid,
 	ADD_U_INT32(dptr, sid);
 	ADD_U_INT64(dptr, tid->at_port);
 	ADD_U_INT32(dptr, tid->at_type);
-	if (tid->at_type == AU_IPv6)
+	if (tid->at_type == AU_IPv6) {
 		ADD_MEM(dptr, &tid->at_addr[0], 4 * sizeof(u_int32_t));
-	else
+	} else {
 		ADD_MEM(dptr, &tid->at_addr[0], sizeof(u_int32_t));
+	}
 
-	return (t);
+	return t;
 }
 
 token_t *
 au_to_subject_ex(au_id_t auid, uid_t euid, gid_t egid, uid_t ruid,
     gid_t rgid, pid_t pid, au_asid_t sid, au_tid_addr_t *tid)
 {
-
-	return (au_to_subject32_ex(auid, euid, egid, ruid, rgid, pid, sid,
-	    tid));
+	return au_to_subject32_ex(auid, euid, egid, ruid, rgid, pid, sid,
+	           tid);
 }
 
 #if !defined(_KERNEL) && !defined(KERNEL) && defined(HAVE_AUDIT_SYSCALLS)
@@ -1117,11 +1161,12 @@ au_to_me(void)
 {
 	auditinfo_t auinfo;
 
-	if (getaudit(&auinfo) != 0)
-		return (NULL);
+	if (getaudit(&auinfo) != 0) {
+		return NULL;
+	}
 
-	return (au_to_subject32(auinfo.ai_auid, geteuid(), getegid(),
-	    getuid(), getgid(), getpid(), auinfo.ai_asid, &auinfo.ai_termid));
+	return au_to_subject32(auinfo.ai_auid, geteuid(), getegid(),
+	           getuid(), getgid(), getpid(), auinfo.ai_asid, &auinfo.ai_termid);
 }
 #endif
 
@@ -1134,20 +1179,34 @@ au_to_exec_strings(const char *strs, int count, u_char type)
 	u_int32_t totlen;
 	int ctr;
 	const char *p;
+	size_t nextlen;
+	size_t tokenlen;
+	const size_t totlen_max = KALLOC_SAFE_ALLOC_SIZE - sizeof(u_char) - sizeof(u_int32_t);
 
 	totlen = 0;
 	ctr = count;
 	p = strs;
 	while (ctr-- > 0) {
-		totlen += strlen(p) + 1;
+		nextlen = strlen(p);
+
+		if (totlen + nextlen + 1 >= totlen_max) {
+			break;
+		}
+
+		totlen += nextlen + 1;
 		p = strs + totlen;
 	}
-	GET_TOKEN_AREA(t, dptr, sizeof(u_char) + sizeof(u_int32_t) + totlen);
+
+	tokenlen = sizeof(u_char) + sizeof(u_int32_t) + totlen;
+	KASSERT(tokenlen <= KALLOC_SAFE_ALLOC_SIZE,
+	    ("au_to_exec_strings: token length (%zu) exceeds maximum allowed size", tokenlen));
+
+	GET_TOKEN_AREA(t, dptr, tokenlen);
 	ADD_U_CHAR(dptr, type);
 	ADD_U_INT32(dptr, count);
 	ADD_STRING(dptr, strs, totlen);
 
-	return (t);
+	return t;
 }
 
 /*
@@ -1158,8 +1217,7 @@ au_to_exec_strings(const char *strs, int count, u_char type)
 token_t *
 au_to_exec_args(char *args, int argc)
 {
-
-	return (au_to_exec_strings(args, argc, AUT_EXEC_ARGS));
+	return au_to_exec_strings(args, argc, AUT_EXEC_ARGS);
 }
 
 /*
@@ -1170,8 +1228,29 @@ au_to_exec_args(char *args, int argc)
 token_t *
 au_to_exec_env(char *envs, int envc)
 {
+	return au_to_exec_strings(envs, envc, AUT_EXEC_ENV);
+}
 
-	return (au_to_exec_strings(envs, envc, AUT_EXEC_ENV));
+/*
+ * token ID         1 byte
+ * count            4 bytes
+ * text             count null-terminated strings
+ */
+token_t *
+au_to_certificate_hash(char *hashes, int hashc)
+{
+	return au_to_exec_strings(hashes, hashc, AUT_CERT_HASH);
+}
+
+/*
+ * token ID         1 byte
+ * count            4 bytes
+ * text             count null-terminated strings
+ */
+token_t *
+au_to_krb5_principal(char *principals, int princ)
+{
+	return au_to_exec_strings(principals, princ, AUT_KRB5_PRINCIPAL);
 }
 #else
 /*
@@ -1185,22 +1264,31 @@ au_to_exec_args(char **argv)
 	token_t *t;
 	u_char *dptr = NULL;
 	const char *nextarg;
+	size_t nextlen;
 	int i, count = 0;
 	size_t totlen = 0;
+	size_t tokenlen;
+	const size_t totlen_max = KALLOC_SAFE_ALLOC_SIZE - sizeof(u_char) - sizeof(u_int32_t);
 
 	nextarg = *argv;
 
 	while (nextarg != NULL) {
-		int nextlen;
-
 		nextlen = strlen(nextarg);
+
+		if (totlen + nextlen + 1 >= totlen_max) {
+			break;
+		}
+
 		totlen += nextlen + 1;
 		count++;
 		nextarg = *(argv + count);
 	}
 
-	totlen += count * sizeof(char);	/* nul terminations. */
-	GET_TOKEN_AREA(t, dptr, sizeof(u_char) + sizeof(u_int32_t) + totlen);
+	tokenlen = sizeof(u_char) + sizeof(u_int32_t) + totlen;
+	KASSERT(tokenlen <= KALLOC_SAFE_ALLOC_SIZE,
+	    ("au_to_exec_args: token length (%zu) exceeds maximum allowed size", tokenlen));
+
+	GET_TOKEN_AREA(t, dptr, tokenlen);
 
 	ADD_U_CHAR(dptr, AUT_EXEC_ARGS);
 	ADD_U_INT32(dptr, count);
@@ -1210,7 +1298,7 @@ au_to_exec_args(char **argv)
 		ADD_MEM(dptr, nextarg, strlen(nextarg) + 1);
 	}
 
-	return (t);
+	return t;
 }
 
 /*
@@ -1223,15 +1311,21 @@ au_to_zonename(char *zonename)
 {
 	u_char *dptr = NULL;
 	u_int16_t textlen;
+	size_t tokenlen;
 	token_t *t;
 
 	textlen = strlen(zonename);
 	textlen += 1;
-	GET_TOKEN_AREA(t, dptr, sizeof(u_char) + sizeof(u_int16_t) + textlen);
+
+	tokenlen = sizeof(u_char) + sizeof(u_int16_t) + textlen;
+	KASSERT(tokenlen <= KALLOC_SAFE_ALLOC_SIZE,
+	    ("au_to_zonename: token length (%zu) exceeds maximum allowed size", tokenlen));
+
+	GET_TOKEN_AREA(t, dptr, tokenlen);
 	ADD_U_CHAR(dptr, AUT_ZONENAME);
 	ADD_U_INT16(dptr, textlen);
 	ADD_STRING(dptr, zonename, textlen);
-	return (t);
+	return t;
 }
 
 /*
@@ -1245,21 +1339,31 @@ au_to_exec_env(char **envp)
 	token_t *t;
 	u_char *dptr = NULL;
 	int i, count = 0;
+	size_t nextlen;
 	size_t totlen = 0;
 	const char *nextenv;
+	size_t tokenlen;
+	const size_t totlen_max = KALLOC_SAFE_ALLOC_SIZE - sizeof(u_char) - sizeof(u_int32_t);
 
 	nextenv = *envp;
 
 	while (nextenv != NULL) {
-		int nextlen;
-
 		nextlen = strlen(nextenv);
+
+		if (totlen + nextlen + 1 >= totlen_max) {
+			break;
+		}
+
 		totlen += nextlen + 1;
 		count++;
 		nextenv = *(envp + count);
 	}
 
-	GET_TOKEN_AREA(t, dptr, sizeof(u_char) + sizeof(u_int32_t) + totlen);
+	tokenlen = sizeof(u_char) + sizeof(u_int32_t) + totlen;
+	KASSERT(tokenlen <= KALLOC_SAFE_ALLOC_SIZE,
+	    ("au_to_exec_env: token length (%zu) exceeds maximum allowed size", tokenlen));
+
+	GET_TOKEN_AREA(t, dptr, tokenlen);
 
 	ADD_U_CHAR(dptr, AUT_EXEC_ENV);
 	ADD_U_INT32(dptr, count);
@@ -1269,9 +1373,74 @@ au_to_exec_env(char **envp)
 		ADD_MEM(dptr, nextenv, strlen(nextenv) + 1);
 	}
 
-	return (t);
+	return t;
 }
 #endif  /* !(defined(_KERNEL) || defined(KERNEL)) */
+
+/*
+ * token ID             1 byte
+ * signer type          4 bytes
+ * signer id length     2 bytes
+ * signer id            n bytes
+ * signer id truncated  1 byte
+ * team id length       2 bytes
+ * team id              n bytes
+ * team id truncated    1 byte
+ * cdhash length        2 bytes
+ * cdhash               n bytes
+ */
+token_t*
+au_to_identity(uint32_t signer_type, const char* signing_id,
+    u_char signing_id_trunc, const char* team_id, u_char team_id_trunc,
+    uint8_t* cdhash, uint16_t cdhash_len)
+{
+	token_t *t = NULL;
+	u_char *dptr = NULL;
+	size_t signing_id_len = 0;
+	size_t team_id_len = 0;
+	size_t totlen = 0;
+
+	if (signing_id) {
+		signing_id_len = strlen(signing_id);
+	}
+
+	if (team_id) {
+		team_id_len = strlen(team_id);
+	}
+
+	totlen =
+	    sizeof(u_char) +        // token id
+	    sizeof(uint32_t) +      // signer type
+	    sizeof(uint16_t) +      // singing id length
+	    signing_id_len +        // length of signing id to copy
+	    sizeof(u_char) +        // null terminator for signing id
+	    sizeof(u_char) +        // if signing id truncated
+	    sizeof(uint16_t) +      // team id length
+	    team_id_len +           // length of team id to copy
+	    sizeof(u_char) +        // null terminator for team id
+	    sizeof(u_char) +        // if team id truncated
+	    sizeof(uint16_t) +      // cdhash length
+	    cdhash_len;             // cdhash buffer
+
+	KASSERT(totlen <= KALLOC_SAFE_ALLOC_SIZE,
+	    ("au_to_identity: token length (%zu) exceeds maximum allowed size", tokenlen));
+	GET_TOKEN_AREA(t, dptr, totlen);
+
+	ADD_U_CHAR(dptr, AUT_IDENTITY);                // token id
+	ADD_U_INT32(dptr, signer_type);                // signer type
+	ADD_U_INT16(dptr, signing_id_len + 1);         // signing id length+null
+	ADD_STRING(dptr, signing_id, signing_id_len);  // truncated signing id
+	ADD_U_CHAR(dptr, 0);                           // null terminator byte
+	ADD_U_CHAR(dptr, signing_id_trunc);            // if signing id is trunc
+	ADD_U_INT16(dptr, team_id_len + 1);            // team id length+null
+	ADD_STRING(dptr, team_id, team_id_len);        // truncated team id
+	ADD_U_CHAR(dptr, 0);                           // null terminator byte
+	ADD_U_CHAR(dptr, team_id_trunc);               // if team id is trunc
+	ADD_U_INT16(dptr, cdhash_len);                 // cdhash length
+	ADD_MEM(dptr, cdhash, cdhash_len);             // cdhash
+
+	return t;
+}
 
 /*
  * token ID                1 byte
@@ -1282,7 +1451,7 @@ au_to_exec_env(char **envp)
  * address type/length     4 bytes
  * machine address         4 bytes/16 bytes (IPv4/IPv6 address)
  * seconds of time         4 bytes/8 bytes  (32/64-bits)
- * milliseconds of time    4 bytes/8 bytes  (32/64-bits) 
+ * milliseconds of time    4 bytes/8 bytes  (32/64-bits)
  */
 token_t *
 au_to_header32_ex_tm(int rec_size, au_event_t e_type, au_emod_t e_mod,
@@ -1292,14 +1461,19 @@ au_to_header32_ex_tm(int rec_size, au_event_t e_type, au_emod_t e_mod,
 	u_char *dptr = NULL;
 	u_int32_t timems;
 	struct au_tid_addr *tid;
+	size_t tokenlen;
 
 	tid = &aia->ai_termid;
 	KASSERT(tid->at_type == AU_IPv4 || tid->at_type == AU_IPv6,
 	    ("au_to_header32_ex_tm: invalid address family"));
 
-	GET_TOKEN_AREA(t, dptr, sizeof(u_char) + sizeof(u_int32_t) +
+	tokenlen = sizeof(u_char) + sizeof(u_int32_t) +
 	    sizeof(u_char) + 2 * sizeof(u_int16_t) + 3 * sizeof(u_int32_t) +
-	    tid->at_type);
+	    tid->at_type;
+	KASSERT(tokenlen <= KALLOC_SAFE_ALLOC_SIZE,
+	    ("au_to_header32_ex_tm: token length (%zu) exceeds maximum allowed size", tokenlen));
+
+	GET_TOKEN_AREA(t, dptr, tokenlen);
 
 	ADD_U_CHAR(dptr, AUT_HEADER32_EX);
 	ADD_U_INT32(dptr, rec_size);
@@ -1307,15 +1481,16 @@ au_to_header32_ex_tm(int rec_size, au_event_t e_type, au_emod_t e_mod,
 	ADD_U_INT16(dptr, e_type);
 	ADD_U_INT16(dptr, e_mod);
 	ADD_U_INT32(dptr, tid->at_type);
-	if (tid->at_type == AU_IPv6)
+	if (tid->at_type == AU_IPv6) {
 		ADD_MEM(dptr, &tid->at_addr[0], 4 * sizeof(u_int32_t));
-	else
+	} else {
 		ADD_MEM(dptr, &tid->at_addr[0], sizeof(u_int32_t));
+	}
 	timems = tm.tv_usec / 1000;
 	/* Add the timestamp */
 	ADD_U_INT32(dptr, tm.tv_sec);
-	ADD_U_INT32(dptr, timems);	/* We need time in ms. */
-	return (t);
+	ADD_U_INT32(dptr, timems);      /* We need time in ms. */
+	return t;
 }
 
 /*
@@ -1344,12 +1519,12 @@ au_to_header32_tm(int rec_size, au_event_t e_type, au_emod_t e_mod,
 	ADD_U_INT16(dptr, e_type);
 	ADD_U_INT16(dptr, e_mod);
 
-	timems = tm.tv_usec/1000;
+	timems = tm.tv_usec / 1000;
 	/* Add the timestamp */
 	ADD_U_INT32(dptr, tm.tv_sec);
-	ADD_U_INT32(dptr, timems);	/* We need time in ms. */
+	ADD_U_INT32(dptr, timems);      /* We need time in ms. */
 
-	return (t);
+	return t;
 }
 
 token_t *
@@ -1369,12 +1544,12 @@ au_to_header64_tm(int rec_size, au_event_t e_type, au_emod_t e_mod,
 	ADD_U_INT16(dptr, e_type);
 	ADD_U_INT16(dptr, e_mod);
 
-	timems = tm.tv_usec/1000;
+	timems = tm.tv_usec / 1000;
 	/* Add the timestamp */
 	ADD_U_INT64(dptr, tm.tv_sec);
-	ADD_U_INT64(dptr, timems);	/* We need time in ms. */
+	ADD_U_INT64(dptr, timems);      /* We need time in ms. */
 
-	return (t);
+	return t;
 }
 
 /*
@@ -1396,6 +1571,6 @@ au_to_trailer(int rec_size)
 	ADD_U_INT16(dptr, magic);
 	ADD_U_INT32(dptr, rec_size);
 
-	return (t);
+	return t;
 }
 #endif /* CONFIG_AUDIT */

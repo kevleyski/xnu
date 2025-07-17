@@ -1,8 +1,8 @@
 /*
- * Copyright (c) 2005-2006 Apple Computer, Inc. All rights reserved.
+ * Copyright (c) 2005-2021 Apple Computer, Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
- * 
+ *
  * This file contains Original Code and/or Modifications of Original Code
  * as defined in and that are subject to the Apple Public Source License
  * Version 2.0 (the 'License'). You may not use this file except in
@@ -11,10 +11,10 @@
  * unlawful or unlicensed copies of an Apple operating system, or to
  * circumvent, violate, or enable the circumvention or violation of, any
  * terms of an Apple operating system software license agreement.
- * 
+ *
  * Please obtain a copy of the License at
  * http://www.opensource.apple.com/apsl/ and read it before using this file.
- * 
+ *
  * The Original Code and all software distributed under the License are
  * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
@@ -22,50 +22,33 @@
  * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
  * Please see the License for the specific language governing rights and
  * limitations under the License.
- * 
+ *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
 
-
-/*
- * APPLE NOTE: This file is compiled even if dtrace is unconfig'd. A symbol
- * from this file (_dtrace_register_anon_DOF) always needs to be exported for
- * an external kext to link against.
- */
-
-#if CONFIG_DTRACE
-
-#define MACH__POSIX_C_SOURCE_PRIVATE 1 /* pulls in suitable savearea from mach/ppc/thread_status.h */
 #include <kern/thread.h>
-#include <mach/thread_status.h>
 
-#include <stdarg.h>
-#include <string.h>
-#include <sys/malloc.h>
 #include <sys/time.h>
 #include <sys/proc.h>
-#include <sys/proc_internal.h>
 #include <sys/kauth.h>
 #include <sys/user.h>
 #include <sys/systm.h>
 #include <sys/dtrace.h>
 #include <sys/dtrace_impl.h>
-#include <libkern/OSAtomic.h>
+#include <machine/atomic.h>
+#include <libkern/OSKextLibPrivate.h>
 #include <kern/kern_types.h>
 #include <kern/timer_call.h>
 #include <kern/thread_call.h>
 #include <kern/task.h>
 #include <kern/sched_prim.h>
-#include <kern/queue.h>
 #include <miscfs/devfs/devfs.h>
 #include <kern/kalloc.h>
 
 #include <mach/vm_param.h>
 #include <mach/mach_vm.h>
 #include <mach/task.h>
-#include <vm/pmap.h>
-#include <vm/vm_map.h> /* All the bits we care about are guarded by MACH_KERNEL_PRIVATE :-( */
-
+#include <vm/vm_map_xnu.h> /* All the bits we care about are guarded by MACH_KERNEL_PRIVATE :-( */
 
 /*
  * pid/proc
@@ -73,8 +56,22 @@
 /* Solaris proc_t is the struct. Darwin's proc_t is a pointer to it. */
 #define proc_t struct proc /* Steer clear of the Darwin typedef for proc_t */
 
+KALLOC_HEAP_DEFINE(KHEAP_DTRACE, "dtrace", KHEAP_ID_KT_VAR);
+
+void
+dtrace_sprlock(proc_t *p)
+{
+	lck_mtx_lock(&p->p_dtrace_sprlock);
+}
+
+void
+dtrace_sprunlock(proc_t *p)
+{
+	lck_mtx_unlock(&p->p_dtrace_sprlock);
+}
+
 /* Not called from probe context */
-proc_t * 
+proc_t *
 sprlock(pid_t pid)
 {
 	proc_t* p;
@@ -83,11 +80,9 @@ sprlock(pid_t pid)
 		return PROC_NULL;
 	}
 
-	task_suspend(p->task);
+	task_suspend_internal(proc_task(p));
 
-	proc_lock(p);
-
-	lck_mtx_lock(&p->p_dtrace_sprlock);
+	dtrace_sprlock(p);
 
 	return p;
 }
@@ -97,11 +92,9 @@ void
 sprunlock(proc_t *p)
 {
 	if (p != PROC_NULL) {
-		lck_mtx_unlock(&p->p_dtrace_sprlock);
+		dtrace_sprunlock(p);
 
-		proc_unlock(p);
-
-		task_resume(p->task);
+		task_resume_internal(proc_task(p));
 
 		proc_rele(p);
 	}
@@ -111,9 +104,6 @@ sprunlock(proc_t *p)
  * uread/uwrite
  */
 
-// These are not exported from vm_map.h.
-extern kern_return_t vm_map_read_user(vm_map_t map, vm_map_address_t src_addr, void *dst_p, vm_size_t size);
-extern kern_return_t vm_map_write_user(vm_map_t map, void *src_p, vm_map_address_t dst_addr, vm_size_t size);
 
 /* Not called from probe context */
 int
@@ -122,9 +112,9 @@ uread(proc_t *p, void *buf, user_size_t len, user_addr_t a)
 	kern_return_t ret;
 
 	ASSERT(p != PROC_NULL);
-	ASSERT(p->task != NULL);
+	ASSERT(proc_task(p) != NULL);
 
-	task_t task = p->task;
+	task_t task = proc_task(p);
 
 	/*
 	 * Grab a reference to the task vm_map_t to make sure
@@ -138,9 +128,10 @@ uread(proc_t *p, void *buf, user_size_t len, user_addr_t a)
 	if (map) {
 		ret = vm_map_read_user( map, (vm_map_address_t)a, buf, (vm_size_t)len);
 		vm_map_deallocate(map);
-	} else
+	} else {
 		ret = KERN_TERMINATED;
-	
+	}
+
 	return (int)ret;
 }
 
@@ -152,9 +143,9 @@ uwrite(proc_t *p, void *buf, user_size_t len, user_addr_t a)
 	kern_return_t ret;
 
 	ASSERT(p != NULL);
-	ASSERT(p->task != NULL);
+	ASSERT(proc_task(p) != NULL);
 
-	task_t task = p->task;
+	task_t task = proc_task(p);
 
 	/*
 	 * Grab a reference to the task vm_map_t to make sure
@@ -167,15 +158,16 @@ uwrite(proc_t *p, void *buf, user_size_t len, user_addr_t a)
 	vm_map_t map = get_task_map_reference(task);
 	if (map) {
 		/* Find the memory permissions. */
-		uint32_t nestingDepth=999999;
+		uint32_t nestingDepth = 999999;
 		vm_region_submap_short_info_data_64_t info;
 		mach_msg_type_number_t count = VM_REGION_SUBMAP_SHORT_INFO_COUNT_64;
 		mach_vm_address_t address = (mach_vm_address_t)a;
 		mach_vm_size_t sizeOfRegion = (mach_vm_size_t)len;
-	
+
 		ret = mach_vm_region_recurse(map, &address, &sizeOfRegion, &nestingDepth, (vm_region_recurse_info_t)&info, &count);
-		if (ret != KERN_SUCCESS)
+		if (ret != KERN_SUCCESS) {
 			goto done;
+		}
 
 		vm_prot_t reprotect;
 
@@ -185,41 +177,45 @@ uwrite(proc_t *p, void *buf, user_size_t len, user_addr_t a)
 
 			if (info.max_protection & VM_PROT_WRITE) {
 				/* The memory is not currently writable, but can be made writable. */
-				ret = mach_vm_protect (map, (mach_vm_offset_t)a, (mach_vm_size_t)len, 0, reprotect | VM_PROT_WRITE);
+				ret = mach_vm_protect(map, (mach_vm_offset_t)a, (mach_vm_size_t)len, 0, (reprotect & ~VM_PROT_EXECUTE) | VM_PROT_WRITE);
 			} else {
 				/*
 				 * The memory is not currently writable, and cannot be made writable. We need to COW this memory.
 				 *
 				 * Strange, we can't just say "reprotect | VM_PROT_COPY", that fails.
 				 */
-				ret = mach_vm_protect (map, (mach_vm_offset_t)a, (mach_vm_size_t)len, 0, VM_PROT_COPY | VM_PROT_READ | VM_PROT_WRITE);
+				ret = mach_vm_protect(map, (mach_vm_offset_t)a, (mach_vm_size_t)len, 0, VM_PROT_COPY | VM_PROT_READ | VM_PROT_WRITE);
 			}
 
-			if (ret != KERN_SUCCESS)
+			if (ret != KERN_SUCCESS) {
 				goto done;
-
+			}
 		} else {
 			/* The memory was already writable. */
 			reprotect = VM_PROT_NONE;
 		}
 
 		ret = vm_map_write_user( map,
-					 buf,
-					 (vm_map_address_t)a,
-					 (vm_size_t)len);
+		    buf,
+		    (vm_map_address_t)a,
+		    (vm_size_t)len);
 
-		if (ret != KERN_SUCCESS)
+		dtrace_flush_caches();
+
+		if (ret != KERN_SUCCESS) {
 			goto done;
+		}
 
 		if (reprotect != VM_PROT_NONE) {
 			ASSERT(reprotect & VM_PROT_EXECUTE);
-			ret = mach_vm_protect (map, (mach_vm_offset_t)a, (mach_vm_size_t)len, 0, reprotect);
+			ret = mach_vm_protect(map, (mach_vm_offset_t)a, (mach_vm_size_t)len, 0, reprotect);
 		}
 
 done:
 		vm_map_deallocate(map);
-	} else 
+	} else {
 		ret = KERN_TERMINATED;
+	}
 
 	return (int)ret;
 }
@@ -227,8 +223,9 @@ done:
 /*
  * cpuvar
  */
-lck_mtx_t cpu_lock;
-lck_mtx_t mod_lock;
+LCK_MTX_DECLARE_ATTR(cpu_lock, &dtrace_lck_grp, &dtrace_lck_attr);
+LCK_MTX_DECLARE_ATTR(cyc_lock, &dtrace_lck_grp, &dtrace_lck_attr);
+LCK_MTX_DECLARE_ATTR(mod_lock, &dtrace_lck_grp, &dtrace_lck_attr);
 
 dtrace_cpu_t *cpu_list;
 cpu_core_t *cpu_core; /* XXX TLB lockdown? */
@@ -240,56 +237,103 @@ cpu_core_t *cpu_core; /* XXX TLB lockdown? */
 /*
  * dtrace_CRED() can be called from probe context. We cannot simply call kauth_cred_get() since
  * that function may try to resolve a lazy credential binding, which entails taking the proc_lock.
- */ 
+ */
 cred_t *
 dtrace_CRED(void)
 {
-	struct uthread *uthread = get_bsdthread_info(current_thread());
-
-	if (uthread == NULL)
-		return NULL;
-	else
-		return uthread->uu_ucred; /* May return NOCRED which is defined to be 0 */
+	return current_thread_ro_unchecked()->tro_cred;
 }
 
-#define	HAS_ALLPRIVS(cr)	priv_isfullset(&CR_OEPRIV(cr))
-#define	HAS_PRIVILEGE(cr, pr)	((pr) == PRIV_ALL ? \
-					HAS_ALLPRIVS(cr) : \
-					PRIV_ISASSERT(&CR_OEPRIV(cr), pr))
-
-int PRIV_POLICY_CHOICE(void* cred, int priv, int all)
+int
+PRIV_POLICY_CHOICE(void* cred, int priv, int all)
 {
 #pragma unused(priv, all)
 	return kauth_cred_issuser(cred); /* XXX TODO: How is this different from PRIV_POLICY_ONLY? */
 }
 
-int 
+int
 PRIV_POLICY_ONLY(void *cr, int priv, int boolean)
 {
 #pragma unused(priv, boolean)
 	return kauth_cred_issuser(cr); /* XXX TODO: HAS_PRIVILEGE(cr, priv); */
 }
 
-/* XXX Get around const poisoning using structure assigns */
-gid_t
-crgetgid(const cred_t *cr) { cred_t copy_cr = *cr; return kauth_cred_getgid(&copy_cr); }
-
 uid_t
-crgetuid(const cred_t *cr) { cred_t copy_cr = *cr; return kauth_cred_getuid(&copy_cr); }
+crgetuid(const cred_t *cr)
+{
+	cred_t copy_cr = *cr; return kauth_cred_getuid(&copy_cr);
+}
 
 /*
  * "cyclic"
  */
 
 typedef struct wrap_timer_call {
-	cyc_handler_t hdlr;
-	cyc_time_t when;
-	uint64_t deadline;
-	struct timer_call call;
+	/* node attributes */
+	cyc_handler_t           hdlr;
+	cyc_time_t              when;
+	uint64_t                deadline;
+	int                     cpuid;
+	boolean_t               suspended;
+	struct timer_call       call;
+
+	/* next item in the linked list */
+	LIST_ENTRY(wrap_timer_call) entries;
 } wrap_timer_call_t;
 
-#define WAKEUP_REAPER 0x7FFFFFFFFFFFFFFFLL
-#define NEARLY_FOREVER 0x7FFFFFFFFFFFFFFELL
+#define WAKEUP_REAPER           0x7FFFFFFFFFFFFFFFLL
+#define NEARLY_FOREVER          0x7FFFFFFFFFFFFFFELL
+
+
+typedef struct cyc_list {
+	cyc_omni_handler_t cyl_omni;
+	wrap_timer_call_t cyl_wrap_by_cpus[];
+} cyc_list_t;
+
+/* CPU going online/offline notifications */
+void (*dtrace_cpu_state_changed_hook)(int, boolean_t) = NULL;
+void dtrace_cpu_state_changed(int, boolean_t);
+
+void
+dtrace_install_cpu_hooks(void)
+{
+	dtrace_cpu_state_changed_hook = dtrace_cpu_state_changed;
+}
+
+void
+dtrace_cpu_state_changed(int cpuid, boolean_t is_running)
+{
+	wrap_timer_call_t       *wrapTC = NULL;
+	boolean_t               suspend = (is_running ? FALSE : TRUE);
+	dtrace_icookie_t        s;
+
+	/* Ensure that we're not going to leave the CPU */
+	s = dtrace_interrupt_disable();
+
+	LIST_FOREACH(wrapTC, &(cpu_list[cpuid].cpu_cyc_list), entries) {
+		assert3u(wrapTC->cpuid, ==, cpuid);
+		if (suspend) {
+			assert(!wrapTC->suspended);
+			/* If this fails, we'll panic anyway, so let's do this now. */
+			if (!timer_call_cancel(&wrapTC->call)) {
+				panic("timer_call_cancel() failed to cancel a timer call: %p",
+				    &wrapTC->call);
+			}
+			wrapTC->suspended = TRUE;
+		} else {
+			/* Rearm the timer, but ensure it was suspended first. */
+			assert(wrapTC->suspended);
+			clock_deadline_for_periodic_event(wrapTC->when.cyt_interval, mach_absolute_time(),
+			    &wrapTC->deadline);
+			timer_call_enter1(&wrapTC->call, (void*) wrapTC, wrapTC->deadline,
+			    TIMER_CALL_SYS_CRITICAL | TIMER_CALL_LOCAL);
+			wrapTC->suspended = FALSE;
+		}
+	}
+
+	/* Restore the previous interrupt state. */
+	dtrace_interrupt_enable(s);
+}
 
 static void
 _timer_call_apply_cyclic( void *ignore, void *vTChdl )
@@ -299,20 +343,17 @@ _timer_call_apply_cyclic( void *ignore, void *vTChdl )
 
 	(*(wrapTC->hdlr.cyh_func))( wrapTC->hdlr.cyh_arg );
 
-	clock_deadline_for_periodic_event( wrapTC->when.cyt_interval, mach_absolute_time(), &(wrapTC->deadline) );
+	clock_deadline_for_periodic_event( wrapTC->when.cyt_interval, mach_absolute_time(), &(wrapTC->deadline));
 	timer_call_enter1( &(wrapTC->call), (void *)wrapTC, wrapTC->deadline, TIMER_CALL_SYS_CRITICAL | TIMER_CALL_LOCAL );
-
-	/* Did timer_call_remove_cyclic request a wakeup call when this timer call was re-armed? */
-	if (wrapTC->when.cyt_interval == WAKEUP_REAPER)
-		thread_wakeup((event_t)wrapTC);
 }
 
 static cyclic_id_t
 timer_call_add_cyclic(wrap_timer_call_t *wrapTC, cyc_handler_t *handler, cyc_time_t *when)
 {
 	uint64_t now;
+	dtrace_icookie_t s;
 
-	timer_call_setup( &(wrapTC->call),  _timer_call_apply_cyclic, NULL );
+	timer_call_setup( &(wrapTC->call), _timer_call_apply_cyclic, NULL );
 	wrapTC->hdlr = *handler;
 	wrapTC->when = *when;
 
@@ -321,119 +362,120 @@ timer_call_add_cyclic(wrap_timer_call_t *wrapTC, cyc_handler_t *handler, cyc_tim
 	now = mach_absolute_time();
 	wrapTC->deadline = now;
 
-	clock_deadline_for_periodic_event( wrapTC->when.cyt_interval, now, &(wrapTC->deadline) );
-	timer_call_enter1( &(wrapTC->call), (void *)wrapTC, wrapTC->deadline, TIMER_CALL_SYS_CRITICAL | TIMER_CALL_LOCAL );
+	clock_deadline_for_periodic_event( wrapTC->when.cyt_interval, now, &(wrapTC->deadline));
+
+	/* Insert the timer to the list of the running timers on this CPU, and start it. */
+	s = dtrace_interrupt_disable();
+	wrapTC->cpuid = cpu_number();
+	LIST_INSERT_HEAD(&cpu_list[wrapTC->cpuid].cpu_cyc_list, wrapTC, entries);
+	timer_call_enter1(&wrapTC->call, (void*) wrapTC, wrapTC->deadline,
+	    TIMER_CALL_SYS_CRITICAL | TIMER_CALL_LOCAL);
+	wrapTC->suspended = FALSE;
+	dtrace_interrupt_enable(s);
 
 	return (cyclic_id_t)wrapTC;
 }
 
+/*
+ * Executed on the CPU the timer is running on.
+ */
 static void
-timer_call_remove_cyclic(cyclic_id_t cyclic)
+timer_call_remove_cyclic(wrap_timer_call_t *wrapTC)
 {
-	wrap_timer_call_t *wrapTC = (wrap_timer_call_t *)cyclic;
+	assert(wrapTC);
+	assert(cpu_number() == wrapTC->cpuid);
 
-	while (!timer_call_cancel(&(wrapTC->call))) {
-		int ret = assert_wait(wrapTC, THREAD_UNINT);
-		ASSERT(ret == THREAD_WAITING);
-
-		wrapTC->when.cyt_interval = WAKEUP_REAPER;
-
-		ret = thread_block(THREAD_CONTINUE_NULL);
-		ASSERT(ret == THREAD_AWAKENED);
+	if (!timer_call_cancel(&wrapTC->call)) {
+		panic("timer_call_remove_cyclic() failed to cancel a timer call");
 	}
+
+	LIST_REMOVE(wrapTC, entries);
 }
 
 static void *
-timer_call_get_cyclic_arg(cyclic_id_t cyclic)
-{       
-	wrap_timer_call_t *wrapTC = (wrap_timer_call_t *)cyclic;
- 	
-	return (wrapTC ? wrapTC->hdlr.cyh_arg : NULL);
-}   
+timer_call_get_cyclic_arg(wrap_timer_call_t *wrapTC)
+{
+	return wrapTC ? wrapTC->hdlr.cyh_arg : NULL;
+}
 
 cyclic_id_t
 cyclic_timer_add(cyc_handler_t *handler, cyc_time_t *when)
 {
-	wrap_timer_call_t *wrapTC = _MALLOC(sizeof(wrap_timer_call_t), M_TEMP, M_ZERO | M_WAITOK);
-	if (NULL == wrapTC)
+	wrap_timer_call_t *wrapTC = kalloc_type(wrap_timer_call_t, Z_ZERO | Z_WAITOK);
+	if (NULL == wrapTC) {
 		return CYCLIC_NONE;
-	else
+	} else {
 		return timer_call_add_cyclic( wrapTC, handler, when );
+	}
 }
 
-void 
+void
 cyclic_timer_remove(cyclic_id_t cyclic)
 {
 	ASSERT( cyclic != CYCLIC_NONE );
 
-	timer_call_remove_cyclic( cyclic );
-	_FREE((void *)cyclic, M_TEMP);
+	/* Removing a timer call must be done on the CPU the timer is running on. */
+	wrap_timer_call_t *wrapTC = (wrap_timer_call_t *) cyclic;
+	dtrace_xcall(wrapTC->cpuid, (dtrace_xcall_t) timer_call_remove_cyclic, (void*) cyclic);
+
+	kfree_type(wrap_timer_call_t, wrapTC);
 }
 
 static void
-_cyclic_add_omni(cyclic_id_list_t cyc_list)
+_cyclic_add_omni(cyc_list_t *cyc_list)
 {
 	cyc_time_t cT;
 	cyc_handler_t cH;
-	wrap_timer_call_t *wrapTC;
-	cyc_omni_handler_t *omni = (cyc_omni_handler_t *)cyc_list;
-	char *t;
+	cyc_omni_handler_t *omni = &cyc_list->cyl_omni;
 
-	(omni->cyo_online)(omni->cyo_arg, CPU, &cH, &cT); 
+	(omni->cyo_online)(omni->cyo_arg, CPU, &cH, &cT);
 
-	t = (char *)cyc_list;
-	t += sizeof(cyc_omni_handler_t);
-	cyc_list = (cyclic_id_list_t)(uintptr_t)t;
-
-	t += sizeof(cyclic_id_t)*NCPU;
-	t += (sizeof(wrap_timer_call_t))*cpu_number();
-	wrapTC = (wrap_timer_call_t *)(uintptr_t)t;
-
-	cyc_list[cpu_number()] = timer_call_add_cyclic(wrapTC, &cH, &cT);
+	wrap_timer_call_t *wrapTC = &cyc_list->cyl_wrap_by_cpus[cpu_number()];
+	timer_call_add_cyclic(wrapTC, &cH, &cT);
 }
 
 cyclic_id_list_t
 cyclic_add_omni(cyc_omni_handler_t *omni)
 {
-	cyclic_id_list_t cyc_list = 
-		_MALLOC( (sizeof(wrap_timer_call_t))*NCPU + 
-				 sizeof(cyclic_id_t)*NCPU + 
-				 sizeof(cyc_omni_handler_t), M_TEMP, M_ZERO | M_WAITOK);
-	if (NULL == cyc_list)
-		return (cyclic_id_list_t)CYCLIC_NONE;
+	cyc_list_t *cyc_list = kalloc_type(cyc_list_t, wrap_timer_call_t, NCPU, Z_WAITOK | Z_ZERO);
 
-	*(cyc_omni_handler_t *)cyc_list = *omni;
+	if (NULL == cyc_list) {
+		return NULL;
+	}
+
+	cyc_list->cyl_omni = *omni;
+
 	dtrace_xcall(DTRACE_CPUALL, (dtrace_xcall_t)_cyclic_add_omni, (void *)cyc_list);
 
-	return cyc_list;
+	return (cyclic_id_list_t)cyc_list;
 }
 
 static void
-_cyclic_remove_omni(cyclic_id_list_t cyc_list)
+_cyclic_remove_omni(cyc_list_t *cyc_list)
 {
-	cyc_omni_handler_t *omni = (cyc_omni_handler_t *)cyc_list;
+	cyc_omni_handler_t *omni = &cyc_list->cyl_omni;
 	void *oarg;
-	cyclic_id_t cid;
-	char *t;
+	wrap_timer_call_t *wrapTC;
 
-	t = (char *)cyc_list;
-	t += sizeof(cyc_omni_handler_t);
-	cyc_list = (cyclic_id_list_t)(uintptr_t)t;
-
-	cid = cyc_list[cpu_number()];
-	oarg = timer_call_get_cyclic_arg(cid);
-
-	timer_call_remove_cyclic( cid );
-	(omni->cyo_offline)(omni->cyo_arg, CPU, oarg);
+	/*
+	 * If the processor was offline when dtrace started, we did not allocate
+	 * a cyclic timer for this CPU.
+	 */
+	if ((wrapTC = &cyc_list->cyl_wrap_by_cpus[cpu_number()]) != NULL) {
+		oarg = timer_call_get_cyclic_arg(wrapTC);
+		timer_call_remove_cyclic(wrapTC);
+		(omni->cyo_offline)(omni->cyo_arg, CPU, oarg);
+	}
 }
 
 void
 cyclic_remove_omni(cyclic_id_list_t cyc_list)
 {
-	ASSERT( cyc_list != (cyclic_id_list_t)CYCLIC_NONE );
+	ASSERT(cyc_list != NULL);
 
 	dtrace_xcall(DTRACE_CPUALL, (dtrace_xcall_t)_cyclic_remove_omni, (void *)cyc_list);
-	_FREE(cyc_list, M_TEMP);
+	void *cyc_list_p = (void *)cyc_list;
+	kfree_type(cyc_list_t, wrap_timer_call_t, NCPU, cyc_list_p);
 }
 
 typedef struct wrap_thread_call {
@@ -444,7 +486,7 @@ typedef struct wrap_thread_call {
 } wrap_thread_call_t;
 
 /*
- * _cyclic_apply will run on some thread under kernel_task. That's OK for the 
+ * _cyclic_apply will run on some thread under kernel_task. That's OK for the
  * cleaner and the deadman, but too distant in time and place for the profile provider.
  */
 static void
@@ -455,12 +497,13 @@ _cyclic_apply( void *ignore, void *vTChdl )
 
 	(*(wrapTC->hdlr.cyh_func))( wrapTC->hdlr.cyh_arg );
 
-	clock_deadline_for_periodic_event( wrapTC->when.cyt_interval, mach_absolute_time(), &(wrapTC->deadline) );
+	clock_deadline_for_periodic_event( wrapTC->when.cyt_interval, mach_absolute_time(), &(wrapTC->deadline));
 	(void)thread_call_enter1_delayed( wrapTC->TChdl, (void *)wrapTC, wrapTC->deadline );
 
 	/* Did cyclic_remove request a wakeup call when this thread call was re-armed? */
-	if (wrapTC->when.cyt_interval == WAKEUP_REAPER)
+	if (wrapTC->when.cyt_interval == WAKEUP_REAPER) {
 		thread_wakeup((event_t)wrapTC);
+	}
 }
 
 cyclic_id_t
@@ -468,9 +511,10 @@ cyclic_add(cyc_handler_t *handler, cyc_time_t *when)
 {
 	uint64_t now;
 
-	wrap_thread_call_t *wrapTC = _MALLOC(sizeof(wrap_thread_call_t), M_TEMP, M_ZERO | M_WAITOK);
-	if (NULL == wrapTC)
+	wrap_thread_call_t *wrapTC = kalloc_type(wrap_thread_call_t, Z_ZERO | Z_WAITOK);
+	if (NULL == wrapTC) {
 		return CYCLIC_NONE;
+	}
 
 	wrapTC->TChdl = thread_call_allocate( _cyclic_apply, NULL );
 	wrapTC->hdlr = *handler;
@@ -484,7 +528,7 @@ cyclic_add(cyc_handler_t *handler, cyc_time_t *when)
 	now = mach_absolute_time();
 	wrapTC->deadline = now;
 
-	clock_deadline_for_periodic_event( wrapTC->when.cyt_interval, now, &(wrapTC->deadline) );
+	clock_deadline_for_periodic_event( wrapTC->when.cyt_interval, now, &(wrapTC->deadline));
 	(void)thread_call_enter1_delayed( wrapTC->TChdl, (void *)wrapTC, wrapTC->deadline );
 
 	return (cyclic_id_t)wrapTC;
@@ -513,156 +557,20 @@ cyclic_remove(cyclic_id_t cyclic)
 		ASSERT(ret == THREAD_AWAKENED);
 	}
 
-	if (thread_call_free(wrapTC->TChdl))
-		_FREE(wrapTC, M_TEMP);
-	else {
+	if (thread_call_free(wrapTC->TChdl)) {
+		kfree_type(wrap_thread_call_t, wrapTC);
+	} else {
 		/* Gut this cyclic and move on ... */
 		wrapTC->hdlr.cyh_func = noop_cyh_func;
 		wrapTC->when.cyt_interval = NEARLY_FOREVER;
 	}
 }
 
-/*
- * timeout / untimeout (converted to dtrace_timeout / dtrace_untimeout due to name collision)
- */ 
-
-thread_call_t
-dtrace_timeout(void (*func)(void *, void *), void* arg, uint64_t nanos)
-{
-#pragma unused(arg)
-	thread_call_t call = thread_call_allocate(func, NULL);
-
-	nanoseconds_to_absolutetime(nanos, &nanos);
-
-	/*
-	 * This method does not use clock_deadline_for_periodic_event() because it is a one-shot,
-	 * and clock drift on later invocations is not a worry.
-	 */
-	uint64_t deadline = mach_absolute_time() + nanos;
-	/* DRK: consider using a lower priority callout here */
-	thread_call_enter_delayed(call, deadline);
-
-	return call;
-}
-
-/*
- * ddi
- */
-void
-ddi_report_dev(dev_info_t *devi)
-{
-#pragma unused(devi)
-}
-
-#define NSOFT_STATES 32 /* XXX No more than 32 clients at a time, please. */
-static void *soft[NSOFT_STATES];
-
 int
-ddi_soft_state_init(void **state_p, size_t size, size_t n_items)
+ddi_driver_major(dev_info_t     *devi)
 {
-#pragma unused(n_items)
-	int i;
-	
-	for (i = 0; i < NSOFT_STATES; ++i) soft[i] = _MALLOC(size, M_TEMP, M_ZERO | M_WAITOK);
-	*(size_t *)state_p = size;
-	return 0;
+	return (int)major(CAST_DOWN_EXPLICIT(int, devi));
 }
-
-int
-ddi_soft_state_zalloc(void *state, int item)
-{
-#pragma unused(state)
-	if (item < NSOFT_STATES)
-		return DDI_SUCCESS;
-	else
-		return DDI_FAILURE;
-}
-
-void *
-ddi_get_soft_state(void *state, int item)
-{
-#pragma unused(state)
-	ASSERT(item < NSOFT_STATES);
-	return soft[item];
-}
-
-int
-ddi_soft_state_free(void *state, int item)
-{
-	ASSERT(item < NSOFT_STATES);
-	bzero( soft[item], (size_t)state );
-	return DDI_SUCCESS;
-}
-
-void
-ddi_soft_state_fini(void **state_p)
-{
-#pragma unused(state_p)
-	int i;
-	
-	for (i = 0; i < NSOFT_STATES; ++i) _FREE( soft[i], M_TEMP );
-}
-
-static unsigned int gRegisteredProps = 0;
-static struct {
-	char name[32];		/* enough for "dof-data-" + digits */
-	int *data;
-	uint_t nelements;
-} gPropTable[16];
-
-kern_return_t _dtrace_register_anon_DOF(char *, uchar_t *, uint_t);
-
-kern_return_t
-_dtrace_register_anon_DOF(char *name, uchar_t *data, uint_t nelements)
-{
-	if (gRegisteredProps < sizeof(gPropTable)/sizeof(gPropTable[0])) {
-		int *p = (int *)_MALLOC(nelements*sizeof(int), M_TEMP, M_WAITOK);
-		
-		if (NULL == p)
-			return KERN_FAILURE;
-			
-		strlcpy(gPropTable[gRegisteredProps].name, name, sizeof(gPropTable[0].name));
-		gPropTable[gRegisteredProps].nelements = nelements;
-		gPropTable[gRegisteredProps].data = p;
-			
-		while (nelements-- > 0) {
-			*p++ = (int)(*data++);
-		}
-		
-		gRegisteredProps++;
-		return KERN_SUCCESS;
-	}
-	else
-		return KERN_FAILURE;
-}
-
-int
-ddi_prop_lookup_int_array(dev_t match_dev, dev_info_t *dip, uint_t flags,
-    const char *name, int **data, uint_t *nelements)
-{
-#pragma unused(match_dev,dip,flags)
-	unsigned int i;
-	for (i = 0; i < gRegisteredProps; ++i)
-	{
-		if (0 == strncmp(name, gPropTable[i].name,
-					sizeof(gPropTable[i].name))) {
-			*data = gPropTable[i].data;
-			*nelements = gPropTable[i].nelements;
-			return DDI_SUCCESS;
-		}
-	}
-	return DDI_FAILURE;
-}
-	
-int
-ddi_prop_free(void *buf)
-{
-	_FREE(buf, M_TEMP);
-	return DDI_SUCCESS;
-}
-
-int
-ddi_driver_major(dev_info_t	*devi) { return (int)major(CAST_DOWN_EXPLICIT(int,devi)); }
 
 int
 ddi_create_minor_node(dev_info_t *dip, const char *name, int spec_type,
@@ -671,11 +579,12 @@ ddi_create_minor_node(dev_info_t *dip, const char *name, int spec_type,
 #pragma unused(spec_type,node_type,flag)
 	dev_t dev = makedev( ddi_driver_major(dip), minor_num );
 
-	if (NULL == devfs_make_node( dev, DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, name, 0 ))
+	if (NULL == devfs_make_node( dev, DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "%s", name )) {
 		return DDI_FAILURE;
-	else
+	} else {
 		return DDI_SUCCESS;
-} 
+	}
+}
 
 void
 ddi_remove_minor_node(dev_info_t *dip, char *name)
@@ -691,236 +600,128 @@ getemajor( dev_t d )
 }
 
 minor_t
-getminor ( dev_t d )
+getminor( dev_t d )
 {
 	return (minor_t) minor(d);
-}
-
-dev_t 
-makedevice(major_t major, minor_t minor)
-{
-	return makedev( major, minor );
-}
-
-int ddi_getprop(dev_t dev, dev_info_t *dip, int flags, const char *name, int defvalue)
-{
-#pragma unused(dev, dip, flags, name)
-
-	return defvalue;
-}
-
-/*
- * Kernel Debug Interface
- */
-int
-kdi_dtrace_set(kdi_dtrace_set_t ignore)
-{
-#pragma unused(ignore)
-	return 0; /* Success */
 }
 
 extern void Debugger(const char*);
 
 void
-debug_enter(char *c) { Debugger(c); }
+debug_enter(char *c)
+{
+	Debugger(c);
+}
 
 /*
  * kmem
  */
 
+// rdar://88962505
+__typed_allocators_ignore_push
+
 void *
-dt_kmem_alloc(size_t size, int kmflag)
+dt_kmem_alloc_tag(size_t size, int kmflag, vm_tag_t tag)
 {
 #pragma unused(kmflag)
 
 /*
  * We ignore the M_NOWAIT bit in kmflag (all of kmflag, in fact).
- * Requests larger than 8K with M_NOWAIT fail in kalloc_canblock.
+ * Requests larger than 8K with M_NOWAIT fail in kalloc_ext.
  */
-#if defined(DTRACE_MEMORY_ZONES)
-	return dtrace_alloc(size);
-#else
-	return kalloc(size);
-#endif
+	return kheap_alloc_tag(KHEAP_DTRACE, size, Z_WAITOK, tag);
 }
 
 void *
-dt_kmem_zalloc(size_t size, int kmflag)
+dt_kmem_zalloc_tag(size_t size, int kmflag, vm_tag_t tag)
 {
 #pragma unused(kmflag)
 
 /*
  * We ignore the M_NOWAIT bit in kmflag (all of kmflag, in fact).
- * Requests larger than 8K with M_NOWAIT fail in kalloc_canblock.
+ * Requests larger than 8K with M_NOWAIT fail in kalloc_ext.
  */
-#if defined(DTRACE_MEMORY_ZONES)
-	void* buf = dtrace_alloc(size);
-#else
-	void* buf = kalloc(size);
-#endif
-
-	if(!buf)
-		return NULL;
-
-	bzero(buf, size);
-
-	return buf;
+	return kheap_alloc_tag(KHEAP_DTRACE, size, Z_WAITOK | Z_ZERO, tag);
 }
 
 void
 dt_kmem_free(void *buf, size_t size)
 {
-#pragma unused(size)
-	/*
-	 * DTrace relies on this, its doing a lot of NULL frees.
-	 * A null free causes the debug builds to panic.
-	 */
-	if (buf == NULL) return;
-
-	ASSERT(size > 0);
-
-#if defined(DTRACE_MEMORY_ZONES)
-	dtrace_free(buf, size);
-#else
-	kfree(buf, size);
-#endif
+	kheap_free(KHEAP_DTRACE, buf, size);
 }
 
+__typed_allocators_ignore_pop
 
 
 /*
- * aligned kmem allocator
+ * aligned dt_kmem allocator
  * align should be a power of two
  */
 
-void* dt_kmem_alloc_aligned(size_t size, size_t align, int kmflag)
+void*
+dt_kmem_alloc_aligned_tag(size_t size, size_t align, int kmflag, vm_tag_t tag)
 {
-	void* buf;
-	intptr_t p;
-	void** buf_backup;
+	void *mem, **addr_to_free;
+	intptr_t mem_aligned;
+	size_t *size_to_free, hdr_size;
 
-	buf = dt_kmem_alloc(align + sizeof(void*) + size, kmflag);
+	/* Must be a power of two. */
+	assert(align != 0);
+	assert((align & (align - 1)) == 0);
 
-	if(!buf)
+	/*
+	 * We are going to add a header to the allocation. It contains
+	 * the address to free and the total size of the buffer.
+	 */
+	hdr_size = sizeof(size_t) + sizeof(void*);
+	mem = dt_kmem_alloc_tag(size + align + hdr_size, kmflag, tag);
+	if (mem == NULL) {
 		return NULL;
+	}
 
-	p = (intptr_t)buf;
-	p += sizeof(void*);				/* now we have enough room to store the backup */
-	p = P2ROUNDUP(p, align);			/* and now we're aligned */
+	mem_aligned = (intptr_t) (((intptr_t) mem + align + hdr_size) & ~(align - 1));
 
-	buf_backup = (void**)(p - sizeof(void*));
-	*buf_backup = buf;				/* back up the address we need to free */
+	/* Write the address to free in the header. */
+	addr_to_free = (void**) (mem_aligned - sizeof(void*));
+	*addr_to_free = mem;
 
-	return (void*)p;
+	/* Write the size to free in the header. */
+	size_to_free = (size_t*) (mem_aligned - hdr_size);
+	*size_to_free = size + align + hdr_size;
+
+	return (void*) mem_aligned;
 }
 
-void* dt_kmem_zalloc_aligned(size_t size, size_t align, int kmflag)
+void*
+dt_kmem_zalloc_aligned_tag(size_t size, size_t align, int kmflag, vm_tag_t tag)
 {
 	void* buf;
 
-	buf = dt_kmem_alloc_aligned(size, align, kmflag);
+	buf = dt_kmem_alloc_aligned_tag(size, align, kmflag, tag);
 
-	if(!buf)
+	if (!buf) {
 		return NULL;
+	}
 
 	bzero(buf, size);
 
 	return buf;
 }
 
-void dt_kmem_free_aligned(void* buf, size_t size)
+void
+dt_kmem_free_aligned(void* buf, size_t size)
 {
 #pragma unused(size)
-	intptr_t p;
-	void** buf_backup;
+	intptr_t ptr = (intptr_t) buf;
+	void **addr_to_free = (void**) (ptr - sizeof(void*));
+	size_t *size_to_free = (size_t*) (ptr - (sizeof(size_t) + sizeof(void*)));
 
-	p = (intptr_t)buf;
-	p -= sizeof(void*);
-	buf_backup = (void**)(p);
+	if (buf == NULL) {
+		return;
+	}
 
-	dt_kmem_free(*buf_backup, size + ((char*)buf - (char*)*buf_backup));
+	dt_kmem_free(*addr_to_free, *size_to_free);
 }
-
-/*
- * dtrace wants to manage just a single block: dtrace_state_percpu_t * NCPU, and
- * doesn't specify constructor, destructor, or reclaim methods.
- * At present, it always zeroes the block it obtains from kmem_cache_alloc().
- * We'll manage this constricted use of kmem_cache with ordinary _MALLOC and _FREE.
- */
-kmem_cache_t *
-kmem_cache_create(
-    const char *name,		/* descriptive name for this cache */
-    size_t bufsize,		/* size of the objects it manages */
-    size_t align,		/* required object alignment */
-    int (*constructor)(void *, void *, int), /* object constructor */
-    void (*destructor)(void *, void *),	/* object destructor */
-    void (*reclaim)(void *), /* memory reclaim callback */
-    void *private,		/* pass-thru arg for constr/destr/reclaim */
-    vmem_t *vmp,		/* vmem source for slab allocation */
-    int cflags)		/* cache creation flags */
-{
-#pragma unused(name,align,constructor,destructor,reclaim,private,vmp,cflags)
-	return (kmem_cache_t *)bufsize; /* A cookie that tracks the single object size. */
-}
-	
-void *
-kmem_cache_alloc(kmem_cache_t *cp, int kmflag)
-{
-#pragma unused(kmflag)
-	size_t bufsize = (size_t)cp;
-	return (void *)_MALLOC(bufsize, M_TEMP, M_WAITOK);
-}
-
-void
-kmem_cache_free(kmem_cache_t *cp, void *buf)
-{
-#pragma unused(cp)
-	_FREE(buf, M_TEMP);
-}
-
-void
-kmem_cache_destroy(kmem_cache_t *cp)
-{
-#pragma unused(cp)
-}
-
-/*
- * taskq
- */
-extern void thread_call_setup(thread_call_t, thread_call_func_t, thread_call_param_t); /* XXX MACH_KERNEL_PRIVATE */
-
-static void
-_taskq_apply( task_func_t func, thread_call_param_t arg )
-{
-	func( (void *)arg );
-}
-
-taskq_t *
-taskq_create(const char *name, int nthreads, pri_t pri, int minalloc,
-    int maxalloc, uint_t flags)
-{
-#pragma unused(name,nthreads,pri,minalloc,maxalloc,flags)
-
-	return (taskq_t *)thread_call_allocate( (thread_call_func_t)_taskq_apply, NULL );
-}
-
-taskqid_t
-taskq_dispatch(taskq_t *tq, task_func_t func, void *arg, uint_t flags)
-{
-#pragma unused(flags)
-	thread_call_setup( (thread_call_t) tq, (thread_call_func_t)_taskq_apply, (thread_call_param_t)func );
-	thread_call_enter1( (thread_call_t) tq, (thread_call_param_t)arg );
-	return (taskqid_t) tq /* for lack of anything better */;
-}
-
-void	
-taskq_destroy(taskq_t *tq)
-{
-	thread_call_cancel( (thread_call_t) tq );
-	thread_call_free( (thread_call_t) tq );
-}
-
-pri_t maxclsyspri;
 
 /*
  * vmem (Solaris "slab" allocator) used by DTrace solely to hand out resource ids
@@ -930,33 +731,35 @@ typedef unsigned int u_daddr_t;
 
 /* By passing around blist *handles*, the underlying blist can be resized as needed. */
 struct blist_hdl {
-	blist_t blist; 
+	blist_t blist;
 };
 
-vmem_t * 
+vmem_t *
 vmem_create(const char *name, void *base, size_t size, size_t quantum, void *ignore5,
-					void *ignore6, vmem_t *source, size_t qcache_max, int vmflag)
+    void *ignore6, vmem_t *source, size_t qcache_max, int vmflag)
 {
 #pragma unused(name,quantum,ignore5,ignore6,source,qcache_max,vmflag)
 	blist_t bl;
-	struct blist_hdl *p = _MALLOC(sizeof(struct blist_hdl), M_TEMP, M_WAITOK);
-	
+	struct blist_hdl *p = kalloc_type(struct blist_hdl, Z_WAITOK);
+
 	ASSERT(quantum == 1);
 	ASSERT(NULL == ignore5);
 	ASSERT(NULL == ignore6);
 	ASSERT(NULL == source);
 	ASSERT(0 == qcache_max);
+	ASSERT(size <= INT32_MAX);
 	ASSERT(vmflag & VMC_IDENTIFIER);
-	
+
 	size = MIN(128, size); /* Clamp to 128 initially, since the underlying data structure is pre-allocated */
-	
-	p->blist = bl = blist_create( size );
-	blist_free(bl, 0, size);
-	if (base) blist_alloc( bl, (daddr_t)(uintptr_t)base ); /* Chomp off initial ID(s) */
-	
+
+	p->blist = bl = blist_create((daddr_t)size);
+	blist_free(bl, 0, (daddr_t)size);
+	if (base) {
+		blist_alloc( bl, (daddr_t)(uintptr_t)base );   /* Chomp off initial ID(s) */
+	}
 	return (vmem_t *)p;
 }
- 
+
 void *
 vmem_alloc(vmem_t *vmp, size_t size, int vmflag)
 {
@@ -964,17 +767,18 @@ vmem_alloc(vmem_t *vmp, size_t size, int vmflag)
 	struct blist_hdl *q = (struct blist_hdl *)vmp;
 	blist_t bl = q->blist;
 	daddr_t p;
-	
+
 	p = blist_alloc(bl, (daddr_t)size);
-	
-	if ((daddr_t)-1 == p) {
+
+	if (p == SWAPBLK_NONE) {
 		blist_resize(&bl, (bl->bl_blocks) << 1, 1);
 		q->blist = bl;
 		p = blist_alloc(bl, (daddr_t)size);
-		if ((daddr_t)-1 == p) 
+		if (p == SWAPBLK_NONE) {
 			panic("vmem_alloc: failure after blist_resize!");
+		}
 	}
-	
+
 	return (void *)(uintptr_t)p;
 }
 
@@ -982,7 +786,7 @@ void
 vmem_free(vmem_t *vmp, void *vaddr, size_t size)
 {
 	struct blist_hdl *p = (struct blist_hdl *)vmp;
-	
+
 	blist_free( p->blist, (daddr_t)(uintptr_t)vaddr, (daddr_t)size );
 }
 
@@ -990,9 +794,9 @@ void
 vmem_destroy(vmem_t *vmp)
 {
 	struct blist_hdl *p = (struct blist_hdl *)vmp;
-	
+
 	blist_destroy( p->blist );
-	_FREE( p, sizeof(struct blist_hdl) );
+	kfree_type(struct blist_hdl, p);
 }
 
 /*
@@ -1000,17 +804,17 @@ vmem_destroy(vmem_t *vmp)
  */
 
 /*
- * dtrace_gethrestime() provides the "walltimestamp", a value that is anchored at 
+ * dtrace_gethrestime() provides the "walltimestamp", a value that is anchored at
  * January 1, 1970. Because it can be called from probe context, it must take no locks.
  */
 
 hrtime_t
 dtrace_gethrestime(void)
 {
-	clock_sec_t		secs;
-	clock_nsec_t	nanosecs;
-	uint64_t		secs64, ns64;
-    
+	clock_sec_t             secs;
+	clock_nsec_t    nanosecs;
+	uint64_t                secs64, ns64;
+
 	clock_get_calendar_nanotime_nowait(&secs, &nanosecs);
 	secs64 = (uint64_t)secs;
 	ns64 = (uint64_t)nanosecs;
@@ -1036,7 +840,7 @@ dtrace_abs_to_nano(uint64_t elapsed)
 	 * denominator in a fraction.
 	 */
 
-	if ( sTimebaseInfo.denom == 0 ) {
+	if (sTimebaseInfo.denom == 0) {
 		(void) clock_timebase_info(&sTimebaseInfo);
 	}
 
@@ -1047,11 +851,11 @@ dtrace_abs_to_nano(uint64_t elapsed)
 	 * Provided the final result is representable in 64 bits the following maneuver will
 	 * deliver that result without intermediate overflow.
 	 */
-	if (sTimebaseInfo.denom == sTimebaseInfo.numer)
+	if (sTimebaseInfo.denom == sTimebaseInfo.numer) {
 		return elapsed;
-	else if (sTimebaseInfo.denom == 1)
+	} else if (sTimebaseInfo.denom == 1) {
 		return elapsed * (uint64_t)sTimebaseInfo.numer;
-	else {
+	} else {
 		/* Decompose elapsed = eta32 * 2^32 + eps32: */
 		uint64_t eta32 = elapsed >> 32;
 		uint64_t eps32 = elapsed & 0x00000000ffffffffLL;
@@ -1063,22 +867,23 @@ dtrace_abs_to_nano(uint64_t elapsed)
 		uint64_t lambda64 = numer * eps32;
 
 		/* Divide the constituents by denom: */
-		uint64_t q32 = mu64/denom;
+		uint64_t q32 = mu64 / denom;
 		uint64_t r32 = mu64 - (q32 * denom); /* mu64 % denom */
 
-		return (q32 << 32) + ((r32 << 32) + lambda64)/denom;
+		return (q32 << 32) + ((r32 << 32) + lambda64) / denom;
 	}
 }
 
 hrtime_t
 dtrace_gethrtime(void)
 {
-    static uint64_t        start = 0;
-    
-	if (start == 0)
+	static uint64_t        start = 0;
+
+	if (start == 0) {
 		start = mach_absolute_time();
-		
-    return dtrace_abs_to_nano(mach_absolute_time() - start);
+	}
+
+	return dtrace_abs_to_nano(mach_absolute_time() - start);
 }
 
 /*
@@ -1087,19 +892,21 @@ dtrace_gethrtime(void)
 uint32_t
 dtrace_cas32(uint32_t *target, uint32_t cmp, uint32_t new)
 {
-    if (OSCompareAndSwap( (UInt32)cmp, (UInt32)new, (volatile UInt32 *)target ))
+	if (OSCompareAndSwap((UInt32)cmp, (UInt32)new, (volatile UInt32 *)target )) {
 		return cmp;
-	else
+	} else {
 		return ~cmp; /* Must return something *other* than cmp */
+	}
 }
 
 void *
 dtrace_casptr(void *target, void *cmp, void *new)
 {
-	if (OSCompareAndSwapPtr( cmp, new, (void**)target ))
+	if (OSCompareAndSwapPtr( cmp, new, (void**)target )) {
 		return cmp;
-	else
+	} else {
 		return (void *)(~(uintptr_t)cmp); /* Must return something *other* than cmp */
+	}
 }
 
 /*
@@ -1121,7 +928,9 @@ dtrace_interrupt_enable(dtrace_icookie_t reenable)
  * MP coordination
  */
 static void
-dtrace_sync_func(void) {}
+dtrace_sync_func(void)
+{
+}
 
 /*
  * dtrace_sync() is not called from probe context.
@@ -1138,32 +947,28 @@ dtrace_sync(void)
 
 extern kern_return_t dtrace_copyio_preflight(addr64_t);
 extern kern_return_t dtrace_copyio_postflight(addr64_t);
- 
+
 static int
 dtrace_copycheck(user_addr_t uaddr, uintptr_t kaddr, size_t size)
 {
 #pragma unused(kaddr)
 
-	vm_offset_t recover = dtrace_set_thread_recover( current_thread(), 0 ); /* Snare any extant recovery point. */
-	dtrace_set_thread_recover( current_thread(), recover ); /* Put it back. We *must not* re-enter and overwrite. */
-
 	ASSERT(kaddr + size >= kaddr);
 
-	if (	uaddr + size < uaddr ||		/* Avoid address wrap. */
-		KERN_FAILURE == dtrace_copyio_preflight(uaddr)) /* Machine specific setup/constraints. */
-	{
+	if (uaddr + size < uaddr ||             /* Avoid address wrap. */
+	    KERN_FAILURE == dtrace_copyio_preflight(uaddr)) {   /* Machine specific setup/constraints. */
 		DTRACE_CPUFLAG_SET(CPU_DTRACE_BADADDR);
 		cpu_core[CPU->cpu_id].cpuc_dtrace_illval = uaddr;
-		return (0);
+		return 0;
 	}
-	return (1);
+	return 1;
 }
 
 void
 dtrace_copyin(user_addr_t src, uintptr_t dst, size_t len, volatile uint16_t *flags)
 {
 #pragma unused(flags)
-    
+
 	if (dtrace_copycheck( src, dst, len )) {
 		if (copyin((const user_addr_t)src, (char *)dst, (vm_size_t)len)) {
 			DTRACE_CPUFLAG_SET(CPU_DTRACE_BADADDR);
@@ -1177,9 +982,9 @@ void
 dtrace_copyinstr(user_addr_t src, uintptr_t dst, size_t len, volatile uint16_t *flags)
 {
 #pragma unused(flags)
-    
+
 	size_t actual;
-	
+
 	if (dtrace_copycheck( src, dst, len )) {
 		/*  copyin as many as 'len' bytes. */
 		int error = copyinstr((const user_addr_t)src, (char *)dst, (vm_size_t)len, &actual);
@@ -1202,7 +1007,7 @@ void
 dtrace_copyout(uintptr_t src, user_addr_t dst, size_t len, volatile uint16_t *flags)
 {
 #pragma unused(flags)
-    
+
 	if (dtrace_copycheck( dst, src, len )) {
 		if (copyout((const void *)src, dst, (vm_size_t)len)) {
 			DTRACE_CPUFLAG_SET(CPU_DTRACE_BADADDR);
@@ -1216,11 +1021,10 @@ void
 dtrace_copyoutstr(uintptr_t src, user_addr_t dst, size_t len, volatile uint16_t *flags)
 {
 #pragma unused(flags)
-    
+
 	size_t actual;
 
 	if (dtrace_copycheck( dst, src, len )) {
-
 		/*
 		 * ENAMETOOLONG is returned when 'len' bytes have been copied out but the NUL terminator was
 		 * not encountered. We raise CPU_DTRACE_BADADDR in that case.
@@ -1233,6 +1037,40 @@ dtrace_copyoutstr(uintptr_t src, user_addr_t dst, size_t len, volatile uint16_t 
 		}
 		dtrace_copyio_postflight(dst);
 	}
+}
+
+extern const int copysize_limit_panic;
+
+int
+dtrace_copy_maxsize(void)
+{
+	return copysize_limit_panic;
+}
+
+
+int
+dtrace_buffer_copyout(const void *kaddr, user_addr_t uaddr, vm_size_t nbytes)
+{
+	int maxsize = dtrace_copy_maxsize();
+	/*
+	 * Partition the copyout in copysize_limit_panic-sized chunks
+	 */
+	while (nbytes >= (vm_size_t)maxsize) {
+		if (copyout(kaddr, uaddr, maxsize) != 0) {
+			return EFAULT;
+		}
+
+		nbytes -= maxsize;
+		uaddr += maxsize;
+		kaddr = (const void *)((uintptr_t)kaddr + maxsize);
+	}
+	if (nbytes > 0) {
+		if (copyout(kaddr, uaddr, nbytes) != 0) {
+			return EFAULT;
+		}
+	}
+
+	return 0;
 }
 
 uint8_t
@@ -1250,7 +1088,7 @@ dtrace_fuword8(user_addr_t uaddr)
 	}
 	DTRACE_CPUFLAG_CLEAR(CPU_DTRACE_NOFAULT);
 
-	return(ret);
+	return ret;
 }
 
 uint16_t
@@ -1268,7 +1106,7 @@ dtrace_fuword16(user_addr_t uaddr)
 	}
 	DTRACE_CPUFLAG_CLEAR(CPU_DTRACE_NOFAULT);
 
-	return(ret);
+	return ret;
 }
 
 uint32_t
@@ -1286,7 +1124,7 @@ dtrace_fuword32(user_addr_t uaddr)
 	}
 	DTRACE_CPUFLAG_CLEAR(CPU_DTRACE_NOFAULT);
 
-	return(ret);
+	return ret;
 }
 
 uint64_t
@@ -1304,7 +1142,7 @@ dtrace_fuword64(user_addr_t uaddr)
 	}
 	DTRACE_CPUFLAG_CLEAR(CPU_DTRACE_NOFAULT);
 
-	return(ret);
+	return ret;
 }
 
 /*
@@ -1353,22 +1191,6 @@ fuword64(user_addr_t uaddr, uint64_t *value)
 }
 
 void
-fuword8_noerr(user_addr_t uaddr, uint8_t *value)
-{
-	if (copyin((const user_addr_t)uaddr, (char *)value, sizeof(uint8_t))) {
-		*value = 0;
-	}
-}
-
-void
-fuword16_noerr(user_addr_t uaddr, uint16_t *value)
-{
-	if (copyin((const user_addr_t)uaddr, (char *)value, sizeof(uint16_t))) {
-		*value = 0;
-	}
-}
-
-void
 fuword32_noerr(user_addr_t uaddr, uint32_t *value)
 {
 	if (copyin((const user_addr_t)uaddr, (char *)value, sizeof(uint32_t))) {
@@ -1404,27 +1226,6 @@ suword32(user_addr_t addr, uint32_t value)
 	return 0;
 }
 
-int
-suword16(user_addr_t addr, uint16_t value)
-{
-	if (copyout((const void *)&value, addr, sizeof(value)) != 0) {
-		return -1;
-	}
-
-	return 0;
-}
-
-int
-suword8(user_addr_t addr, uint8_t value)
-{
-	if (copyout((const void *)&value, addr, sizeof(value)) != 0) {
-		return -1;
-	}
-
-	return 0;
-}
-
-
 /*
  * Miscellaneous
  */
@@ -1435,7 +1236,7 @@ dtrace_tally_fault(user_addr_t uaddr)
 {
 	DTRACE_CPUFLAG_SET(CPU_DTRACE_BADADDR);
 	cpu_core[CPU->cpu_id].cpuc_dtrace_illval = uaddr;
-	return( DTRACE_CPUFLAG_ISSET(CPU_DTRACE_NOFAULT) ? TRUE : FALSE );
+	return DTRACE_CPUFLAG_ISSET(CPU_DTRACE_NOFAULT) ? TRUE : FALSE;
 }
 
 #define TOTTY   0x02
@@ -1448,7 +1249,8 @@ vuprintf(const char *format, va_list ap)
 }
 
 /* Not called from probe context */
-void cmn_err( int level, const char *format, ... )
+void
+cmn_err( int level, const char *format, ... )
 {
 #pragma unused(level)
 	va_list alist;
@@ -1459,33 +1261,25 @@ void cmn_err( int level, const char *format, ... )
 	uprintf("\n");
 }
 
-/*
- * History:
- *  2002-01-24 	gvdl	Initial implementation of strstr
- */
-
-__private_extern__ const char *
-strstr(const char *in, const char *str)
+const void*
+bsearch(const void *key, const void *base0, size_t nmemb, size_t size, int (*compar)(const void *, const void *))
 {
-    char c;
-    size_t len;
-
-    c = *str++;
-    if (!c)
-        return (const char *) in;	// Trivial empty string case
-
-    len = strlen(str);
-    do {
-        char sc;
-
-        do {
-            sc = *in++;
-            if (!sc)
-                return (char *) 0;
-        } while (sc != c);
-    } while (strncmp(in, str, len) != 0);
-
-    return (const char *) (in - 1);
+	const char *base = base0;
+	size_t lim;
+	int cmp;
+	const void *p;
+	for (lim = nmemb; lim != 0; lim >>= 1) {
+		p = base + (lim >> 1) * size;
+		cmp = (*compar)(key, p);
+		if (cmp == 0) {
+			return p;
+		}
+		if (cmp > 0) {  /* key > p: move right */
+			base = (const char *)p + size;
+			lim--;
+		}               /* else move left */
+	}
+	return NULL;
 }
 
 /*
@@ -1506,10 +1300,11 @@ dtrace_getstackdepth(int aframes)
 	int depth = 0;
 	int on_intr;
 
-	if ((on_intr = CPU_ON_INTR(CPU)) != 0)
+	if ((on_intr = CPU_ON_INTR(CPU)) != 0) {
 		stacktop = (struct frame *)dtrace_get_cpu_int_stack_top();
-	else
+	} else {
 		stacktop = (struct frame *)(dtrace_get_kernel_stack(current_thread()) + kernel_stack_size);
+	}
 
 	minfp = fp;
 
@@ -1525,10 +1320,10 @@ dtrace_getstackdepth(int aframes)
 				/*
 				 * Hop from interrupt stack to thread stack.
 				 */
-                                vm_offset_t kstack_base = dtrace_get_kernel_stack(current_thread());
+				vm_offset_t kstack_base = dtrace_get_kernel_stack(current_thread());
 
-                                minfp = (struct frame *)kstack_base;
-                                stacktop = (struct frame *)(kstack_base + kernel_stack_size);
+				minfp = (struct frame *)kstack_base;
+				stacktop = (struct frame *)(kstack_base + kernel_stack_size);
 
 				on_intr = 0;
 				continue;
@@ -1540,37 +1335,28 @@ dtrace_getstackdepth(int aframes)
 		minfp = fp;
 	}
 
-	if (depth <= aframes)
-		return (0);
+	if (depth <= aframes) {
+		return 0;
+	}
 
-	return (depth - aframes);
+	return depth - aframes;
+}
+
+int
+dtrace_addr_in_module(const void* addr, const struct modctl *ctl)
+{
+	return OSKextKextForAddress(addr) == (void*)ctl->mod_address;
 }
 
 /*
  * Unconsidered
  */
 void
-dtrace_vtime_enable(void) {}
-
-void
-dtrace_vtime_disable(void) {}
-
-#else /* else ! CONFIG_DTRACE */
-
-#include <sys/types.h>
-#include <mach/vm_types.h>
-#include <mach/kmod.h>
-
-/*
- * This exists to prevent build errors when dtrace is unconfigured.
- */
-
-kern_return_t _dtrace_register_anon_DOF(char *, unsigned char *, uint32_t);
-
-kern_return_t _dtrace_register_anon_DOF(char *arg1, unsigned char *arg2, uint32_t arg3) {
-#pragma unused(arg1, arg2, arg3)
-
-        return KERN_FAILURE;
+dtrace_vtime_enable(void)
+{
 }
 
-#endif /* CONFIG_DTRACE */
+void
+dtrace_vtime_disable(void)
+{
+}

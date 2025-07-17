@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2006-2013 Apple Inc. All rights reserved.
+ * Copyright (c) 2006-2019 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -26,7 +26,7 @@
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
 #ifndef _SYS_MCACHE_H
-#define	_SYS_MCACHE_H
+#define _SYS_MCACHE_H
 
 #ifdef KERNEL_PRIVATE
 
@@ -49,135 +49,50 @@ extern "C" {
 #endif
 
 /*
- * Unlike VERIFY(), ASSERT() is evaluated only in DEBUG build.
+ * Unlike VERIFY(), ASSERT() is evaluated only in DEBUG/DEVELOPMENT build.
  */
-#define	VERIFY(EX)	((void)((EX) || assfail(#EX, __FILE__, __LINE__)))
-#if DEBUG
-#define	ASSERT(EX)	VERIFY(EX)
+#define VERIFY(EX)      \
+	((void)(__probable((EX)) || assfail(#EX, __FILE__, __LINE__)))
+#if (DEBUG || DEVELOPMENT)
+#define ASSERT(EX)      VERIFY(EX)
 #else
-#define	ASSERT(EX)	((void)0)
+#define ASSERT(EX)      ((void)0)
 #endif
 
 /*
  * Compile time assert; this should be on its own someday.
  */
-#define	_CASSERT(x)	\
-	switch (0) { case 0: case (x): ; }
-
-/*
- * Atomic macros; these should be on their own someday.
- */
-#define	atomic_add_16_ov(a, n)						\
-	((u_int16_t) OSAddAtomic16(n, (volatile SInt16 *)a))
-
-#define	atomic_add_16(a, n)						\
-	((void) atomic_add_16_ov(a, n))
-
-#define	atomic_add_32_ov(a, n)						\
-	((u_int32_t) OSAddAtomic(n, (volatile SInt32 *)a))
-
-#define	atomic_add_32(a, n)						\
-	((void) atomic_add_32_ov(a, n))
-
-#define	atomic_add_64_ov(a, n)						\
-	((u_int64_t) OSAddAtomic64(n, (volatile SInt64 *)a))
-
-#define	atomic_add_64(a, n)						\
-	((void) atomic_add_64_ov(a, n))
-
-#define	atomic_set_64(a, n) do {					\
-	while (!OSCompareAndSwap64(*a, n, (volatile UInt64 *)a))	\
-		;							\
-} while (0)
-
-#if defined(__LP64__)
-#define	atomic_get_64(n, a) do {					\
-	(n) = *(a);							\
-} while (0)
-#else
-#define	atomic_get_64(n, a) do {					\
-	(n) = atomic_add_64_ov(a, 0);					\
-} while (0)
-#endif /* __LP64__ */
-
-#define	atomic_or_8_ov(a, n)						\
-	((u_int8_t) OSBitOrAtomic8(n, (volatile UInt8 *)a))
-
-#define	atomic_or_8(a, n)						\
-	((void) atomic_or_8_ov(a, n))
-
-#define	atomic_bitset_8(a, n)						\
-	atomic_or_8(a, n)
-
-#define	atomic_or_16_ov(a, n)						\
-	((u_int16_t) OSBitOrAtomic16(n, (volatile UInt16 *)a))
-
-#define	atomic_or_16(a, n)						\
-	((void) atomic_or_16_ov(a, n))
-
-#define	atomic_bitset_16(a, n)						\
-	atomic_or_16(a, n)
-
-#define	atomic_or_32_ov(a, n)						\
-	((u_int32_t) OSBitOrAtomic(n, (volatile UInt32 *)a))
-
-#define	atomic_or_32(a, n)						\
-	((void) atomic_or_32_ov(a, n))
-
-#define	atomic_bitset_32(a, n)						\
-	atomic_or_32(a, n)
-
-#define	atomic_and_8_ov(a, n)						\
-	((u_int8_t) OSBitAndAtomic8(n, (volatile UInt8 *)a))
-
-#define	atomic_and_8(a, n)						\
-	((void) atomic_and_8_ov(a, n))
-
-#define	atomic_bitclear_8(a, n)						\
-	atomic_and_8(a, ~(n))
-
-#define	atomic_and_16_ov(a, n)						\
-	((u_int16_t) OSBitAndAtomic16(n, (volatile UInt16 *)a))
-
-#define	atomic_and_16(a, n)						\
-	((void) atomic_and_16_ov(a, n))
-
-#define	atomic_bitclear_16(a, n)					\
-	atomic_and_16(a, ~(n))
-
-#define	atomic_and_32_ov(a, n)						\
-	((u_int32_t) OSBitAndAtomic(n, (volatile UInt32 *)a))
-
-#define	atomic_and_32(a, n)						\
-	((void) atomic_and_32_ov(a, n))
-
-#define	atomic_bitclear_32(a, n)					\
-	atomic_and_32(a, ~(n))
+#define _CASSERT(x)     _Static_assert(x, "compile-time assertion failed")
 
 /*
  * Use CPU_CACHE_LINE_SIZE instead of MAX_CPU_CACHE_LINE_SIZE, unless
  * wasting space is of no concern.
  */
-#define	MAX_CPU_CACHE_LINE_SIZE	64
-#define	CPU_CACHE_LINE_SIZE	mcache_cache_line_size()
+#define MAX_CPU_CACHE_LINE_SIZE 128
+#define CPU_CACHE_LINE_SIZE     mcache_cache_line_size()
 
 #ifndef IS_P2ALIGNED
-#define	IS_P2ALIGNED(v, a) \
+#define IS_P2ALIGNED(v, a) \
 	((((uintptr_t)(v)) & ((uintptr_t)(a) - 1)) == 0)
 #endif /* IS_P2ALIGNED */
 
 #ifndef P2ROUNDUP
-#define	P2ROUNDUP(x, align) \
+#define P2ROUNDUP(x, align) \
 	(-(-((uintptr_t)(x)) & -((uintptr_t)align)))
 #endif /* P2ROUNDUP */
 
 #ifndef P2ROUNDDOWN
-#define	P2ROUNDDOWN(x, align) \
+#define P2ROUNDDOWN(x, align) \
 	(((uintptr_t)(x)) & ~((uintptr_t)(align) - 1))
 #endif /* P2ROUNDDOWN */
 
-#define	MCACHE_FREE_PATTERN		0xdeadbeefdeadbeefULL
-#define	MCACHE_UNINITIALIZED_PATTERN	0xbaddcafebaddcafeULL
+#ifndef P2ALIGN
+#define P2ALIGN(x, align) \
+	((uintptr_t)(x) & -((uintptr_t)(align)))
+#endif /* P2ALIGN */
+
+#define MCACHE_FREE_PATTERN             0xdeadbeefdeadbeefULL
+#define MCACHE_UNINITIALIZED_PATTERN    0xbaddcafebaddcafeULL
 
 /*
  * mcache allocation request flags.
@@ -198,13 +113,13 @@ extern "C" {
  *
  * Regular mcache clients should only use MCR_SLEEP or MCR_NOSLEEP.
  */
-#define	MCR_SLEEP	0x0000		/* same as M_WAITOK */
-#define	MCR_NOSLEEP	0x0001		/* same as M_NOWAIT */
-#define	MCR_FAILOK	0x0100		/* private, for internal use only */
-#define	MCR_TRYHARD	0x0200		/* private, for internal use only */
-#define	MCR_USR1	0x1000		/* private, for internal use only */
+#define MCR_SLEEP       0x0000          /* same as M_WAITOK */
+#define MCR_NOSLEEP     0x0001          /* same as M_NOWAIT */
+#define MCR_FAILOK      0x0100          /* private, for internal use only */
+#define MCR_TRYHARD     0x0200          /* private, for internal use only */
+#define MCR_USR1        0x1000          /* private, for internal use only */
 
-#define	MCR_NONBLOCKING	(MCR_NOSLEEP | MCR_FAILOK | MCR_TRYHARD)
+#define MCR_NONBLOCKING (MCR_NOSLEEP | MCR_FAILOK | MCR_TRYHARD)
 
 /*
  * Generic one-way linked list element structure.  This is used to handle
@@ -212,39 +127,40 @@ extern "C" {
  * together before returning them to the caller.
  */
 typedef struct mcache_obj {
-	struct mcache_obj	*obj_next;
+	struct mcache_obj       *obj_next;
 } mcache_obj_t;
 
 typedef struct mcache_bkt {
-	void		*bkt_next;	/* next bucket in list */
-	void		*bkt_obj[1];	/* one or more objects */
+	void            *bkt_next;      /* next bucket in list */
+	struct mcache_bkttype *bkt_type; /* bucket type */
+	void            *bkt_obj[1];    /* one or more objects */
 } mcache_bkt_t;
 
 typedef struct mcache_bktlist {
-	mcache_bkt_t	*bl_list;	/* bucket list */
-	u_int32_t	bl_total;	/* number of buckets */
-	u_int32_t	bl_min;		/* min since last update */
-	u_int32_t	bl_reaplimit;	/* max reapable buckets */
-	u_int64_t	bl_alloc;	/* allocations from this list */
+	mcache_bkt_t    *bl_list;       /* bucket list */
+	u_int32_t       bl_total;       /* number of buckets */
+	u_int32_t       bl_min;         /* min since last update */
+	u_int32_t       bl_reaplimit;   /* max reapable buckets */
+	u_int64_t       bl_alloc;       /* allocations from this list */
 } mcache_bktlist_t;
 
 typedef struct mcache_bkttype {
-	int		bt_bktsize;	/* bucket size (number of elements) */
-	size_t		bt_minbuf;	/* all smaller buffers qualify */
-	size_t		bt_maxbuf;	/* no larger bfufers qualify */
-	struct mcache	*bt_cache;	/* bucket cache */
+	int             bt_bktsize;     /* bucket size (number of elements) */
+	size_t          bt_minbuf;      /* all smaller buffers qualify */
+	size_t          bt_maxbuf;      /* no larger bfufers qualify */
+	struct mcache   *bt_cache;      /* bucket cache */
 } mcache_bkttype_t;
 
 typedef struct mcache_cpu {
 	decl_lck_mtx_data(, cc_lock);
-	mcache_bkt_t	*cc_filled;	/* the currently filled bucket */
-	mcache_bkt_t	*cc_pfilled;	/* the previously filled bucket */
-	u_int64_t	cc_alloc;	/* allocations from this cpu */
-	u_int64_t	cc_free;	/* frees to this cpu */
-	int		cc_objs;	/* number of objects in filled bkt */
-	int		cc_pobjs;	/* number of objects in previous bkt */
-	int		cc_bktsize;	/* number of elements in a full bkt */
-} __attribute__((aligned(MAX_CPU_CACHE_LINE_SIZE), packed)) mcache_cpu_t;
+	mcache_bkt_t    *cc_filled;     /* the currently filled bucket */
+	mcache_bkt_t    *cc_pfilled;    /* the previously filled bucket */
+	u_int64_t       cc_alloc;       /* allocations from this cpu */
+	u_int64_t       cc_free;        /* frees to this cpu */
+	int             cc_objs;        /* number of objects in filled bkt */
+	int             cc_pobjs;       /* number of objects in previous bkt */
+	int             cc_bktsize;     /* number of elements in a full bkt */
+} __attribute__((aligned(MAX_CPU_CACHE_LINE_SIZE))) mcache_cpu_t;
 
 typedef unsigned int (*mcache_allocfn_t)(void *, mcache_obj_t ***,
     unsigned int, int);
@@ -257,92 +173,90 @@ typedef struct mcache {
 	/*
 	 * Cache properties
 	 */
-	LIST_ENTRY(mcache) mc_list;	/* cache linkage */
-	char		mc_name[32];	/* cache name */
-	struct zone	*mc_slab_zone;	/* backend zone allocator */
-	mcache_allocfn_t mc_slab_alloc;	/* slab layer allocate callback */
-	mcache_freefn_t	mc_slab_free;	/* slab layer free callback */
-	mcache_auditfn_t mc_slab_audit;	/* slab layer audit callback */
-	mcache_logfn_t mc_slab_log;	/* slab layer log callback */
+	LIST_ENTRY(mcache) mc_list;     /* cache linkage */
+	char            mc_name[32];    /* cache name */
+	struct zone     *mc_slab_zone;  /* backend zone allocator */
+	mcache_allocfn_t mc_slab_alloc; /* slab layer allocate callback */
+	mcache_freefn_t mc_slab_free;   /* slab layer free callback */
+	mcache_auditfn_t mc_slab_audit; /* slab layer audit callback */
+	mcache_logfn_t mc_slab_log;     /* slab layer log callback */
 	mcache_notifyfn_t mc_slab_notify; /* slab layer notify callback */
-	void		*mc_private;	/* opaque arg to callbacks */
-	size_t		mc_bufsize;	/* object size */
-	size_t		mc_align;	/* object alignment */
-	u_int32_t	mc_flags;	/* cache creation flags */
-	u_int32_t	mc_purge_cnt;	/* # of purges requested by slab */
-	u_int32_t	mc_enable_cnt;	/* # of reenables due to purges */
-	u_int32_t	mc_waiter_cnt;	/* # of slab layer waiters */
-	u_int32_t	mc_wretry_cnt;	/* # of wait retries */
-	u_int32_t	mc_nwretry_cnt;	/* # of no-wait retry attempts */
-	u_int32_t	mc_nwfail_cnt;	/* # of no-wait retries that failed */
+	void            *mc_private;    /* opaque arg to callbacks */
+	size_t          mc_bufsize;     /* object size */
+	size_t          mc_align;       /* object alignment */
+	u_int32_t       mc_flags;       /* cache creation flags */
+	u_int32_t       mc_purge_cnt;   /* # of purges requested by slab */
+	u_int32_t       mc_enable_cnt;  /* # of reenables due to purges */
+	u_int32_t       mc_waiter_cnt;  /* # of slab layer waiters */
+	u_int32_t       mc_wretry_cnt;  /* # of wait retries */
+	u_int32_t       mc_nwretry_cnt; /* # of no-wait retry attempts */
+	u_int32_t       mc_nwfail_cnt;  /* # of no-wait retries that failed */
 	decl_lck_mtx_data(, mc_sync_lock); /* protects purges and reenables */
-	lck_attr_t	*mc_sync_lock_attr;
-	lck_grp_t	*mc_sync_lock_grp;
-	lck_grp_attr_t	*mc_sync_lock_grp_attr;
+	lck_grp_t       *mc_sync_lock_grp;
 	/*
 	 * Keep CPU and buckets layers lock statistics separate.
 	 */
-	lck_attr_t	*mc_cpu_lock_attr;
-	lck_grp_t	*mc_cpu_lock_grp;
-	lck_grp_attr_t	*mc_cpu_lock_grp_attr;
+	lck_grp_t       *mc_cpu_lock_grp;
 
 	/*
 	 * Bucket layer common to all CPUs
 	 */
 	decl_lck_mtx_data(, mc_bkt_lock);
-	lck_attr_t	*mc_bkt_lock_attr;
-	lck_grp_t	*mc_bkt_lock_grp;
-	lck_grp_attr_t  *mc_bkt_lock_grp_attr;
-	mcache_bkttype_t *cache_bkttype;	/* bucket type */
-	mcache_bktlist_t mc_full;		/* full buckets */
-	mcache_bktlist_t mc_empty;		/* empty buckets */
-	size_t		mc_chunksize;		/* bufsize + alignment */
-	u_int32_t	mc_bkt_contention;	/* lock contention count */
-	u_int32_t	mc_bkt_contention_prev;	/* previous snapshot */
+	lck_grp_t       *mc_bkt_lock_grp;
+	mcache_bkttype_t *cache_bkttype;        /* bucket type */
+	mcache_bktlist_t mc_full;               /* full buckets */
+	mcache_bktlist_t mc_empty;              /* empty buckets */
+	size_t          mc_chunksize;           /* bufsize + alignment */
+	u_int32_t       mc_bkt_contention;      /* lock contention count */
+	u_int32_t       mc_bkt_contention_prev; /* previous snapshot */
 
 	/*
 	 * Per-CPU layer, aligned at cache line boundary
 	 */
-	mcache_cpu_t	mc_cpu[1];
+	mcache_cpu_t    mc_cpu[1]
+	__attribute__((aligned(MAX_CPU_CACHE_LINE_SIZE)));
 } mcache_t;
 
-#define	MCACHE_ALIGN	8	/* default guaranteed alignment */
+#define MCACHE_ALIGN    8       /* default guaranteed alignment */
 
 /* Valid values for mc_flags */
-#define	MCF_VERIFY	0x00000001	/* enable verification */
-#define	MCF_TRACE	0x00000002	/* enable transaction auditing */
-#define	MCF_NOCPUCACHE	0x00000010	/* disable CPU layer caching */
-#define	MCF_NOLEAKLOG	0x00000100	/* disable leak logging */
-#define	MCF_EXPLEAKLOG	0x00000200	/* expose leak info to user space */
+#define MCF_VERIFY      0x00000001      /* enable verification */
+#define MCF_TRACE       0x00000002      /* enable transaction auditing */
+#define MCF_NOCPUCACHE  0x00000010      /* disable CPU layer caching */
+#define MCF_NOLEAKLOG   0x00000100      /* disable leak logging */
+#define MCF_EXPLEAKLOG  0x00000200      /* expose leak info to user space */
 
-#define	MCF_DEBUG	(MCF_VERIFY | MCF_TRACE)
-#define	MCF_FLAGS_MASK	\
+#define MCF_DEBUG       (MCF_VERIFY | MCF_TRACE)
+#define MCF_FLAGS_MASK  \
 	(MCF_DEBUG | MCF_NOCPUCACHE | MCF_NOLEAKLOG | MCF_EXPLEAKLOG)
 
 /* Valid values for notify callback */
-#define	MCN_RETRYALLOC	0x00000001	/* Allocation should be retried */
+#define MCN_RETRYALLOC  0x00000001      /* Allocation should be retried */
 
-#define	MCACHE_STACK_DEPTH 16
+#define MCACHE_STACK_DEPTH 16
+
+#define MCA_TRN_MAX     2               /* Number of transactions to record */
+
+#define DUMP_MCA_BUF_SIZE       512
 
 typedef struct mcache_audit {
-	struct mcache_audit *mca_next;	/* next audit struct */
-	void		*mca_addr;	/* address of buffer */
-	mcache_t	*mca_cache;	/* parent cache of the buffer */
-	struct thread	*mca_thread;	/* thread doing transaction */
-	struct thread	*mca_pthread;	/* previous transaction thread */
-	size_t		mca_contents_size; /* size of saved contents */
-	void		*mca_contents;	/* user-specific saved contents */
-	uint32_t	mca_tstamp;	/* transaction timestamp (ms) */
-	uint32_t	mca_ptstamp;	/* prev transaction timestamp (ms) */
-	uint16_t	mca_depth;	/* pc stack depth */
-	uint16_t	mca_pdepth;	/* previous transaction pc stack */
-	void		*mca_stack[MCACHE_STACK_DEPTH];
-	void		*mca_pstack[MCACHE_STACK_DEPTH];
-	void		*mca_uptr;	/* user-specific pointer */
-	uint32_t	mca_uflags;	/* user-specific flags */
+	struct mcache_audit *mca_next;  /* next audit struct */
+	void            *mca_addr;      /* address of buffer */
+	mcache_t        *mca_cache;     /* parent cache of the buffer */
+	size_t          mca_contents_size; /* size of saved contents */
+	void            *mca_contents;  /* user-specific saved contents */
+	void            *mca_uptr;      /* user-specific pointer */
+	uint32_t        mca_uflags;     /* user-specific flags */
+	uint32_t        mca_next_trn;
+	struct mca_trn {
+		struct thread   *mca_thread;    /* thread doing transaction */
+		uint32_t        mca_tstamp;
+		uint16_t        mca_depth;
+		void            *mca_stack[MCACHE_STACK_DEPTH];
+	} mca_trns[MCA_TRN_MAX];
 } mcache_audit_t;
 
-__private_extern__ int assfail(const char *, const char *, int);
+__private_extern__ int assfail(const char *, const char *, int) __abortlike;
 __private_extern__ void mcache_init(void);
 __private_extern__ unsigned int mcache_getflags(void);
 __private_extern__ unsigned int mcache_cache_line_size(void);
@@ -352,30 +266,28 @@ __private_extern__ void *mcache_alloc(mcache_t *, int);
 __private_extern__ void mcache_free(mcache_t *, void *);
 __private_extern__ mcache_t *mcache_create_ext(const char *, size_t,
     mcache_allocfn_t, mcache_freefn_t, mcache_auditfn_t, mcache_logfn_t,
-    mcache_notifyfn_t, void *, u_int32_t, int);
+    mcache_notifyfn_t, void *__unsafe_indexable, u_int32_t, int);
 __private_extern__ void mcache_destroy(mcache_t *);
 __private_extern__ unsigned int mcache_alloc_ext(mcache_t *, mcache_obj_t **,
     unsigned int, int);
 __private_extern__ void mcache_free_ext(mcache_t *, mcache_obj_t *);
 __private_extern__ void mcache_reap(void);
-__private_extern__ boolean_t mcache_purge_cache(mcache_t *);
+__private_extern__ void mcache_reap_now(mcache_t *, boolean_t);
+__private_extern__ boolean_t mcache_purge_cache(mcache_t *, boolean_t);
 __private_extern__ void mcache_waiter_inc(mcache_t *);
 __private_extern__ void mcache_waiter_dec(mcache_t *);
 __private_extern__ boolean_t mcache_bkt_isempty(mcache_t *);
 
+struct timeval;
 __private_extern__ void mcache_buffer_log(mcache_audit_t *, void *, mcache_t *,
     struct timeval *);
 __private_extern__ void mcache_set_pattern(u_int64_t, void *, size_t);
 __private_extern__ void *mcache_verify_pattern(u_int64_t, void *, size_t);
-__private_extern__ void *mcache_verify_set_pattern(u_int64_t, u_int64_t,
-    void *, size_t);
 __private_extern__ void mcache_audit_free_verify(mcache_audit_t *,
     void *, size_t, size_t);
 __private_extern__ void mcache_audit_free_verify_set(mcache_audit_t *,
     void *, size_t, size_t);
-__private_extern__ char *mcache_dump_mca(mcache_audit_t *);
-__private_extern__ void mcache_audit_panic(mcache_audit_t *, void *, size_t,
-    int64_t, int64_t);
+__private_extern__ char *mcache_dump_mca(char buf[DUMP_MCA_BUF_SIZE], mcache_audit_t *);
 
 extern mcache_t *mcache_audit_cache;
 

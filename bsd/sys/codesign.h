@@ -2,7 +2,7 @@
  * Copyright (c) 2006 Apple Computer, Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
- * 
+ *
  * This file contains Original Code and/or Modifications of Original Code
  * as defined in and that are subject to the Apple Public Source License
  * Version 2.0 (the 'License'). You may not use this file except in
@@ -11,10 +11,10 @@
  * unlawful or unlicensed copies of an Apple operating system, or to
  * circumvent, violate, or enable the circumvention or violation of, any
  * terms of an Apple operating system software license agreement.
- * 
+ *
  * Please obtain a copy of the License at
  * http://www.opensource.apple.com/apsl/ and read it before using this file.
- * 
+ *
  * The Original Code and all software distributed under the License are
  * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
@@ -22,149 +22,49 @@
  * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
  * Please see the License for the specific language governing rights and
  * limitations under the License.
- * 
+ *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
 
 #ifndef _SYS_CODESIGN_H_
 #define _SYS_CODESIGN_H_
 
-/* code signing attributes of a process */
-#define	CS_VALID		0x0000001	/* dynamically valid */
-#define CS_ADHOC		0x0000002	/* ad hoc signed */
+#include <kern/cs_blobs.h>
 
-#define	CS_HARD			0x0000100	/* don't load invalid pages */
-#define	CS_KILL			0x0000200	/* kill process if it becomes invalid */
-#define CS_CHECK_EXPIRATION	0x0000400	/* force expiration checking */
-#define CS_RESTRICT		0x0000800	/* tell dyld to treat restricted */
-#define CS_ENFORCEMENT		0x0001000	/* require enforcement */
+/* MAC flags used by F_ADDFILESIGS_* */
+#define MAC_VNODE_CHECK_DYLD_SIM 0x1   /* tells the MAC framework that dyld-sim is being loaded */
 
-#define	CS_ALLOWED_MACHO	0x00ffffe
-
-#define CS_EXEC_SET_HARD	0x0100000	/* set CS_HARD on any exec'ed process */
-#define CS_EXEC_SET_KILL	0x0200000	/* set CS_KILL on any exec'ed process */
-#define CS_EXEC_SET_ENFORCEMENT	0x0400000	/* set CS_ENFORCEMENT on any exec'ed process */
-
-#define CS_KILLED		0x1000000	/* was killed by kernel for invalidity */
+#define CLEAR_LV_ENTITLEMENT "com.apple.private.security.clear-library-validation"
+#define OVERRIDE_PLUGIN_HOST_ENTITLEMENT "com.apple.private.security.override-plugin-host-detection"
 
 /* csops  operations */
-#define	CS_OPS_STATUS		0	/* return status */
-#define	CS_OPS_MARKINVALID	1	/* invalidate process */
-#define	CS_OPS_MARKHARD		2	/* set HARD flag */
-#define	CS_OPS_MARKKILL		3	/* set KILL flag (sticky) */
+#define CS_OPS_STATUS           0       /* return status */
+#define CS_OPS_MARKINVALID      1       /* invalidate process */
+#define CS_OPS_MARKHARD         2       /* set HARD flag */
+#define CS_OPS_MARKKILL         3       /* set KILL flag (sticky) */
 #ifdef KERNEL_PRIVATE
 /* CS_OPS_PIDPATH		4	*/
 #endif
-#define	CS_OPS_CDHASH		5	/* get code directory hash */
-#define CS_OPS_PIDOFFSET	6	/* get offset of active Mach-o slice */
-#define CS_OPS_ENTITLEMENTS_BLOB 7	/* get entitlements blob */
-#define CS_OPS_MARKRESTRICT	8	/* set RESTRICT flag (sticky) */
-#define CS_OPS_SET_STATUS	9	/* set codesign flags */
-#define CS_OPS_BLOB		10	/* get codesign blob */
-#define CS_OPS_IDENTITY		11	/* get codesign identity */
+#define CS_OPS_CDHASH           5       /* get code directory hash */
+#define CS_OPS_PIDOFFSET        6       /* get offset of active Mach-o slice */
+#define CS_OPS_ENTITLEMENTS_BLOB 7      /* get entitlements blob */
+#define CS_OPS_MARKRESTRICT     8       /* set RESTRICT flag (sticky) */
+#define CS_OPS_SET_STATUS       9       /* set codesign flags */
+#define CS_OPS_BLOB             10      /* get codesign blob */
+#define CS_OPS_IDENTITY         11      /* get codesign identity */
+#define CS_OPS_CLEARINSTALLER   12      /* clear INSTALLER flag */
+#define CS_OPS_CLEARPLATFORM 13 /* clear platform binary status (DEVELOPMENT-only) */
+#define CS_OPS_TEAMID       14  /* get team id */
+#define CS_OPS_CLEAR_LV     15  /* clear the library validation flag */
+#define CS_OPS_DER_ENTITLEMENTS_BLOB 16  /* get der entitlements blob */
+#define CS_OPS_VALIDATION_CATEGORY 17   /* get process validation category */
 
-/* SigPUP */
-#define CS_OPS_SIGPUP_INSTALL	20
-#define CS_OPS_SIGPUP_DROP	21
-#define CS_OPS_SIGPUP_VALIDATE	22
-
-struct sigpup_install_table {
-	uint64_t data;
-	uint64_t length;
-	uint64_t path;
-};
-
-
-/*
- * Magic numbers used by Code Signing
- */
-enum {
-	CSMAGIC_REQUIREMENT = 0xfade0c00,		/* single Requirement blob */
-	CSMAGIC_REQUIREMENTS = 0xfade0c01,		/* Requirements vector (internal requirements) */
-	CSMAGIC_CODEDIRECTORY = 0xfade0c02,		/* CodeDirectory blob */
-	CSMAGIC_EMBEDDED_SIGNATURE = 0xfade0cc0, /* embedded form of signature data */
-	CSMAGIC_EMBEDDED_SIGNATURE_OLD = 0xfade0b02,	/* XXX */
-	CSMAGIC_EMBEDDED_ENTITLEMENTS = 0xfade7171,	/* embedded entitlements */
-	CSMAGIC_DETACHED_SIGNATURE = 0xfade0cc1, /* multi-arch collection of embedded signatures */
-	CSMAGIC_BLOBWRAPPER = 0xfade0b01,	/* CMS Signature, among other things */
-	
-	CS_SUPPORTSSCATTER = 0x20100,
-
-	CSSLOT_CODEDIRECTORY = 0,				/* slot index for CodeDirectory */
-	CSSLOT_INFOSLOT = 1,
-	CSSLOT_REQUIREMENTS = 2,
-	CSSLOT_RESOURCEDIR = 3,
-	CSSLOT_APPLICATION = 4,
-	CSSLOT_ENTITLEMENTS = 5,
-
-	CSSLOT_SIGNATURESLOT = 0x10000,			/* CMS Signature */
-
-	CSTYPE_INDEX_REQUIREMENTS = 0x00000002,		/* compat with amfi */
-	CSTYPE_INDEX_ENTITLEMENTS = 0x00000005,		/* compat with amfi */
-
-	CS_HASHTYPE_SHA1 = 1
-};
-
-
-#define KERNEL_HAVE_CS_CODEDIRECTORY 1
-
-/*
- * C form of a CodeDirectory.
- */
-typedef struct __CodeDirectory {
-	uint32_t magic;					/* magic number (CSMAGIC_CODEDIRECTORY) */
-	uint32_t length;				/* total length of CodeDirectory blob */
-	uint32_t version;				/* compatibility version */
-	uint32_t flags;					/* setup and mode flags */
-	uint32_t hashOffset;			/* offset of hash slot element at index zero */
-	uint32_t identOffset;			/* offset of identifier string */
-	uint32_t nSpecialSlots;			/* number of special hash slots */
-	uint32_t nCodeSlots;			/* number of ordinary (code) hash slots */
-	uint32_t codeLimit;				/* limit to main image signature range */
-	uint8_t hashSize;				/* size of each hash in bytes */
-	uint8_t hashType;				/* type of hash (cdHashType* constants) */
-	uint8_t spare1;					/* unused (must be zero) */
-	uint8_t	pageSize;				/* log2(page size in bytes); 0 => infinite */
-	uint32_t spare2;				/* unused (must be zero) */
-	/* Version 0x20100 */
-	uint32_t scatterOffset;				/* offset of optional scatter vector */
-	/* followed by dynamic content as located by offset fields above */
-} CS_CodeDirectory;
-
-/*
- * Structure of an embedded-signature SuperBlob
- */
-
-typedef struct __BlobIndex {
-	uint32_t type;					/* type of entry */
-	uint32_t offset;				/* offset of entry */
-} CS_BlobIndex;
-
-typedef struct __SC_SuperBlob {
-	uint32_t magic;					/* magic number */
-	uint32_t length;				/* total length of SuperBlob */
-	uint32_t count;					/* number of index entries following */
-	CS_BlobIndex index[];			/* (count) entries */
-	/* followed by Blobs in no particular order as indicated by offsets in index */
-} CS_SuperBlob;
-
-typedef struct __SC_GenericBlob {
-	uint32_t magic;				/* magic number */
-	uint32_t length;			/* total length of blob */
-	char data[];
-} CS_GenericBlob;
-
-typedef struct __SC_Scatter {
-	uint32_t count;			// number of pages; zero for sentinel (only)
-	uint32_t base;			// first page number
-	uint64_t targetOffset;		// offset in target
-	uint64_t spare;			// reserved
-} SC_Scatter;
-
+#define CS_MAX_TEAMID_LEN       64
 
 #ifndef KERNEL
 
 #include <sys/types.h>
+#include <mach/message.h>
 
 __BEGIN_DECLS
 /* code sign operations */
@@ -174,40 +74,152 @@ __END_DECLS
 
 #else /* !KERNEL */
 
+#include <mach/machine.h>
+#include <mach/vm_types.h>
+
 #include <sys/cdefs.h>
+#include <sys/_types/_off_t.h>
 
 struct vnode;
-
-struct cscsr_functions  {
-	int		csr_version;
-#define CSCSR_VERSION 1
-	int		(*csr_validate_header)(const uint8_t *, size_t);
-	const void*	(*csr_find_file_codedirectory)(struct vnode *, const uint8_t *, size_t, size_t *);
-};
+struct cs_blob;
+struct fileglob;
 
 __BEGIN_DECLS
-int	cs_enforcement(struct proc *);
-int	cs_entitlements_blob_get(struct proc *, void **out_start, size_t *out_length);
-uint8_t * cs_get_cdhash(struct proc *);
-void	cs_register_cscsr(struct cscsr_functions *);
+int     cs_valid(struct proc *);
+int     cs_process_enforcement(struct proc *);
+int cs_process_global_enforcement(void);
+int cs_system_enforcement(void);
+int cs_vm_supports_4k_translations(void);
+int     cs_require_lv(struct proc *);
+int csproc_forced_lv(struct proc* p);
+int     cs_system_require_lv(void);
+uint32_t cs_entitlement_flags(struct proc *p);
+int     cs_entitlements_blob_get_vnode(struct vnode *, off_t, void **, size_t *);
+int     cs_entitlements_dictionary_copy_vnode(struct vnode *, off_t, void **);
+int     cs_entitlements_blob_get(struct proc *, void **, size_t *);
+#ifdef KERNEL_PRIVATE
+int     cs_entitlements_dictionary_copy(struct proc *, void **);
+#endif
+int     cs_restricted(struct proc *);
+uint8_t *__counted_by_or_null(CS_CDHASH_LEN) cs_get_cdhash(struct proc *);
+cs_launch_type_t launch_constraint_data_get_launch_type(launch_constraint_data_t lcd);
 
-__END_DECLS
+struct cs_blob * csproc_get_blob(struct proc *);
+struct cs_blob * csvnode_get_blob(struct vnode *, off_t);
+void             csvnode_print_debug(struct vnode *);
+
+off_t           csblob_get_base_offset(struct cs_blob *);
+vm_size_t       csblob_get_size(struct cs_blob *);
+vm_address_t    csblob_get_addr(struct cs_blob *);
+const char *    csblob_get_teamid(struct cs_blob *);
+const char *    csblob_get_identity(struct cs_blob *);
+const uint8_t * csblob_get_cdhash(struct cs_blob *);
+const CS_CodeDirectory* csblob_get_code_directory(struct cs_blob *csblob);
+int             csblob_get_platform_binary(struct cs_blob *);
+void            csblob_invalidate_flags(struct cs_blob *blob);
+void            csvnode_invalidate_flags(struct vnode * vp);
+unsigned int    csblob_get_flags(struct cs_blob *);
+uint8_t         csblob_get_hashtype(struct cs_blob const *);
+unsigned int    csblob_get_signer_type(struct cs_blob *);
+#if DEVELOPMENT || DEBUG
+void            csproc_clear_platform_binary(struct proc *);
+#endif
+
+#define XNU_CSBLOB_HAS_VALIDATION_CATEGORY 1
+int             csblob_set_validation_category(struct cs_blob *, unsigned int);
+unsigned int    csblob_get_validation_category(struct cs_blob *);
+
+#define XNU_CSBLOB_HAS_AUXILIARY_INFO 1
+int             csblob_set_auxiliary_info(struct cs_blob *, uint64_t);
+uint64_t        csblob_get_auxiliary_info(struct cs_blob *);
+
+#define XNU_CSBLOB_HAS_TRUST_LEVEL 1
+uint32_t        csblob_get_trust_level(struct cs_blob *);
+
+#include <uuid/uuid.h>
+#define XNU_SUPPORTS_PROVISIONING_PROFILE_UUID 1
+int csblob_register_profile_uuid(struct cs_blob *, const uuid_t, void*, vm_size_t);
+
+void csproc_disable_enforcement(struct proc* p);
+void csproc_mark_invalid_allowed(struct proc* p);
+int csproc_check_invalid_allowed(struct proc* p);
+int csproc_hardened_runtime(struct proc* p);
+
+int             csblob_get_entitlements(struct cs_blob *, void **, size_t *);
+int             csblob_get_der_entitlements(struct cs_blob *, const CS_GenericBlob **, size_t *);
+#define XNU_HAS_GET_DER_ENTITLEMENTS_UNSAFE 1
+const CS_GenericBlob* csblob_get_der_entitlements_unsafe(struct cs_blob *);
+
+const CS_GenericBlob *
+    csblob_find_blob(struct cs_blob *, uint32_t, uint32_t);
+const CS_GenericBlob *
+    csblob_find_blob_bytes(const uint8_t *, size_t, uint32_t, uint32_t);
+void *          csblob_entitlements_dictionary_copy(struct cs_blob *csblob);
+void            csblob_entitlements_dictionary_set(struct cs_blob *csblob, void * entitlements);
+
+// New APIs
+void            csblob_os_entitlements_set(struct cs_blob *csblob, void * entitlements);
+void *          csblob_os_entitlements_copy(struct cs_blob *csblob);
+void *          csblob_os_entitlements_get(struct cs_blob *csblob);
+void *          csblob_get_storage_addr(struct cs_blob *csblob);
+/*
+ * Mostly convenience functions below
+ */
+
+const   char * csproc_get_teamid(struct proc *);
+const   char * csproc_get_identity(struct proc *);
+const   char * csvnode_get_teamid(struct vnode *, off_t);
+int     csproc_get_platform_binary(struct proc *);
+int csproc_get_prod_signed(struct proc *);
+const   char * csfg_get_teamid(struct fileglob *);
+const   char * csfg_get_supplement_teamid(struct fileglob *);
+int     csfg_get_path(struct fileglob *, char *, int *);
+int     csfg_get_platform_binary(struct fileglob *);
+int     csfg_get_supplement_platform_binary(struct fileglob *);
+uint8_t * csfg_get_cdhash(struct fileglob *, uint64_t, size_t *);
+uint8_t * csfg_get_supplement_cdhash(struct fileglob *, uint64_t, size_t *);
+const uint8_t * csfg_get_supplement_linkage_cdhash(struct fileglob *, uint64_t, size_t *);
+int csfg_get_prod_signed(struct fileglob *);
+int csfg_get_supplement_prod_signed(struct fileglob *fg);
+unsigned int csfg_get_signer_type(struct fileglob *);
+unsigned int csfg_get_supplement_signer_type(struct fileglob *);
+unsigned int csfg_get_validation_category(struct fileglob *fg, uint64_t offset);
+unsigned int csfg_get_supplement_validation_category(struct fileglob *fg, uint64_t offset);
+const char *csfg_get_identity(struct fileglob *fg, off_t offset);
+unsigned int csproc_get_signer_type(struct proc *);
+
+uint8_t csfg_get_platform_identifier(struct fileglob *, off_t);
+uint8_t csvnode_get_platform_identifier(struct vnode *, off_t);
+uint8_t csproc_get_platform_identifier(struct proc *);
+
+struct cs_blob* csfg_get_csblob(struct fileglob*, uint64_t);
+struct cs_blob* csfg_get_supplement_csblob(struct fileglob*, uint64_t);
+
+extern int cs_debug;
+extern int cs_debug_fail_on_unsigned_code;
+extern unsigned int cs_debug_unsigned_exec_failures;
+extern unsigned int cs_debug_unsigned_mmap_failures;
+
+int cs_blob_create_validated(vm_address_t* addr, vm_size_t size,
+    struct cs_blob ** ret_blob, CS_CodeDirectory const **ret_cd);
+
+void cs_blob_free(struct cs_blob *blob);
 
 #ifdef XNU_KERNEL_PRIVATE
 
-void	cs_init(void);
-int	cs_allow_invalid(struct proc *);
-int	cs_invalid_page(addr64_t);
-int	sigpup_install(user_addr_t);
-int	sigpup_drop(void);
+int     cs_allow_invalid(struct proc *);
+int     cs_invalid_page(addr64_t vaddr, boolean_t *cs_killed);
+void    cs_process_invalidated(struct proc *);
+int     csproc_get_platform_path(struct proc *);
+int     csproc_get_validation_category(struct proc *, unsigned int *);
 
-extern int cs_debug;
-extern int cs_validation;
 #if !SECURE_KERNEL
 extern int cs_enforcement_panic;
 #endif
 
 #endif /* XNU_KERNEL_PRIVATE */
+
+__END_DECLS
 
 #endif /* KERNEL */
 

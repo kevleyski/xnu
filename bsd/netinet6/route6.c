@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2000-2013 Apple Inc. All rights reserved.
+ * Copyright (c) 2000-2020 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -77,25 +77,26 @@ int
 route6_input(struct mbuf **mp, int *offp, int proto)
 {
 #pragma unused(proto)
-	struct ip6_hdr *ip6;
-	struct mbuf *m = *mp;
-	struct ip6_rthdr *rh;
-	int off = *offp, rhlen;
+	struct ip6_hdr *ip6 = NULL;
+	mbuf_ref_t m = *mp;
+	struct ip6_rthdr *__single rh = NULL;
+	int off = *offp, rhlen = 0;
 #ifdef notyet
-	struct ip6aux *ip6a;
+	struct ip6aux *__single ip6a = NULL;
 
 	ip6a = ip6_findaux(m);
 	if (ip6a) {
 		/* XXX reject home-address option before rthdr */
 		if (ip6a->ip6a_flags & IP6A_SWAP) {
 			ip6stat.ip6s_badoptions++;
+			*mp = NULL;
 			m_freem(m);
 			return IPPROTO_DONE;
 		}
 	}
+	ip6a = NULL;
 #endif /* notyet */
 
-#ifndef PULLDOWN_TEST
 	IP6_EXTHDR_CHECK(m, off, sizeof(*rh), return IPPROTO_DONE);
 
 	/* Expect 32-bit aligned data pointer on strict-align platforms */
@@ -103,31 +104,21 @@ route6_input(struct mbuf **mp, int *offp, int proto)
 
 	ip6 = mtod(m, struct ip6_hdr *);
 	rh = (struct ip6_rthdr *)((caddr_t)ip6 + off);
-#else
-	/* Expect 32-bit aligned data pointer on strict-align platforms */
-	MBUF_STRICT_DATA_ALIGNMENT_CHECK_32(m);
-
-	ip6 = mtod(m, struct ip6_hdr *);
-	IP6_EXTHDR_GET(rh, struct ip6_rthdr *, m, off, sizeof(*rh));
-	if (rh == NULL) {
-		ip6stat.ip6s_tooshort++;
-		return (IPPROTO_DONE);
-	}
-#endif
 
 	switch (rh->ip6r_type) {
 	default:
 		/* unknown routing type */
 		if (rh->ip6r_segleft == 0) {
 			rhlen = (rh->ip6r_len + 1) << 3;
-			break;	/* Final dst. Just ignore the header. */
+			break;  /* Final dst. Just ignore the header. */
 		}
 		ip6stat.ip6s_badoptions++;
 		icmp6_error(m, ICMP6_PARAM_PROB, ICMP6_PARAMPROB_HEADER,
-		    (caddr_t)&rh->ip6r_type - (caddr_t)ip6);
-		return (IPPROTO_DONE);
+		    (int)((caddr_t)&rh->ip6r_type - (caddr_t)ip6));
+		return IPPROTO_DONE;
 	}
 
+	*mp = m;
 	*offp += rhlen;
-	return (rh->ip6r_nxt);
+	return rh->ip6r_nxt;
 }

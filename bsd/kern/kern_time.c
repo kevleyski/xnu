@@ -2,7 +2,7 @@
  * Copyright (c) 2000-2008 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
- * 
+ *
  * This file contains Original Code and/or Modifications of Original Code
  * as defined in and that are subject to the Apple Public Source License
  * Version 2.0 (the 'License'). You may not use this file except in
@@ -11,10 +11,10 @@
  * unlawful or unlicensed copies of an Apple operating system, or to
  * circumvent, violate, or enable the circumvention or violation of, any
  * terms of an Apple operating system software license agreement.
- * 
+ *
  * Please obtain a copy of the License at
  * http://www.opensource.apple.com/apsl/ and read it before using this file.
- * 
+ *
  * The Original Code and all software distributed under the License are
  * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
@@ -22,7 +22,7 @@
  * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
  * Please see the License for the specific language governing rights and
  * limitations under the License.
- * 
+ *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
 /* Copyright (c) 1995 NeXT Computer, Inc. All Rights Reserved */
@@ -88,21 +88,22 @@
 #if CONFIG_MACF
 #include <security/mac_framework.h>
 #endif
+#include <IOKit/IOBSD.h>
+#include <sys/time.h>
+#include <kern/remote_time.h>
 
-#define HZ	100	/* XXX */
+#define HZ      100     /* XXX */
 
 /* simple lock used to access timezone, tz structure */
-lck_spin_t * tz_slock;
-lck_grp_t * tz_slock_grp;
-lck_attr_t * tz_slock_attr;
-lck_grp_attr_t	*tz_slock_grp_attr;
+static LCK_GRP_DECLARE(tz_slock_grp, "tzlock");
+static LCK_SPIN_DECLARE(tz_slock, &tz_slock_grp);
 
-static void		setthetime(
-					struct timeval	*tv);
+static void             setthetime(
+	struct timeval  *tv);
 
-void time_zone_slock_init(void);
+static boolean_t timeval_fixusec(struct timeval *t1);
 
-/* 
+/*
  * Time of day and interval timer support.
  *
  * These routines provide the kernel entry points to get and set
@@ -114,31 +115,51 @@ void time_zone_slock_init(void);
 /* ARGSUSED */
 int
 gettimeofday(
-__unused	struct proc	*p,
-			struct gettimeofday_args *uap, 
-			int32_t *retval)
+	struct proc     *p,
+	struct gettimeofday_args *uap,
+	__unused int32_t *retval)
 {
 	int error = 0;
 	struct timezone ltz; /* local copy */
+	clock_sec_t secs;
+	clock_usec_t usecs;
+	uint64_t mach_time;
+
+	if (uap->tp || uap->mach_absolute_time) {
+		clock_gettimeofday_and_absolute_time(&secs, &usecs, &mach_time);
+	}
 
 	if (uap->tp) {
-		clock_sec_t		secs;
-		clock_usec_t	usecs;
-
-		clock_gettimeofday(&secs, &usecs);
-		retval[0] = secs;
-		retval[1] = usecs;
+		/* Casting secs through a uint32_t to match arm64 commpage */
+		if (IS_64BIT_PROCESS(p)) {
+			struct user64_timeval user_atv = {};
+			user_atv.tv_sec = (uint32_t)secs;
+			user_atv.tv_usec = usecs;
+			error = copyout(&user_atv, uap->tp, sizeof(user_atv));
+		} else {
+			struct user32_timeval user_atv = {};
+			user_atv.tv_sec = (uint32_t)secs;
+			user_atv.tv_usec = usecs;
+			error = copyout(&user_atv, uap->tp, sizeof(user_atv));
+		}
+		if (error) {
+			return error;
+		}
 	}
-	
+
 	if (uap->tzp) {
-		lck_spin_lock(tz_slock);
+		lck_spin_lock(&tz_slock);
 		ltz = tz;
-		lck_spin_unlock(tz_slock);
+		lck_spin_unlock(&tz_slock);
 
-		error = copyout((caddr_t)&ltz, CAST_USER_ADDR_T(uap->tzp), sizeof (tz));
+		error = copyout((caddr_t)&ltz, CAST_USER_ADDR_T(uap->tzp), sizeof(tz));
 	}
 
-	return (error);
+	if (error == 0 && uap->mach_absolute_time) {
+		error = copyout(&mach_time, uap->mach_absolute_time, sizeof(mach_time));
+	}
+
+	return error;
 }
 
 /*
@@ -154,19 +175,27 @@ settimeofday(__unused struct proc *p, struct settimeofday_args  *uap, __unused i
 
 	bzero(&atv, sizeof(atv));
 
+	/* Check that this task is entitled to set the time or it is root */
+	if (!IOCurrentTaskHasEntitlement(SETTIME_ENTITLEMENT)) {
 #if CONFIG_MACF
-	error = mac_system_check_settime(kauth_cred_get());
-	if (error)
-		return (error);
+		error = mac_system_check_settime(kauth_cred_get());
+		if (error) {
+			return error;
+		}
 #endif
-	if ((error = suser(kauth_cred_get(), &p->p_acflag)))
-		return (error);
+#if defined(XNU_TARGET_OS_OSX)
+		if ((error = suser(kauth_cred_get(), &p->p_acflag))) {
+			return error;
+		}
+#endif
+	}
+
 	/* Verify all parameters before changing time */
 	if (uap->tv) {
 		if (IS_64BIT_PROCESS(p)) {
 			struct user64_timeval user_atv;
 			error = copyin(uap->tv, &user_atv, sizeof(user_atv));
-			atv.tv_sec = user_atv.tv_sec;
+			atv.tv_sec = (__darwin_time_t)user_atv.tv_sec;
 			atv.tv_usec = user_atv.tv_usec;
 		} else {
 			struct user32_timeval user_atv;
@@ -174,83 +203,36 @@ settimeofday(__unused struct proc *p, struct settimeofday_args  *uap, __unused i
 			atv.tv_sec = user_atv.tv_sec;
 			atv.tv_usec = user_atv.tv_usec;
 		}
-		if (error)
-			return (error);
+		if (error) {
+			return error;
+		}
 	}
-	if (uap->tzp && (error = copyin(uap->tzp, (caddr_t)&atz, sizeof(atz))))
-		return (error);
+	if (uap->tzp && (error = copyin(uap->tzp, (caddr_t)&atz, sizeof(atz)))) {
+		return error;
+	}
 	if (uap->tv) {
-		timevalfix(&atv);
-		if (atv.tv_sec < 0 || (atv.tv_sec == 0 && atv.tv_usec < 0))
-			return (EPERM);
+		/* only positive values of sec/usec are accepted */
+		if (atv.tv_sec < 0 || atv.tv_usec < 0) {
+			return EPERM;
+		}
+		if (!timeval_fixusec(&atv)) {
+			return EPERM;
+		}
 		setthetime(&atv);
 	}
 	if (uap->tzp) {
-		lck_spin_lock(tz_slock);
+		lck_spin_lock(&tz_slock);
 		tz = atz;
-		lck_spin_unlock(tz_slock);
+		lck_spin_unlock(&tz_slock);
 	}
-	return (0);
+	return 0;
 }
 
 static void
 setthetime(
-	struct timeval	*tv)
+	struct timeval  *tv)
 {
 	clock_set_calendar_microtime(tv->tv_sec, tv->tv_usec);
-}
-
-/*
- * XXX Y2038 bug because of clock_adjtime() first argument
- */
-/* ARGSUSED */
-int
-adjtime(struct proc *p, struct adjtime_args *uap, __unused int32_t *retval)
-{
-	struct timeval atv;
-	int error;
-
-#if CONFIG_MACF
-	error = mac_system_check_settime(kauth_cred_get());
-	if (error)
-		return (error);
-#endif
-	if ((error = priv_check_cred(kauth_cred_get(), PRIV_ADJTIME, 0)))
-		return (error);
-	if (IS_64BIT_PROCESS(p)) {
-		struct user64_timeval user_atv;
-		error = copyin(uap->delta, &user_atv, sizeof(user_atv));
-		atv.tv_sec = user_atv.tv_sec;
-		atv.tv_usec = user_atv.tv_usec;
-	} else {
-		struct user32_timeval user_atv;
-		error = copyin(uap->delta, &user_atv, sizeof(user_atv));
-		atv.tv_sec = user_atv.tv_sec;
-		atv.tv_usec = user_atv.tv_usec;
-	}
-	if (error)
-		return (error);
-		
-	/*
-	 * Compute the total correction and the rate at which to apply it.
-	 */
-	clock_adjtime(&atv.tv_sec, &atv.tv_usec);
-
-	if (uap->olddelta) {
-		if (IS_64BIT_PROCESS(p)) {
-			struct user64_timeval user_atv;
-			user_atv.tv_sec = atv.tv_sec;
-			user_atv.tv_usec = atv.tv_usec;
-			error = copyout(&user_atv, uap->olddelta, sizeof(user_atv));
-		} else {
-			struct user32_timeval user_atv;
-			user_atv.tv_sec = atv.tv_sec;
-			user_atv.tv_usec = atv.tv_usec;
-			error = copyout(&user_atv, uap->olddelta, sizeof(user_atv));
-		}
-	}
-
-	return (0);
 }
 
 /*
@@ -259,9 +241,9 @@ adjtime(struct proc *p, struct adjtime_args *uap, __unused int32_t *retval)
  */
 void
 inittodr(
-	__unused time_t	base)
+	__unused time_t base)
 {
-	struct timeval	tv;
+	struct timeval  tv;
 
 	/*
 	 * Assertion:
@@ -274,8 +256,8 @@ inittodr(
 	microtime(&tv);
 
 	if (tv.tv_sec < 0 || tv.tv_usec < 0) {
-		printf ("WARNING: preposterous time in Real Time Clock");
-		tv.tv_sec = 0;		/* the UNIX epoch */
+		printf("WARNING: preposterous time in Real Time Clock");
+		tv.tv_sec = 0;          /* the UNIX epoch */
 		tv.tv_usec = 0;
 		setthetime(&tv);
 		printf(" -- CHECK AND RESET THE DATE!\n");
@@ -285,11 +267,23 @@ inittodr(
 time_t
 boottime_sec(void)
 {
-	clock_sec_t		secs;
-	clock_nsec_t	nanosecs;
+	clock_sec_t             secs;
+	clock_nsec_t    nanosecs;
 
 	clock_get_boottime_nanotime(&secs, &nanosecs);
-	return (secs);
+	return secs;
+}
+
+void
+boottime_timeval(struct timeval *tv)
+{
+	clock_sec_t             secs;
+	clock_usec_t    microsecs;
+
+	clock_get_boottime_microtime(&secs, &microsecs);
+
+	tv->tv_sec = secs;
+	tv->tv_usec = microsecs;
 }
 
 /*
@@ -320,14 +314,14 @@ getitimer(struct proc *p, struct getitimer_args *uap, __unused int32_t *retval)
 {
 	struct itimerval aitv;
 
-	if (uap->which > ITIMER_PROF)
-		return(EINVAL);
+	if (uap->which > ITIMER_PROF) {
+		return EINVAL;
+	}
 
 	bzero(&aitv, sizeof(aitv));
 
 	proc_spinlock(p);
 	switch (uap->which) {
-
 	case ITIMER_REAL:
 		/*
 		 * If time for real time timer has passed return 0,
@@ -336,18 +330,18 @@ getitimer(struct proc *p, struct getitimer_args *uap, __unused int32_t *retval)
 		 */
 		aitv = p->p_realtimer;
 		if (timerisset(&p->p_rtime)) {
-			struct timeval		now;
+			struct timeval          now;
 
 			microuptime(&now);
-			if (timercmp(&p->p_rtime, &now, <))
+			if (timercmp(&p->p_rtime, &now, <)) {
 				timerclear(&aitv.it_value);
-			else {
+			} else {
 				aitv.it_value = p->p_rtime;
 				timevalsub(&aitv.it_value, &now);
 			}
-		}
-		else
+		} else {
 			timerclear(&aitv.it_value);
+		}
 		break;
 
 	case ITIMER_VIRTUAL:
@@ -363,18 +357,20 @@ getitimer(struct proc *p, struct getitimer_args *uap, __unused int32_t *retval)
 
 	if (IS_64BIT_PROCESS(p)) {
 		struct user64_itimerval user_itv;
+		bzero(&user_itv, sizeof(user_itv));
 		user_itv.it_interval.tv_sec = aitv.it_interval.tv_sec;
 		user_itv.it_interval.tv_usec = aitv.it_interval.tv_usec;
 		user_itv.it_value.tv_sec = aitv.it_value.tv_sec;
 		user_itv.it_value.tv_usec = aitv.it_value.tv_usec;
-		return (copyout((caddr_t)&user_itv, uap->itv, sizeof (user_itv)));
+		return copyout((caddr_t)&user_itv, uap->itv, sizeof(user_itv));
 	} else {
 		struct user32_itimerval user_itv;
-		user_itv.it_interval.tv_sec = aitv.it_interval.tv_sec;
+		bzero(&user_itv, sizeof(user_itv));
+		user_itv.it_interval.tv_sec = (user32_time_t)aitv.it_interval.tv_sec;
 		user_itv.it_interval.tv_usec = aitv.it_interval.tv_usec;
-		user_itv.it_value.tv_sec = aitv.it_value.tv_sec;
+		user_itv.it_value.tv_sec = (user32_time_t)aitv.it_value.tv_sec;
 		user_itv.it_value.tv_usec = aitv.it_value.tv_usec;
-		return (copyout((caddr_t)&user_itv, uap->itv, sizeof (user_itv)));
+		return copyout((caddr_t)&user_itv, uap->itv, sizeof(user_itv));
 	}
 }
 
@@ -395,36 +391,41 @@ setitimer(struct proc *p, struct setitimer_args *uap, int32_t *retval)
 
 	bzero(&aitv, sizeof(aitv));
 
-	if (uap->which > ITIMER_PROF)
-		return (EINVAL);
+	if (uap->which > ITIMER_PROF) {
+		return EINVAL;
+	}
 	if ((itvp = uap->itv)) {
 		if (IS_64BIT_PROCESS(p)) {
 			struct user64_itimerval user_itv;
-			if ((error = copyin(itvp, (caddr_t)&user_itv, sizeof (user_itv))))
-				return (error);
-			aitv.it_interval.tv_sec = user_itv.it_interval.tv_sec;
+			if ((error = copyin(itvp, (caddr_t)&user_itv, sizeof(user_itv)))) {
+				return error;
+			}
+			aitv.it_interval.tv_sec = (__darwin_time_t)user_itv.it_interval.tv_sec;
 			aitv.it_interval.tv_usec = user_itv.it_interval.tv_usec;
-			aitv.it_value.tv_sec = user_itv.it_value.tv_sec;
+			aitv.it_value.tv_sec = (__darwin_time_t)user_itv.it_value.tv_sec;
 			aitv.it_value.tv_usec = user_itv.it_value.tv_usec;
-		} else { 
+		} else {
 			struct user32_itimerval user_itv;
-			if ((error = copyin(itvp, (caddr_t)&user_itv, sizeof (user_itv))))
-				return (error);
+			if ((error = copyin(itvp, (caddr_t)&user_itv, sizeof(user_itv)))) {
+				return error;
+			}
 			aitv.it_interval.tv_sec = user_itv.it_interval.tv_sec;
 			aitv.it_interval.tv_usec = user_itv.it_interval.tv_usec;
 			aitv.it_value.tv_sec = user_itv.it_value.tv_sec;
 			aitv.it_value.tv_usec = user_itv.it_value.tv_usec;
 		}
 	}
-	if ((uap->itv = uap->oitv) && (error = getitimer(p, (struct getitimer_args *)uap, retval)))
-		return (error);
-	if (itvp == 0)
-		return (0);
-	if (itimerfix(&aitv.it_value) || itimerfix(&aitv.it_interval))
-		return (EINVAL);
+	if ((uap->itv = uap->oitv) && (error = getitimer(p, (struct getitimer_args *)uap, retval))) {
+		return error;
+	}
+	if (itvp == 0) {
+		return 0;
+	}
+	if (itimerfix(&aitv.it_value) || itimerfix(&aitv.it_interval)) {
+		return EINVAL;
+	}
 
 	switch (uap->which) {
-
 	case ITIMER_REAL:
 		proc_spinlock(p);
 		if (timerisset(&aitv.it_value)) {
@@ -432,13 +433,15 @@ setitimer(struct proc *p, struct setitimer_args *uap, int32_t *retval)
 			timevaladd(&p->p_rtime, &aitv.it_value);
 			p->p_realtimer = aitv;
 			if (!thread_call_enter_delayed_with_leeway(p->p_rcall, NULL,
-					         tvtoabstime(&p->p_rtime), 0, THREAD_CALL_DELAY_USER_NORMAL))
+			    tvtoabstime(&p->p_rtime), 0, THREAD_CALL_DELAY_USER_NORMAL)) {
 				p->p_ractive++;
-		} else  {
+			}
+		} else {
 			timerclear(&p->p_rtime);
 			p->p_realtimer = aitv;
-			if (thread_call_cancel(p->p_rcall))
+			if (thread_call_cancel(p->p_rcall)) {
 				p->p_ractive--;
+			}
 		}
 		proc_spinunlock(p);
 
@@ -446,10 +449,11 @@ setitimer(struct proc *p, struct setitimer_args *uap, int32_t *retval)
 
 
 	case ITIMER_VIRTUAL:
-		if (timerisset(&aitv.it_value))
-			task_vtimer_set(p->task, TASK_VTIMER_USER);
-	else
-			task_vtimer_clear(p->task, TASK_VTIMER_USER);
+		if (timerisset(&aitv.it_value)) {
+			task_vtimer_set(proc_task(p), TASK_VTIMER_USER);
+		} else {
+			task_vtimer_clear(proc_task(p), TASK_VTIMER_USER);
+		}
 
 		proc_spinlock(p);
 		p->p_vtimer_user = aitv;
@@ -457,10 +461,11 @@ setitimer(struct proc *p, struct setitimer_args *uap, int32_t *retval)
 		break;
 
 	case ITIMER_PROF:
-		if (timerisset(&aitv.it_value))
-			task_vtimer_set(p->task, TASK_VTIMER_PROF);
-		else
-			task_vtimer_clear(p->task, TASK_VTIMER_PROF);
+		if (timerisset(&aitv.it_value)) {
+			task_vtimer_set(proc_task(p), TASK_VTIMER_PROF);
+		} else {
+			task_vtimer_clear(proc_task(p), TASK_VTIMER_PROF);
+		}
 
 		proc_spinlock(p);
 		p->p_vtimer_prof = aitv;
@@ -468,7 +473,53 @@ setitimer(struct proc *p, struct setitimer_args *uap, int32_t *retval)
 		break;
 	}
 
-	return (0);
+	return 0;
+}
+
+void
+proc_inherit_itimers(struct proc *old_proc, struct proc *new_proc)
+{
+	struct itimerval real_itv, vuser_itv, vprof_itv;
+
+	/* Snapshot the old timer values */
+	proc_spinlock(old_proc);
+	real_itv = old_proc->p_realtimer;
+	vuser_itv = old_proc->p_vtimer_user;
+	vprof_itv = old_proc->p_vtimer_prof;
+	proc_spinunlock(old_proc);
+
+	if (timerisset(&vuser_itv.it_value)) {
+		task_vtimer_set(proc_task(new_proc), TASK_VTIMER_USER);
+	} else {
+		task_vtimer_clear(proc_task(new_proc), TASK_VTIMER_USER);
+	}
+
+	if (timerisset(&vprof_itv.it_value)) {
+		task_vtimer_set(proc_task(new_proc), TASK_VTIMER_PROF);
+	} else {
+		task_vtimer_clear(proc_task(new_proc), TASK_VTIMER_PROF);
+	}
+
+	/* Update the timer values on new proc */
+	proc_spinlock(new_proc);
+
+	if (timerisset(&real_itv.it_value)) {
+		microuptime(&new_proc->p_rtime);
+		timevaladd(&new_proc->p_rtime, &real_itv.it_value);
+		new_proc->p_realtimer = real_itv;
+		if (!thread_call_enter_delayed_with_leeway(new_proc->p_rcall, NULL,
+		    tvtoabstime(&new_proc->p_rtime), 0, THREAD_CALL_DELAY_USER_NORMAL)) {
+			new_proc->p_ractive++;
+		}
+	} else {
+		timerclear(&new_proc->p_rtime);
+		new_proc->p_realtimer = real_itv;
+	}
+
+	new_proc->p_vtimer_user = vuser_itv;
+	new_proc->p_vtimer_prof = vprof_itv;
+
+	proc_spinunlock(new_proc);
 }
 
 /*
@@ -481,24 +532,36 @@ setitimer(struct proc *p, struct setitimer_args *uap, int32_t *retval)
  */
 void
 realitexpire(
-	struct proc	*p)
+	struct proc *p,
+	__unused void *p2)
 {
 	struct proc *r;
-	struct timeval	t;
+	struct timeval t;
 
-	r = proc_find(p->p_pid);
+	r = proc_find(proc_getpid(p));
 
 	proc_spinlock(p);
 
+	assert(p->p_ractive > 0);
+
 	if (--p->p_ractive > 0 || r != p) {
+		/*
+		 * bail, because either proc is exiting
+		 * or there's another active thread call
+		 */
 		proc_spinunlock(p);
 
-		if (r != NULL)
+		if (r != NULL) {
 			proc_rele(r);
+		}
 		return;
 	}
-	
+
 	if (!timerisset(&p->p_realtimer.it_interval)) {
+		/*
+		 * p_realtimer was cleared while this call was pending,
+		 * send one last SIGALRM, but don't re-arm
+		 */
 		timerclear(&p->p_rtime);
 		proc_spinunlock(p);
 
@@ -507,28 +570,91 @@ realitexpire(
 		return;
 	}
 
+	proc_spinunlock(p);
+
+	/*
+	 * Send the signal before re-arming the next thread call,
+	 * so in case psignal blocks, we won't create yet another thread call.
+	 */
+
+	psignal(p, SIGALRM);
+
+	proc_spinlock(p);
+
+	/* Should we still re-arm the next thread call? */
+	if (!timerisset(&p->p_realtimer.it_interval)) {
+		timerclear(&p->p_rtime);
+		proc_spinunlock(p);
+
+		proc_rele(p);
+		return;
+	}
+
 	microuptime(&t);
 	timevaladd(&p->p_rtime, &p->p_realtimer.it_interval);
+
 	if (timercmp(&p->p_rtime, &t, <=)) {
 		if ((p->p_rtime.tv_sec + 2) >= t.tv_sec) {
 			for (;;) {
 				timevaladd(&p->p_rtime, &p->p_realtimer.it_interval);
-				if (timercmp(&p->p_rtime, &t, >))
+				if (timercmp(&p->p_rtime, &t, >)) {
 					break;
+				}
 			}
-		}
-		else {
+		} else {
 			p->p_rtime = p->p_realtimer.it_interval;
 			timevaladd(&p->p_rtime, &t);
 		}
 	}
 
-	if (!thread_call_enter_delayed(p->p_rcall, tvtoabstime(&p->p_rtime)))
+	assert(p->p_rcall != NULL);
+
+	if (!thread_call_enter_delayed_with_leeway(p->p_rcall, NULL, tvtoabstime(&p->p_rtime), 0,
+	    THREAD_CALL_DELAY_USER_NORMAL)) {
 		p->p_ractive++;
+	}
+
 	proc_spinunlock(p);
 
-	psignal(p, SIGALRM);
 	proc_rele(p);
+}
+
+/*
+ * Called once in proc_exit to clean up after an armed or pending realitexpire
+ *
+ * This will only be called after the proc refcount is drained,
+ * so realitexpire cannot be currently holding a proc ref.
+ * i.e. it will/has gotten PROC_NULL from proc_find.
+ */
+void
+proc_free_realitimer(proc_t p)
+{
+	proc_spinlock(p);
+
+	assert(p->p_rcall != NULL);
+	assert(proc_list_exited(p));
+
+	timerclear(&p->p_realtimer.it_interval);
+
+	if (thread_call_cancel(p->p_rcall)) {
+		assert(p->p_ractive > 0);
+		p->p_ractive--;
+	}
+
+	while (p->p_ractive > 0) {
+		proc_spinunlock(p);
+
+		delay(1);
+
+		proc_spinlock(p);
+	}
+
+	thread_call_t call = p->p_rcall;
+	p->p_rcall = NULL;
+
+	proc_spinunlock(p);
+
+	thread_call_free(call);
 }
 
 /*
@@ -539,11 +665,23 @@ int
 itimerfix(
 	struct timeval *tv)
 {
-
 	if (tv->tv_sec < 0 || tv->tv_sec > 100000000 ||
-	    tv->tv_usec < 0 || tv->tv_usec >= 1000000)
-		return (EINVAL);
-	return (0);
+	    tv->tv_usec < 0 || tv->tv_usec >= 1000000) {
+		return EINVAL;
+	}
+	return 0;
+}
+
+int
+timespec_is_valid(const struct timespec *ts)
+{
+	/* The INT32_MAX limit ensures the timespec is safe for clock_*() functions
+	 * which accept 32-bit ints. */
+	if (ts->tv_sec < 0 || ts->tv_sec > INT32_MAX ||
+	    ts->tv_nsec < 0 || (unsigned long long)ts->tv_nsec > NSEC_PER_SEC) {
+		return 0;
+	}
+	return 1;
 }
 
 /*
@@ -558,11 +696,10 @@ itimerfix(
  */
 int
 itimerdecr(proc_t p,
-	struct itimerval *itp, int usec)
+    struct itimerval *itp, int usec)
 {
-
 	proc_spinlock(p);
-	
+
 	if (itp->it_value.tv_usec < usec) {
 		if (itp->it_value.tv_sec == 0) {
 			/* expired, and already in next interval */
@@ -576,23 +713,24 @@ itimerdecr(proc_t p,
 	usec = 0;
 	if (timerisset(&itp->it_value)) {
 		proc_spinunlock(p);
-		return (1);
+		return 1;
 	}
 	/* expired, exactly at end of interval */
 expire:
 	if (timerisset(&itp->it_interval)) {
 		itp->it_value = itp->it_interval;
 		if (itp->it_value.tv_sec > 0) {
-		itp->it_value.tv_usec -= usec;
-		if (itp->it_value.tv_usec < 0) {
-			itp->it_value.tv_usec += 1000000;
-			itp->it_value.tv_sec--;
+			itp->it_value.tv_usec -= usec;
+			if (itp->it_value.tv_usec < 0) {
+				itp->it_value.tv_usec += 1000000;
+				itp->it_value.tv_sec--;
 			}
 		}
-	} else
-		itp->it_value.tv_usec = 0;		/* sec is already 0 */
+	} else {
+		itp->it_value.tv_usec = 0;              /* sec is already 0 */
+	}
 	proc_spinunlock(p);
-	return (0);
+	return 0;
 }
 
 /*
@@ -607,7 +745,6 @@ timevaladd(
 	struct timeval *t1,
 	struct timeval *t2)
 {
-
 	t1->tv_sec += t2->tv_sec;
 	t1->tv_usec += t2->tv_usec;
 	timevalfix(t1);
@@ -617,7 +754,6 @@ timevalsub(
 	struct timeval *t1,
 	struct timeval *t2)
 {
-
 	t1->tv_sec -= t2->tv_sec;
 	t1->tv_usec -= t2->tv_usec;
 	timevalfix(t1);
@@ -626,7 +762,6 @@ void
 timevalfix(
 	struct timeval *t1)
 {
-
 	if (t1->tv_usec < 0) {
 		t1->tv_sec--;
 		t1->tv_usec += 1000000;
@@ -637,16 +772,33 @@ timevalfix(
 	}
 }
 
+static boolean_t
+timeval_fixusec(
+	struct timeval *t1)
+{
+	assert(t1->tv_usec >= 0);
+	assert(t1->tv_sec >= 0);
+
+	if (t1->tv_usec >= 1000000) {
+		if (os_add_overflow(t1->tv_sec, t1->tv_usec / 1000000, &t1->tv_sec)) {
+			return FALSE;
+		}
+		t1->tv_usec = t1->tv_usec % 1000000;
+	}
+
+	return TRUE;
+}
+
 /*
  * Return the best possible estimate of the time in the timeval
  * to which tvp points.
  */
 void
 microtime(
-	struct timeval	*tvp)
+	struct timeval  *tvp)
 {
-	clock_sec_t		tv_sec;
-	clock_usec_t	tv_usec;
+	clock_sec_t             tv_sec;
+	clock_usec_t    tv_usec;
 
 	clock_get_calendar_microtime(&tv_sec, &tv_usec);
 
@@ -656,10 +808,10 @@ microtime(
 
 void
 microtime_with_abstime(
-	struct timeval	*tvp, uint64_t *abstime)
+	struct timeval  *tvp, uint64_t *abstime)
 {
-	clock_sec_t		tv_sec;
-	clock_usec_t	tv_usec;
+	clock_sec_t             tv_sec;
+	clock_usec_t    tv_usec;
 
 	clock_get_calendar_absolute_and_microtime(&tv_sec, &tv_usec, abstime);
 
@@ -669,10 +821,10 @@ microtime_with_abstime(
 
 void
 microuptime(
-	struct timeval	*tvp)
+	struct timeval  *tvp)
 {
-	clock_sec_t		tv_sec;
-	clock_usec_t	tv_usec;
+	clock_sec_t             tv_sec;
+	clock_usec_t    tv_usec;
 
 	clock_get_system_microtime(&tv_sec, &tv_usec);
 
@@ -687,8 +839,8 @@ void
 nanotime(
 	struct timespec *tsp)
 {
-	clock_sec_t		tv_sec;
-	clock_nsec_t	tv_nsec;
+	clock_sec_t             tv_sec;
+	clock_nsec_t    tv_nsec;
 
 	clock_get_calendar_nanotime(&tv_sec, &tv_nsec);
 
@@ -700,8 +852,8 @@ void
 nanouptime(
 	struct timespec *tsp)
 {
-	clock_sec_t		tv_sec;
-	clock_nsec_t	tv_nsec;
+	clock_sec_t             tv_sec;
+	clock_nsec_t    tv_nsec;
 
 	clock_get_system_nanotime(&tv_sec, &tv_nsec);
 
@@ -711,16 +863,25 @@ nanouptime(
 
 uint64_t
 tvtoabstime(
-	struct timeval	*tvp)
+	struct timeval  *tvp)
 {
-	uint64_t	result, usresult;
+	uint64_t        result, usresult;
 
 	clock_interval_to_absolutetime_interval(
-						tvp->tv_sec, NSEC_PER_SEC, &result);
+		(uint32_t)tvp->tv_sec, NSEC_PER_SEC, &result);
 	clock_interval_to_absolutetime_interval(
-						tvp->tv_usec, NSEC_PER_USEC, &usresult);
+		tvp->tv_usec, NSEC_PER_USEC, &usresult);
 
-	return (result + usresult);
+	return result + usresult;
+}
+
+uint64_t
+tstoabstime(struct timespec *ts)
+{
+	uint64_t abstime_s, abstime_ns;
+	clock_interval_to_absolutetime_interval((uint32_t)ts->tv_sec, NSEC_PER_SEC, &abstime_s);
+	clock_interval_to_absolutetime_interval((uint32_t)ts->tv_nsec, 1, &abstime_ns);
+	return abstime_s + abstime_ns;
 }
 
 #if NETWORKING
@@ -747,7 +908,7 @@ ratecheck(struct timeval *lasttime, const struct timeval *mininterval)
 		rv = 1;
 	}
 
-	return (rv);
+	return rv;
 }
 
 /*
@@ -776,43 +937,26 @@ ppsratecheck(struct timeval *lasttime, int *curpps, int maxpps)
 		*lasttime = tv;
 		*curpps = 0;
 		rv = 1;
-	} else if (maxpps < 0)
+	} else if (maxpps < 0) {
 		rv = 1;
-	else if (*curpps < maxpps)
+	} else if (*curpps < maxpps) {
 		rv = 1;
-	else
+	} else {
 		rv = 0;
+	}
 
-#if 1 /* DIAGNOSTIC? */
 	/* be careful about wrap-around */
-	if (*curpps + 1 > 0)
+	if (*curpps < INT_MAX) {
 		*curpps = *curpps + 1;
-#else
-	/*
-	 * assume that there's not too many calls to this function.
-	 * not sure if the assumption holds, as it depends on *caller's*
-	 * behavior, not the behavior of this function.
-	 * IMHO it is wrong to make assumption on the caller's behavior,
-	 * so the above #if is #if 1, not #ifdef DIAGNOSTIC.
-	 */
-	*curpps = *curpps + 1;
-#endif
+	}
 
-	return (rv);
+	return rv;
 }
 #endif /* NETWORKING */
 
-void
-time_zone_slock_init(void)
+int
+__mach_bridge_remote_time(__unused struct proc *p, struct __mach_bridge_remote_time_args *mbrt_args, uint64_t *retval)
 {
-	/* allocate lock group attribute and group */
-	tz_slock_grp_attr = lck_grp_attr_alloc_init();
-
-	tz_slock_grp =  lck_grp_alloc_init("tzlock", tz_slock_grp_attr);
-
-	/* Allocate lock attribute */
-	tz_slock_attr = lck_attr_alloc_init();
-
-	/* Allocate the spin lock */
-	tz_slock = lck_spin_alloc_init(tz_slock_grp, tz_slock_attr);
+	*retval = mach_bridge_remote_time(mbrt_args->local_timestamp);
+	return 0;
 }

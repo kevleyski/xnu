@@ -1,8 +1,8 @@
 /*
- * Copyright (c) 1999 Apple Computer, Inc. All rights reserved.
+ * Copyright (c) 1999-2016 Apple Inc. All rights reserved.
  *
  * @APPLE_LICENSE_HEADER_START@
- * 
+ *
  * "Portions Copyright (c) 1999 Apple Computer, Inc.  All Rights
  * Reserved.  This file contains Original Code and/or Modifications of
  * Original Code as defined in and that are subject to the Apple Public
@@ -10,7 +10,7 @@
  * except in compliance with the License.  Please obtain a copy of the
  * License at http://www.apple.com/publicsource and read it before using
  * this file.
- * 
+ *
  * The Original Code and all software distributed under the License are
  * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
@@ -18,10 +18,10 @@
  * FITNESS FOR A PARTICULAR PURPOSE OR NON-INFRINGEMENT.  Please see the
  * License for the specific language governing rights and limitations
  * under the License."
- * 
+ *
  * @APPLE_LICENSE_HEADER_END@
  */
-/* 
+/*
  * Mach Operating System
  * Copyright (c) 1990 Carnegie-Mellon University
  * Copyright (c) 1989 Carnegie-Mellon University
@@ -59,44 +59,34 @@ static char sccsid[] __attribute__((used)) = "@(#)mkmakefile.c	5.21 (Berkeley) 6
  */
 
 #include <stdio.h>
-#include <unistd.h>	/* for unlink */
+#include <unistd.h>     /* for unlink */
 #include <ctype.h>
 #include "parser.h"
 #include "config.h"
 
-void	read_files(void);
-void	do_objs(FILE *fp, const char *msg, int ext);
-void	do_ordered(FILE *fp);
-void	do_files(FILE *fp, const char *msg, char ext);
-void	do_machdep(FILE *ofp);
-void	do_build(const char *name, void (*format)(FILE *));
-void	do_rules(FILE *f);
-void	do_load(FILE *f);
-struct file_list *do_systemspec(FILE *f, struct file_list *fl, int first);
-void	do_swapspec(FILE *f, const char *name, char *sysname);
-void	copy_dependencies(FILE *makin, FILE *makout);
-
-void	build_cputypes(FILE *fp);
-void	build_confdep(FILE *fp);
+void    read_files(void);
+void    do_objs(FILE *fp, const char *msg, int ext, int flags);
+void    do_files(FILE *fp, const char *msg, char ext);
+void    do_machdep(FILE *ofp);
+void    do_rules(FILE *f);
+void    copy_dependencies(FILE *makin, FILE *makout);
 
 struct file_list *fl_lookup(char *file);
 struct file_list *fltail_lookup(char *file);
 struct file_list *new_fent(void);
 
-void	put_source_file_name(FILE *fp, struct file_list *tp);
+void    put_source_file_name(FILE *fp, struct file_list *tp);
 
-
-#define DO_SWAPFILE	0
 
 #define next_word(fp, wd) \
-	{ register const char *word = get_word(fp); \
+	{ const char *word = get_word(fp); \
 	  if (word == (char *)EOF) \
-		return; \
+	        return; \
 	  else \
-		wd = word; \
+	        wd = word; \
 	}
 
-static	struct file_list *fcur;
+static  struct file_list *fcur;
 const char *tail(const char *fn);
 char *allCaps(char *str);
 
@@ -106,13 +96,14 @@ char *allCaps(char *str);
 struct file_list *
 fl_lookup(char *file)
 {
-	register struct file_list *fp;
+	struct file_list *fp;
 
-	for (fp = ftab ; fp != 0; fp = fp->f_next) {
-		if (eq(fp->f_fn, file))
-			return (fp);
+	for (fp = ftab; fp != 0; fp = fp->f_next) {
+		if (eq(fp->f_fn, file)) {
+			return fp;
+		}
 	}
-	return (0);
+	return 0;
 }
 
 /*
@@ -121,13 +112,14 @@ fl_lookup(char *file)
 struct file_list *
 fltail_lookup(char *file)
 {
-	register struct file_list *fp;
+	struct file_list *fp;
 
-	for (fp = ftab ; fp != 0; fp = fp->f_next) {
-		if (eq(tail(fp->f_fn), tail(file)))
-			return (fp);
+	for (fp = ftab; fp != 0; fp = fp->f_next) {
+		if (eq(tail(fp->f_fn), tail(file))) {
+			return fp;
+		}
 	}
-	return (0);
+	return 0;
 }
 
 /*
@@ -136,7 +128,7 @@ fltail_lookup(char *file)
 struct file_list *
 new_fent(void)
 {
-	register struct file_list *fp;
+	struct file_list *fp;
 
 	fp = (struct file_list *) malloc(sizeof *fp);
 	fp->f_needs = 0;
@@ -144,58 +136,31 @@ new_fent(void)
 	fp->f_flags = 0;
 	fp->f_type = 0;
 	fp->f_extra = (char *) 0;
-	if (fcur == 0)
+	if (fcur == 0) {
 		fcur = ftab = fp;
-	else
+	} else {
 		fcur->f_next = fp;
+	}
 	fcur = fp;
-	return (fp);
+	return fp;
 }
 
-char	*COPTS;
-static	struct users {
-	int	u_default;
-	int	u_min;
-	int	u_max;
-} users[] = {
-	{ 24, 2, 1024 },		/* MACHINE_VAX */
-	{  8, 2, 32 },			/* MACHINE_SUN */
-	{ 16, 4, 32 },			/* MACHINE_ROMP */
-	{  8, 2, 32 },			/* MACHINE_SUN2 */
-	{  8, 2, 32 },			/* MACHINE_SUN3 */
-	{ 24, 8, 1024},			/* MACHINE_MMAX */
-	{ 32, 8, 1024},			/* MACHINE_SQT */
-	{  8, 2, 32 },			/* MACHINE_SUN4 */
-	{  2, 2, 1024 },		/* MACHINE_I386 */
-	{ 32, 8, 1024 },		/* MACHINE_IX */
-	{ 32, 8, 1024 },		/* MACHINE_MIPSY */
-	{ 32, 8, 1024 },		/* MACHINE_MIPS*/
-	{ 32, 8, 1024 },		/* MACHINE_I860*/
-	{  8, 2, 32 },			/* MACHINE_M68K */
-	{  8, 2, 32 },			/* MACHINE_M88K */
-	{  8, 2, 32 },			/* MACHINE_M98K */
-	{  8, 2, 32 },			/* MACHINE_HPPA */
-	{  8, 2, 32 },			/* MACHINE_SPARC */
-	{  8, 2, 32 },			/* MACHINE_PPC */
-	{  8, 2, 32 },			/* MACHINE_ARM */
-	{  8, 2, 32 },			/* MACHINE_X86_64 */
-};
-#define NUSERS	(sizeof (users) / sizeof (users[0]))
+char    *COPTS;
 
 const char *
 get_VPATH(void)
 {
-    static char *vpath = NULL;
+	static char *vpath = NULL;
 
-    if ((vpath == NULL) &&
-	((vpath = getenv("VPATH")) != NULL) &&
-	(*vpath != ':')) {
-	register char *buf = malloc((unsigned)(strlen(vpath) + 2));
+	if ((vpath == NULL) &&
+	    ((vpath = getenv("VPATH")) != NULL) &&
+	    (*vpath != ':')) {
+		char *buf = malloc((unsigned)(strlen(vpath) + 2));
 
-	vpath = strcat(strcpy(buf, ":"), vpath);
-    }
+		vpath = strcat(strcpy(buf, ":"), vpath);
+	}
 
-    return vpath ? vpath : "";
+	return vpath ? vpath : "";
 }
 
 
@@ -210,7 +175,6 @@ makefile(void)
 	char pname[BUFSIZ];
 	char line[BUFSIZ];
 	struct opt *op;
-	struct users *up;
 
 	read_files();
 	(void) sprintf(line, "%s/Makefile.template", config_directory);
@@ -222,13 +186,6 @@ makefile(void)
 	dfp = fopen(path("Makefile"), "r");
 	rename(path("Makefile"), path("Makefile.old"));
 	unlink(path("Makefile.old"));
-	unlink(path("M.d"));
-	if ((ofp = fopen(path("M.d"), "w")) == NULL) {
-		perror(path("M.d"));
-		/* We'll let this error go */
-	}
-	else
-	 	fclose(ofp);
 	ofp = fopen(path("Makefile"), "w");
 	if (ofp == 0) {
 		perror(path("Makefile"));
@@ -236,102 +193,79 @@ makefile(void)
 	}
 	fprintf(ofp, "SOURCE_DIR=%s\n", source_directory);
 
-	if (machine == MACHINE_SUN || machine == MACHINE_SUN2 
-	    || machine == MACHINE_SUN3 || machine == MACHINE_SUN4)
-		fprintf(ofp, "export IDENT=-D%s -D%s", machinename, allCaps(ident));
-	else
-		fprintf(ofp, "export IDENT=-D%s", allCaps(ident));
-	if (profiling)
+	fprintf(ofp, "export CONFIG_DEFINES =");
+	if (profiling) {
 		fprintf(ofp, " -DGPROF");
-	if (cputype == 0) {
-		printf("cpu type must be specified\n");
-		exit(1);
 	}
-	do_build("cputypes.h", build_cputypes);
-	do_build("platforms.h", build_cputypes);
 
-	for (op = opt; op; op = op->op_next)
-		if (op->op_value)
+	for (op = opt; op; op = op->op_next) {
+		if (op->op_value) {
 			fprintf(ofp, " -D%s=\"%s\"", op->op_name, op->op_value);
-		else
+		} else {
 			fprintf(ofp, " -D%s", op->op_name);
-	fprintf(ofp, "\n");
-	if ((unsigned)machine > NUSERS) {
-		printf("maxusers config info isn't present, using vax\n");
-		up = &users[MACHINE_VAX-1];
-	} else
-		up = &users[machine-1];
-	if (maxusers < up->u_min) {
-		maxusers = up->u_min;
-	} else if (maxusers > up->u_max)
-		printf("warning: maxusers > %d (%d)\n", up->u_max, maxusers);
-	if (maxusers) {
-		do_build("confdep.h", build_confdep);
+		}
 	}
-	for (op = mkopt; op; op = op->op_next)
-		if (op->op_value)
+	fprintf(ofp, "\n");
+	for (op = mkopt; op; op = op->op_next) {
+		if (op->op_value) {
 			fprintf(ofp, "%s=%s\n", op->op_name, op->op_value);
-		else
+		} else {
 			fprintf(ofp, "%s\n", op->op_name);
+		}
+	}
 
 	while (fgets(line, BUFSIZ, ifp) != 0) {
-		if (*line == '%')
+		if (*line == '%') {
 			goto percent;
+		}
 		if (profiling && strncmp(line, "COPTS=", 6) == 0) {
-			register char *cp;
-			if (machine != MACHINE_MMAX)
-			    fprintf(ofp,
-				"GPROF.EX=$(SOURCE_DIR)/machdep/%s/gmon.ex\n", machinename);
+			char *cp;
+			fprintf(ofp,
+			    "GPROF.EX=$(SOURCE_DIR)/machdep/%s/gmon.ex\n", machinename);
 			cp = index(line, '\n');
-			if (cp)
+			if (cp) {
 				*cp = 0;
+			}
 			cp = line + 6;
-			while (*cp && (*cp == ' ' || *cp == '\t'))
+			while (*cp && (*cp == ' ' || *cp == '\t')) {
 				cp++;
+			}
 			COPTS = malloc((unsigned)(strlen(cp) + 1));
 			if (COPTS == 0) {
 				printf("config: out of memory\n");
 				exit(1);
 			}
 			strcpy(COPTS, cp);
-			if (machine == MACHINE_MIPSY || machine == MACHINE_MIPS) {
-				fprintf(ofp, "%s ${CCPROFOPT}\n", line);
-				fprintf(ofp, "PCOPTS=%s\n", cp);
-			} else if (machine == MACHINE_MMAX)
-				fprintf(ofp, "%s -p\n",line);
-			else
-				fprintf(ofp, "%s -pg\n", line);
+			fprintf(ofp, "%s -pg\n", line);
 			continue;
 		}
 		fprintf(ofp, "%s", line);
 		continue;
-	percent:
+percent:
 		if (eq(line, "%OBJS\n")) {
-			do_objs(ofp, "OBJS=", -1);
+			do_objs(ofp, "OBJS=", -1, 0);
+		} else if (eq(line, "%LIBOBJS\n")) {
+			do_objs(ofp, "LIBOBJS=", -1, LIBRARYDEP);
 		} else if (eq(line, "%CFILES\n")) {
 			do_files(ofp, "CFILES=", 'c');
-			do_objs(ofp, "COBJS=", 'c');
+			do_objs(ofp, "COBJS=", 'c', 0);
+		} else if (eq(line, "%CXXFILES\n")) {
+			do_files(ofp, "CXXFILES=", 'p');
+			do_objs(ofp, "CXXOBJS=", 'p', 0);
 		} else if (eq(line, "%SFILES\n")) {
 			do_files(ofp, "SFILES=", 's');
-			do_objs(ofp, "SOBJS=", 's');
+			do_objs(ofp, "SOBJS=", 's', 0);
 		} else if (eq(line, "%MACHDEP\n")) {
-			/*
-			 * Move do_machdep() after the mkopt stuff.
-			 */
-			for (op = mkopt; op; op = op->op_next)
-				fprintf(ofp, "%s=%s\n", op->op_name, op->op_value);
 			do_machdep(ofp);
-		} else if (eq(line, "%RULES\n"))
+		} else if (eq(line, "%RULES\n")) {
 			do_rules(ofp);
-		else if (eq(line, "%LOAD\n"))
-			do_load(ofp);
-		else
+		} else {
 			fprintf(stderr,
 			    "Unknown %% construct in generic makefile: %s",
 			    line);
+		}
 	}
-	if (dfp != NULL)
-	{
+	if (dfp != NULL) {
 		copy_dependencies(dfp, ofp);
 		(void) fclose(dfp);
 	}
@@ -347,20 +281,18 @@ void
 read_files(void)
 {
 	FILE *fp;
-	register struct file_list *tp, *pf;
-	register struct device *dp;
-	register struct opt *op;
+	struct file_list *tp, *pf;
+	struct device *dp;
+	struct opt *op;
 	const char *wd;
 	char *this, *needs;
 	const char *devorprof;
 	int options;
 	int not_option;
-	int ordered;
-	int sedit;				/* SQT */
+	int f_flags;
 	char pname[BUFSIZ];
 	char fname[1024];
 	char *rest = (char *) 0;
-	struct cputype *cp;
 	int nreqs, first = 1, isdup;
 
 	ftab = 0;
@@ -378,13 +310,6 @@ next:
 	 * filename	[ standard | optional ]
 	 *	[ dev* | profiling-routine ] [ device-driver]
 	 */
-	/*
-	 * MACHINE_SQT ONLY:
-	 *
-	 * filename	[ standard | optional ] 
-	 *	[ ordered | sedit ]
-	 *	[ dev* | profiling-routine ] [ device-driver]
-	 */
 	wd = get_word(fp);
 	if (wd == (char *)EOF) {
 		(void) fclose(fp);
@@ -393,24 +318,18 @@ next:
 			first++;
 			goto openit;
 		}
-		if (first == 2) {
-			(void) sprintf(fname, "files.%s", allCaps(ident));
-			first++;
-			fp = fopenp(VPATH, fname, pname, "r");
-			if (fp != 0)
-				goto next;
-		}
 		return;
 	}
-	if (wd == 0)
+	if (wd == 0) {
 		goto next;
+	}
 	/*
 	 *  Allow comment lines beginning witha '#' character.
 	 */
-	if (*wd == '#')
-	{
-		while ((wd=get_word(fp)) && wd != (char *)EOF)
+	if (*wd == '#') {
+		while ((wd = get_word(fp)) && wd != (char *)EOF) {
 			;
+		}
 		goto next;
 	}
 
@@ -421,39 +340,31 @@ next:
 		    fname, this);
 		exit(1);
 	}
-	if ((pf = fl_lookup(this)) && (pf->f_type != INVISIBLE || pf->f_flags))
+	if ((pf = fl_lookup(this)) && (pf->f_type != INVISIBLE || pf->f_flags)) {
 		isdup = 1;
-	else
+	} else {
 		isdup = 0;
+	}
 	tp = 0;
-	if (first == 3 && (tp = fltail_lookup(this)) != 0)
-		printf("%s: Local file %s overrides %s.\n",
-		    fname, this, tp->f_fn);
 	nreqs = 0;
 	devorprof = "";
-	ordered = 0;
-	sedit = 1;				/* SQT: assume sedit for now */
 	needs = 0;
-	if (eq(wd, "standard"))
+	f_flags = 0;
+	if (eq(wd, "standard")) {
 		goto checkdev;
+	}
 	if (!eq(wd, "optional")) {
 		printf("%s: %s must be optional or standard\n", fname, this);
 		exit(1);
 	}
-	if (strncmp(this, "OPTIONS/", 8) == 0)
+	if (strncmp(this, "OPTIONS/", 8) == 0) {
 		options++;
+	}
 	not_option = 0;
 nextopt:
 	next_word(fp, wd);
-	if (wd == 0)
+	if (wd == 0) {
 		goto doneopt;
-	if (eq(wd, "ordered")) {
-		ordered++;
-		goto nextopt;
-	}
-	if (machine == MACHINE_SQT && eq(wd, "sedit")) {
-		sedit++;
-		goto nextopt;
 	}
 	if (eq(wd, "not")) {
 		not_option = !not_option;
@@ -464,13 +375,67 @@ nextopt:
 		next_word(fp, wd);
 		goto save;
 	}
+	if (eq(wd, "xnu-library")) {
+		f_flags |= LIBRARYDEP;
+		goto nextopt;
+	}
+	if (eq(wd, "bound-checks")) {
+		if (f_flags & BOUND_CHECKS_MASK) {
+			printf("%s: cannot combine bound-checks options\n", fname);
+			exit(1);
+		}
+		f_flags |= BOUND_CHECKS;
+		goto nextopt;
+	}
+	if (eq(wd, "bound-checks-pending")) {
+		if (f_flags & BOUND_CHECKS_MASK) {
+			printf("%s: cannot combine bound-checks options\n", fname);
+			exit(1);
+		}
+		f_flags |= BOUND_CHECKS_PENDING;
+		goto nextopt;
+	}
+	if (eq(wd, "bound-checks-soft")) {
+		if (f_flags & BOUND_CHECKS_MASK) {
+			printf("%s: cannot combine bound-checks options\n", fname);
+			exit(1);
+		}
+		f_flags |= BOUND_CHECKS_SOFT;
+		goto nextopt;
+	}
+	if (eq(wd, "bound-checks-debug")) {
+		if (f_flags & BOUND_CHECKS_MASK) {
+			printf("%s: cannot combine bound-checks options\n", fname);
+			exit(1);
+		}
+		f_flags |= BOUND_CHECKS_DEBUG;
+		goto nextopt;
+	}
+	if (eq(wd, "bound-checks-seed")) {
+		if (f_flags & BOUND_CHECKS_MASK) {
+			printf("%s: cannot combine bound-checks options\n", fname);
+			exit(1);
+		}
+		f_flags |= BOUND_CHECKS_SEED;
+		goto nextopt;
+	}
+	if (eq(wd, "bound-checks-new-checks")) {
+		if (!(f_flags & BOUND_CHECKS_MASK)) {
+			printf("%s: cannot use bound-checks-new-checks without a "
+			    "bound-check* option\n", fname);
+			exit(1);
+		}
+		f_flags |= BOUND_CHECKS_NEW_CHECKS;
+		goto nextopt;
+	}
 	nreqs++;
-	if (needs == 0 && nreqs == 1)
+	if (needs == 0 && nreqs == 1) {
 		needs = ns(wd);
-	if (isdup)
+	}
+	if (isdup) {
 		goto invis;
-	if (options)
-	{
+	}
+	if (options) {
 		struct opt *lop = 0;
 		struct device tdev;
 
@@ -488,8 +453,7 @@ nextopt:
 		tdev.d_flags++;
 		tdev.d_slave = 0;
 
-		for (op=opt; op; lop=op, op=op->op_next)
-		{
+		for (op = opt; op; lop = op, op = op->op_next) {
 			char *od = allCaps(ns(wd));
 
 			/*
@@ -497,34 +461,36 @@ nextopt:
 			 *  dependency identifier.  Set the slave field to
 			 *  define the option in the header file.
 			 */
-			if (strcmp(op->op_name, od) == 0)
-			{
+			if (strcmp(op->op_name, od) == 0) {
 				tdev.d_slave = 1;
-				if (lop == 0)
+				if (lop == 0) {
 					opt = op->op_next;
-				else
+				} else {
 					lop->op_next = op->op_next;
+				}
 				free(op);
 				op = 0;
-			 }
+			}
 			free(od);
-			if (op == 0)
+			if (op == 0) {
 				break;
+			}
 		}
 		newdev(&tdev);
 	}
- 	for (dp = dtab; dp != 0; dp = dp->d_next) {
+	for (dp = dtab; dp != 0; dp = dp->d_next) {
 		if (eq(dp->d_name, wd) && (dp->d_type != PSEUDO_DEVICE || dp->d_slave)) {
-			if (not_option)
-				goto invis;	/* dont want file if option present */
-			else
+			if (not_option) {
+				goto invis;     /* dont want file if option present */
+			} else {
 				goto nextopt;
+			}
 		}
 	}
-	if (not_option)
-		goto nextopt;		/* want file if option missing */
-
-	for (op = opt; op != 0; op = op->op_next)
+	if (not_option) {
+		goto nextopt;           /* want file if option missing */
+	}
+	for (op = opt; op != 0; op = op->op_next) {
 		if (op->op_value == 0 && opteq(op->op_name, wd)) {
 			if (nreqs == 1) {
 				free(needs);
@@ -532,21 +498,15 @@ nextopt:
 			}
 			goto nextopt;
 		}
-
-	for (cp = cputype; cp; cp = cp->cpu_next)
-		if (opteq(cp->cpu_name, wd)) {
-			if (nreqs == 1) {
-				free(needs);
-				needs = 0;
-			}
-			goto nextopt;
-		}
+	}
 
 invis:
-	while ((wd = get_word(fp)) != 0)
+	while ((wd = get_word(fp)) != 0) {
 		;
-	if (tp == 0)
+	}
+	if (tp == 0) {
 		tp = new_fent();
+	}
 	tp->f_fn = this;
 	tp->f_type = INVISIBLE;
 	tp->f_needs = needs;
@@ -562,20 +522,75 @@ doneopt:
 
 checkdev:
 	if (wd) {
-		if (*wd == '|')
+		if (*wd == '|') {
 			goto getrest;
+		}
 		next_word(fp, wd);
-		if (wd) {
-			if (eq(wd, "ordered")) {
-				ordered++;
-				goto checkdev;
+		while (wd) {
+			if (eq(wd, "xnu-library")) {
+				f_flags |= LIBRARYDEP;
+				next_word(fp, wd);
+				continue;
 			}
-			if (machine == MACHINE_SQT && eq(wd, "sedit")) {
-				sedit++;
-				goto checkdev;
+			if (eq(wd, "bound-checks")) {
+				if (f_flags & BOUND_CHECKS_MASK) {
+					printf("%s: cannot combine bound-checks options\n", fname);
+					exit(1);
+				}
+				f_flags |= BOUND_CHECKS;
+				next_word(fp, wd);
+				continue;
 			}
+			if (eq(wd, "bound-checks-pending")) {
+				if (f_flags & BOUND_CHECKS_MASK) {
+					printf("%s: cannot combine bound-checks options\n", fname);
+					exit(1);
+				}
+				f_flags |= BOUND_CHECKS_PENDING;
+				next_word(fp, wd);
+				continue;
+			}
+			if (eq(wd, "bound-checks-soft")) {
+				if (f_flags & BOUND_CHECKS_MASK) {
+					printf("%s: cannot combine bound-checks options\n", fname);
+					exit(1);
+				}
+				f_flags |= BOUND_CHECKS_SOFT;
+				next_word(fp, wd);
+				continue;
+			}
+			if (eq(wd, "bound-checks-debug")) {
+				if (f_flags & BOUND_CHECKS_MASK) {
+					printf("%s: cannot combine bound-checks options\n", fname);
+					exit(1);
+				}
+				f_flags |= BOUND_CHECKS_DEBUG;
+				next_word(fp, wd);
+				continue;
+			}
+			if (eq(wd, "bound-checks-seed")) {
+				if (f_flags & BOUND_CHECKS_MASK) {
+					printf("%s: cannot combine bound-checks options\n", fname);
+					exit(1);
+				}
+				f_flags |= BOUND_CHECKS_SEED;
+				next_word(fp, wd);
+				continue;
+			}
+			if (eq(wd, "bound-checks-new-checks")) {
+				if (!(f_flags & BOUND_CHECKS_MASK)) {
+					printf("%s: cannot use bound-checks-new-checks without a "
+					    "bound-check* option\n", fname);
+					exit(1);
+				}
+				f_flags |= BOUND_CHECKS_NEW_CHECKS;
+				next_word(fp, wd);
+				continue;
+			}
+
 			devorprof = wd;
 			next_word(fp, wd);
+			break;
 		}
 	}
 
@@ -586,33 +601,32 @@ getrest:
 			rest = ns(get_rest(fp));
 		} else {
 			printf("%s: syntax error describing %s\n",
-			       fname, this);
+			    fname, this);
 			exit(1);
 		}
 	}
-	if (eq(devorprof, "profiling-routine") && profiling == 0)
+	if (eq(devorprof, "profiling-routine") && profiling == 0) {
 		goto next;
-	if (tp == 0)
+	}
+	if (tp == 0) {
 		tp = new_fent();
+	}
 	tp->f_fn = this;
 	tp->f_extra = rest;
-	if (options)
+	if (options) {
 		tp->f_type = INVISIBLE;
-	else
-	if (eq(devorprof, "device-driver"))
+	} else if (eq(devorprof, "device-driver")) {
 		tp->f_type = DRIVER;
-	else if (eq(devorprof, "profiling-routine"))
+	} else if (eq(devorprof, "profiling-routine")) {
 		tp->f_type = PROFILING;
-	else
+	} else {
 		tp->f_type = NORMAL;
-	tp->f_flags = 0;
-	if (ordered)
-		tp->f_flags |= ORDERED;
-	if (sedit)				/* SQT */
-		tp->f_flags |= SEDIT;
+	}
+	tp->f_flags = f_flags;
 	tp->f_needs = needs;
-	if (pf && pf->f_type == INVISIBLE)
-		pf->f_flags = 1;		/* mark as duplicate */
+	if (pf && pf->f_type == INVISIBLE) {
+		pf->f_flags = 1;                /* mark as duplicate */
+	}
 	goto next;
 }
 
@@ -621,54 +635,60 @@ opteq(const char *cp, const char *dp)
 {
 	char c, d;
 
-	for (; ; cp++, dp++) {
+	for (;; cp++, dp++) {
 		if (*cp != *dp) {
 			c = isupper(*cp) ? tolower(*cp) : *cp;
 			d = isupper(*dp) ? tolower(*dp) : *dp;
-			if (c != d)
-				return (0);
+			if (c != d) {
+				return 0;
+			}
 		}
-		if (*cp == 0)
-			return (1);
+		if (*cp == 0) {
+			return 1;
+		}
 	}
 }
 
 void
 put_source_file_name(FILE *fp, struct file_list *tp)
 {
-	if ((tp->f_fn[0] == '.') && (tp->f_fn[1] == '/'))
+	if ((tp->f_fn[0] == '.') && (tp->f_fn[1] == '/')) {
 		fprintf(fp, "%s ", tp->f_fn);
-	 else
+	} else {
 		fprintf(fp, "$(SOURCE_DIR)/%s ", tp->f_fn);
+	}
 }
 
 void
-do_objs(FILE *fp, const char *msg, int ext)
+do_objs(FILE *fp, const char *msg, int ext, int flags)
 {
-	register struct file_list *tp;
-	register int lpos, len;
+	struct file_list *tp;
+	int lpos, len;
 	char *cp;
 	char och;
 	const char *sp;
-#if	DO_SWAPFILE
-	register struct file_list *fl;
-	char swapname[32];
-#endif	/* DO_SWAPFILE */
 
 	fprintf(fp, "%s", msg);
 	lpos = strlen(msg);
 	for (tp = ftab; tp != 0; tp = tp->f_next) {
-		if (tp->f_type == INVISIBLE)
+		if (tp->f_type == INVISIBLE) {
 			continue;
+		}
+
+		/*
+		 * Check flags (if any)
+		 */
+		if (flags && ((tp->f_flags & flags) != flags)) {
+			continue;
+		}
 
 		/*
 		 *	Check for '.o' file in list
 		 */
 		cp = tp->f_fn + (len = strlen(tp->f_fn)) - 1;
-		if ((ext == -1 && tp->f_flags & ORDERED) ||		/* not in objs */
-		    (ext != -1 && *cp != ext))
+		if (ext != -1 && *cp != ext) {
 			continue;
-		else if (*cp == 'o') {
+		} else if (*cp == 'o') {
 			if (len + lpos > 72) {
 				lpos = 8;
 				fprintf(fp, "\\\n\t");
@@ -679,50 +699,6 @@ do_objs(FILE *fp, const char *msg, int ext)
 			continue;
 		}
 		sp = tail(tp->f_fn);
-#if	DO_SWAPFILE
-		for (fl = conf_list; fl; fl = fl->f_next) {
-			if (fl->f_type != SWAPSPEC)
-				continue;
-			(void) sprintf(swapname, "swap%s.c", fl->f_fn);
-			if (eq(sp, swapname))
-				goto cont;
-		}
-#endif	/* DO_SWAPFILE */
-		cp = (char *)sp + (len = strlen(sp)) - 1;
-		och = *cp;
-		*cp = 'o';
-		if (len + lpos > 72) {
-			lpos = 8;
-			fprintf(fp, "\\\n\t");
-		}
-		fprintf(fp, "%s ", sp);
-		lpos += len + 1;
-		*cp = och;
-#if	DO_SWAPFILE
-cont:
-		;
-#endif	/* DO_SWAPFILE */
-	}
-	if (lpos != 8)
-		putc('\n', fp);
-}
-
-/* not presently used and probably broken,  use ORDERED instead */
-void
-do_ordered(FILE *fp)
-{
-	register struct file_list *tp;
-	register int lpos, len;
-	char *cp;
-	char och;
-	const char *sp;
-
-	fprintf(fp, "ORDERED=");
-	lpos = 10;
-	for (tp = ftab; tp != 0; tp = tp->f_next) {
-		if ((tp->f_flags & ORDERED) != ORDERED)
-			continue;
-		sp = tail(tp->f_fn);
 		cp = (char *)sp + (len = strlen(sp)) - 1;
 		och = *cp;
 		*cp = 'o';
@@ -734,23 +710,24 @@ do_ordered(FILE *fp)
 		lpos += len + 1;
 		*cp = och;
 	}
-	if (lpos != 8)
-		putc('\n', fp);
+	putc('\n', fp);
 }
 
 void
 do_files(FILE *fp, const char *msg, char ext)
 {
-	register struct file_list *tp;
-	register int lpos, len=0; /* dvw: init to 0 */
+	struct file_list *tp;
+	int lpos, len = 0; /* dvw: init to 0 */
 
 	fprintf(fp, "%s", msg);
 	lpos = 8;
 	for (tp = ftab; tp != 0; tp = tp->f_next) {
-		if (tp->f_type == INVISIBLE)
+		if (tp->f_type == INVISIBLE) {
 			continue;
-		if (tp->f_fn[strlen(tp->f_fn)-1] != ext)
+		}
+		if (tp->f_fn[strlen(tp->f_fn) - 1] != ext) {
 			continue;
+		}
 		/*
 		 * Always generate a newline.
 		 * Our Makefile's aren't readable anyway.
@@ -761,8 +738,7 @@ do_files(FILE *fp, const char *msg, char ext)
 		put_source_file_name(fp, tp);
 		lpos += len + 1;
 	}
-	if (lpos != 8)
-		putc('\n', fp);
+	putc('\n', fp);
 }
 
 /*
@@ -783,99 +759,53 @@ do_machdep(FILE *ofp)
 		exit(1);
 	}
 	while (fgets(line, BUFSIZ, ifp) != 0) {
-		if (profiling && (strncmp(line, "LIBS=", 5) == 0)) 
-			fprintf(ofp,"LIBS=${LIBS_P}\n");
-		else
+		if (profiling && (strncmp(line, "LIBS=", 5) == 0)) {
+			fprintf(ofp, "LIBS=${LIBS_P}\n");
+		} else {
 			fputs(line, ofp);
+		}
 	}
 	fclose(ifp);
-}
-
-
-/*
- *  Format configuration dependent parameter file.
- */
-
-void
-build_confdep(FILE *fp)
-{
-	fprintf(fp, "#define MAXUSERS %d\n", maxusers);
-}
-
-/*
- *  Format cpu types file.
- */
-
-void
-build_cputypes(FILE *fp)
-{
-	struct cputype *cp;
-
-	for (cp = cputype; cp; cp = cp->cpu_next)
-		fprintf(fp, "#define\t%s\t1\n", cp->cpu_name);
-}
-
-
-
-/*
- *  Build a define parameter file.  Create it first in a temporary location and
- *  determine if this new contents differs from the old before actually
- *  replacing the original (so as not to introduce avoidable extraneous
- *  compilations).
- */
-
-void
-do_build(const char *name, void (*format)(FILE *))
-{
-	static char temp[]="#config.tmp";
-	FILE *tfp, *ofp;
-	int c;
-
-	unlink(path(temp));
-	tfp = fopen(path(temp), "w+");
-	if (tfp == 0) {
-		perror(path(temp));
-		exit(1);
-	}
-	unlink(path(temp));
-	(*format)(tfp);
-	ofp = fopen(path(name), "r");
-	if (ofp != 0)
-	{
-		fseek(tfp, 0, 0);
-		while ((c = fgetc(tfp)) != EOF)
-			if (fgetc(ofp) != c)
-				goto copy;
-		if (fgetc(ofp) == EOF)
-			goto same;
-		
-	}
-copy:
-	if (ofp)
-		fclose(ofp);
-	unlink(path(name));
-	ofp = fopen(path(name), "w");
-	if (ofp == 0) {
-		perror(path(name));
-		exit(1);
-	}
-	fseek(tfp, 0, 0);
-	while ((c = fgetc(tfp)) != EOF)
-		fputc(c, ofp);
-same:
-	fclose(ofp);
-	fclose(tfp);
 }
 
 const char *
 tail(const char *fn)
 {
-	register const char *cp;
+	const char *cp;
 
 	cp = rindex(fn, '/');
-	if (cp == 0)
-		return (fn);
-	return (cp+1);
+	if (cp == 0) {
+		return fn;
+	}
+	return cp + 1;
+}
+
+void emit_bounds_checks_new_checks_lines(struct file_list * ftp, FILE *f, const char* tp);
+void
+emit_bounds_checks_new_checks_lines(struct file_list * ftp, FILE *f, const char* tp)
+{
+	// We don't specify `-fbounds-safety-bringup-missing-checks` directly
+	// here because `-fbounds-safety` is dynamically disabled at build time for
+	// x86_64. Instead `CFLAGS_BOUND_CHECKS_ENABLE_NEW_CHECKS` and
+	// `CFLAGS_BOUND_CHECKS_DISABLE_NEW_CHECKS` will be set to the appropriate
+	// flag name if the `BOUND_CHECKS` make file variable is not `0`. See
+	// `MakeInc.def`.
+
+	if (!(ftp->f_flags & BOUND_CHECKS_NEW_CHECKS)) {
+		// Explicitly disable the new checks when building with
+		// `-fbounds-safety`.
+		//
+		// While this is technically unnecessary (this is currently clang's
+		// default) the behavior will eventually change (rdar://134095657).
+		// Explicitly setting the flag means that when clang's behavior changes
+		// the semantics of the conf files will remain the same (i.e. not
+		// specifiying `bound-checks-new-checks` means new checks are disabled).
+		fprintf(f, "%so_CFLAGS_ADD += ${CFLAGS_BOUND_CHECKS_DISABLE_NEW_CHECKS}\n", tp);
+		return;
+	}
+
+	// Enable all new checks
+	fprintf(f, "%so_CFLAGS_ADD += ${CFLAGS_BOUND_CHECKS_ENABLE_NEW_CHECKS}\n", tp);
 }
 
 /*
@@ -891,136 +821,114 @@ do_rules(FILE *f)
 	char *cp;
 	char *np, och;
 	const char *tp;
-	register struct file_list *ftp;
+	struct file_list *ftp;
 	const char *extras = ""; /* dvw: init to "" */
 	char *source_dir;
 	char och_upper;
 	const char *nl = "";
 
 	for (ftp = ftab; ftp != 0; ftp = ftp->f_next) {
-		if (ftp->f_type == INVISIBLE)
+		if (ftp->f_type == INVISIBLE) {
 			continue;
+		}
 		cp = (np = ftp->f_fn) + strlen(ftp->f_fn) - 1;
 		och = *cp;
 		/*
-			*	Don't compile '.o' files
-			*/
-		if (och == 'o')
+		 *	Don't compile '.o' files
+		 */
+		if (och == 'o') {
 			continue;
+		}
 		/*
-			*	Determine where sources should come from
-			*/
+		 *	Determine where sources should come from
+		 */
 		if ((np[0] == '.') && (np[1] == '/')) {
 			source_dir = "";
 			np += 2;
-		} else
+		} else {
 			source_dir = "$(SOURCE_DIR)/";
+		}
 		*cp = '\0';
-		tp = tail(np);	/* dvw: init tp before 'if' */
+		tp = tail(np);  /* dvw: init tp before 'if' */
 		fprintf(f, "-include %sd\n", tp);
+		switch (ftp->f_flags & BOUND_CHECKS_MASK) {
+		case BOUND_CHECKS_PENDING:
+			fprintf(f, "%so_CFLAGS_ADD += ${CFLAGS_BOUND_CHECKS_PENDING}\n", tp);
+			break;
+		case BOUND_CHECKS:
+			fprintf(f, "%so_CFLAGS_ADD += ${CFLAGS_BOUND_CHECKS}\n", tp);
+			emit_bounds_checks_new_checks_lines(ftp, f, tp);
+			break;
+		case BOUND_CHECKS_SOFT:
+			fprintf(f, "ifeq ($(CURRENT_KERNEL_CONFIG),RELEASE)\n");
+			fprintf(f, "%so_CFLAGS_ADD += ${CFLAGS_BOUND_CHECKS_PENDING}\n", tp);
+			fprintf(f, "else\n");
+			fprintf(f, "%so_CFLAGS_ADD += ${CFLAGS_BOUND_CHECKS}\n", tp);
+			fprintf(f, "%so_CFLAGS_ADD += ${CFLAGS_BOUND_CHECKS_SOFT}\n", tp);
+			emit_bounds_checks_new_checks_lines(ftp, f, tp);
+			fprintf(f, "endif # CURRENT_KERNEL_CONFIG\n");
+			break;
+		case BOUND_CHECKS_DEBUG:
+			fprintf(f, "%so_CFLAGS_ADD += ${CFLAGS_BOUND_CHECKS}\n", tp);
+			fprintf(f, "%so_CFLAGS_ADD += ${CFLAGS_BOUND_CHECKS_DEBUG}\n", tp);
+			emit_bounds_checks_new_checks_lines(ftp, f, tp);
+			break;
+		case BOUND_CHECKS_SEED:
+			fprintf(f, "ifeq ($(CURRENT_KERNEL_CONFIG),RELEASE)\n");
+			fprintf(f, "%so_CFLAGS_ADD += ${CFLAGS_BOUND_CHECKS}\n", tp);
+			fprintf(f, "%so_CFLAGS_ADD += ${CFLAGS_BOUND_CHECKS_SOFT}\n", tp);
+			fprintf(f, "else\n");
+			fprintf(f, "%so_CFLAGS_ADD += ${CFLAGS_BOUND_CHECKS}\n", tp);
+			fprintf(f, "endif # CURRENT_KERNEL_CONFIG\n");
+			emit_bounds_checks_new_checks_lines(ftp, f, tp);
+			break;
+		}
 		fprintf(f, "%so: %s%s%c\n", tp, source_dir, np, och);
 		if (och == 's') {
-			switch (machine) {
-			case MACHINE_MIPSY:
-			case MACHINE_MIPS:
-				break;
-			default:
-				fprintf(f, "\t${S_RULE_0}\n");
-				fprintf(f, "\t${S_RULE_1A}%s%.*s${S_RULE_1B}%s\n",
-						source_dir, (int)(tp-np), np, nl);
-				fprintf(f, "\t${S_RULE_2}%s\n", nl);
-				break;
-			}
+			fprintf(f, "\t${S_RULE_0}\n");
+			fprintf(f, "\t${S_RULE_1A} %s%.*s${S_RULE_1B}%s\n",
+			    source_dir, (int)(tp - np), np, nl);
+			fprintf(f, "\t${S_RULE_2}%s\n", nl);
 			continue;
 		}
 		extras = "";
 		switch (ftp->f_type) {
-	
 		case NORMAL:
-			switch (machine) {
-	
-			case MACHINE_MIPSY:
-			case MACHINE_MIPS:
-				break;
-			default:
-				goto common;
-			}
+			goto common;
 			break;
-	
+
 		case DRIVER:
-			switch (machine) {
-	
-			case MACHINE_MIPSY:
-			case MACHINE_MIPS:
-				fprintf(f, "\t@${RM} %so\n", tp);
-				fprintf(f, "\t${CC} ${CCDFLAGS}%s %s%s%sc\n\n",
-					(ftp->f_extra?ftp->f_extra:""), extras, source_dir, np);
-				continue;
-			default:
-				extras = "_D";
-				goto common;
-			}
+			extras = "_D";
+			goto common;
 			break;
-	
+
 		case PROFILING:
-			if (!profiling)
+			if (!profiling) {
 				continue;
+			}
 			if (COPTS == 0) {
 				fprintf(stderr,
-					"config: COPTS undefined in generic makefile");
+				    "config: COPTS undefined in generic makefile");
 				COPTS = "";
 			}
-			switch (machine) {
-				case MACHINE_MIPSY:
-				case MACHINE_MIPS:
-					fprintf(f, "\t@${RM} %so\n", tp);
-					fprintf(f, "\t${CC} ${CCPFLAGS}%s %s../%sc\n\n",
-						(ftp->f_extra?ftp->f_extra:""), extras, np);
-					continue;
-				case MACHINE_VAX:
-				case MACHINE_ROMP:
-				case MACHINE_SQT:
-				case MACHINE_MMAX:
-				case MACHINE_SUN3:
-				case MACHINE_SUN4:
-				case MACHINE_I386:
-				case MACHINE_I860:
-				case MACHINE_HPPA:
-				case MACHINE_SPARC:
-				case MACHINE_PPC:
-				case MACHINE_ARM:
-				case MACHINE_X86_64:
-					extras = "_P";
-					goto common;
-				default:
-				fprintf(stderr,
-					"config: don't know how to profile kernel on this cpu\n");
-				break;
-			}
-	
-		common:
+			extras = "_P";
+			goto common;
+
+common:
 			och_upper = och + 'A' - 'a';
 			fprintf(f, "\t${%c_RULE_0%s}\n", och_upper, extras);
 			fprintf(f, "\t${%c_RULE_1A%s}", och_upper, extras);
-			if (ftp->f_extra)
+			if (ftp->f_extra) {
 				fprintf(f, "%s", ftp->f_extra);
-			fprintf(f, "%s%.*s${%c_RULE_1B%s}%s\n",
-					source_dir, (int)(tp-np), np, och_upper, extras, nl);
-
-			/* While we are still using CTF, any build that normally does not support CTF will
-			 * a "standard" compile done as well that we can harvest CTF information from; do
-			 * that here.
-			 */
-			fprintf(f, "\t${%c_CTFRULE_1A%s}", och_upper, extras);
-			if (ftp->f_extra)
-				fprintf(f, "%s", ftp->f_extra);
-			fprintf(f, "%s%.*s${%c_CTFRULE_1B%s}%s\n",
-					source_dir, (int)(tp-np), np, och_upper, extras, nl);
+			}
+			fprintf(f, " %s%.*s${%c_RULE_1B%s}%s\n",
+			    source_dir, (int)(tp - np), np, och_upper, extras, nl);
 
 			fprintf(f, "\t${%c_RULE_2%s}%s\n", och_upper, extras, nl);
-			fprintf(f, "\t${%c_CTFRULE_2%s}%s\n", och_upper, extras, nl);
+			fprintf(f, "\t${%c_RULE_3%s}%s\n", och_upper, extras, nl);
+			fprintf(f, "\t${%c_RULE_4%s}%s\n", och_upper, extras, nl);
 			break;
-	
+
 		default:
 			printf("Don't know rules for %s\n", np);
 			break;
@@ -1029,116 +937,42 @@ do_rules(FILE *f)
 	}
 }
 
-/*
- * Create the load strings
- */
-void
-do_load(FILE *f)
-{
-	register struct file_list *fl;
-	int first = 1;
-
-	fl = conf_list;
-	while (fl) {
-		if (fl->f_type != SYSTEMSPEC) {
-			fl = fl->f_next;
-			continue;
-		}
-		fl = do_systemspec(f, fl, first);
-		if (first)
-			first = 0;
-	}
-	fprintf(f, "LOAD =");
-	for (fl = conf_list; fl != 0; fl = fl->f_next)
-		if (fl->f_type == SYSTEMSPEC)
-			fprintf(f, " %s", fl->f_needs);
-#ifdef	multimax
-	fprintf(f, "\n\nall .ORDER: includelinks ${LOAD}\n");
-#else	/* multimax */
-	fprintf(f, "\n\nall: includelinks ${LOAD}\n");
-#endif	/* multimax */
-	fprintf(f, "\n");
-}
-
-struct file_list *
-do_systemspec(FILE *f, struct file_list *fl, __unused int first)
-{
-	/*
-	 * Variable for kernel name.
-	 */
-	fprintf(f, "KERNEL_NAME=%s\n", fl->f_needs);
-
-	fprintf(f, "%s .ORDER: %s.sys ${SYSDEPS}\n",
-		fl->f_needs, fl->f_needs);
-	fprintf(f, "\t${SYS_RULE_1}\n");
-	fprintf(f, "\t${SYS_RULE_2}\n");
-	fprintf(f, "\t${SYS_RULE_3}\n");
-	fprintf(f, "\t${SYS_RULE_4}\n\n");
-	do_swapspec(f, fl->f_fn, fl->f_needs);
-	for (fl = fl->f_next; fl != NULL && fl->f_type == SWAPSPEC; fl = fl->f_next)
-		continue;
-	return (fl);
-}
-
-void
-do_swapspec(__unused FILE *f, __unused const char *name, __unused char *sysname)
-{
-
-#if	DO_SWAPFILE
-	char *gdir = eq(name, "generic")?"$(MACHINEDIR)/":"";
-
-	fprintf(f, "%s.sys:${P} ${PRELDDEPS} ${LDOBJS} ${LDDEPS}\n\n", sysname);
-	fprintf(f, "%s.swap: swap%s.o\n", sysname, name);
-	fprintf(f, "\t@rm -f $@\n");
-	fprintf(f, "\t@cp swap%s.o $@\n\n", name);
-	fprintf(f, "swap%s.o: %sswap%s.c ${SWAPDEPS}\n", name, gdir, name);
-	if (machine == MACHINE_MIPSY || machine == MACHINE_MIPS) {
-		fprintf(f, "\t@${RM} swap%s.o\n", name);
-		fprintf(f, "\t${CC} ${CCNFLAGS} %sswap%s.c\n\n", gdir, name);
-	} else {
-		fprintf(f, "\t${C_RULE_1A}%s${C_RULE_1B}\n", gdir);
-		fprintf(f, "\t${C_RULE_2}\n");
-		fprintf(f, "\t${C_RULE_3}\n");
-		fprintf(f, "\t${C_RULE_4}\n\n");
-	}
-#endif	/* DO_SWAPFILE */
-}
-
 char *
-allCaps(str)
-	register char *str;
+allCaps(char *str)
 {
-	register char *cp = str;
+	char *cp = str;
 
 	while (*str) {
-		if (islower(*str))
+		if (islower(*str)) {
 			*str = toupper(*str);
+		}
 		str++;
 	}
-	return (cp);
+	return cp;
 }
 
 #define OLDSALUTATION "# DO NOT DELETE THIS LINE"
 
 #define LINESIZE 1024
-static char makbuf[LINESIZE];		/* one line buffer for makefile */
+static char makbuf[LINESIZE];           /* one line buffer for makefile */
 
 void
 copy_dependencies(FILE *makin, FILE *makout)
 {
-	register int oldlen = (sizeof OLDSALUTATION - 1);
+	int oldlen = (sizeof OLDSALUTATION - 1);
 
 	while (fgets(makbuf, LINESIZE, makin) != NULL) {
-		if (! strncmp(makbuf, OLDSALUTATION, oldlen))
+		if (!strncmp(makbuf, OLDSALUTATION, oldlen)) {
 			break;
+		}
 	}
 	while (fgets(makbuf, LINESIZE, makin) != NULL) {
-		if (oldlen != 0)
-		{
-			if (makbuf[0] == '\n')
+		if (oldlen != 0) {
+			if (makbuf[0] == '\n') {
 				continue;
-			else
+			} else {
 				oldlen = 0;
+			}
 		}
 		fputs(makbuf, makout);
 	}

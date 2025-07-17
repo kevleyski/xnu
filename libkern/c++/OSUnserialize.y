@@ -99,15 +99,45 @@ static OSObject	*parsedObject;
 
 #define YYSTYPE object_t *
 
-extern "C" {
-extern void *kern_os_malloc(size_t size);
-extern void *kern_os_realloc(void * addr, size_t size);
-extern void kern_os_free(void * addr);
-} /* extern "C" */
+__BEGIN_DECLS
+#include <kern/kalloc.h>
+__END_DECLS
 
-#define malloc(s) kern_os_malloc(s)
-#define realloc(a, s) kern_os_realloc(a, s)
-#define free(a) kern_os_free(a)
+// Omit from static analysis.
+#ifndef __clang_analyzer__
+
+#define malloc(size)         malloc_impl(size)
+#define malloc_type(type)    kalloc_type(type, Z_SET_NOTSHARED)
+static inline void *
+malloc_impl(size_t size)
+{
+	if (size == 0) {
+		return NULL;
+	}
+	return kalloc_data(size,
+		Z_VM_TAG_BT(Z_WAITOK_ZERO, VM_KERN_MEMORY_LIBKERN));
+}
+
+#define free(addr)             free_impl(addr)
+#define free_type(type, addr)  kfree_type(type, addr)
+static inline void
+free_impl(void *addr)
+{
+	kfree_data_addr(addr);
+}
+static inline void
+safe_free(void *addr, size_t size)
+{
+	kfree_data(addr, size);
+}
+
+#define realloc(addr, osize, nsize) realloc_impl(addr, osize, nsize)
+static inline void *
+realloc_impl(void *addr, size_t osize, size_t nsize)
+{
+	return krealloc_data(addr, osize, nsize,
+		Z_VM_TAG_BT(Z_WAITOK_ZERO, VM_KERN_MEMORY_LIBKERN));
+}
 
 %}
 %token NUMBER
@@ -296,7 +326,7 @@ yylex()
 
 		/* copy to null terminated buffer */
 		tempString = (char *)malloc(length + 1);
-		if (tempString == 0) {
+		if (tempString == NULL) {
 			printf("OSUnserialize: can't alloc temp memory\n");
 			return 0;
 		}
@@ -324,7 +354,7 @@ yylex()
 		(void)nextChar();
 		/* copy to null terminated buffer */
 		tempString = (char *)malloc(length + 1);
-		if (tempString == 0) {
+		if (tempString == NULL) {
 			printf("OSUnserialize: can't alloc temp memory\n");
 			return 0;
 		}
@@ -385,7 +415,8 @@ yylex()
 	if (c == '<') {
 		unsigned char *d, *start, *lastStart;
 
-		start = lastStart = d = (unsigned char *)malloc(OSDATA_ALLOC_SIZE);
+		size_t buflen = OSDATA_ALLOC_SIZE;
+		start = lastStart = d = (unsigned char *)malloc(buflen);
 		c = nextChar();	// skip over '<'
 		while (c != 0 && c != '>') {
 
@@ -417,13 +448,14 @@ yylex()
 			d++;
 			if ((d - lastStart) >= OSDATA_ALLOC_SIZE) {
 				int oldsize = d - start;
-				start = (unsigned char *)realloc(start, oldsize + OSDATA_ALLOC_SIZE);
+				assert(buflen == oldsize);
+				start = (unsigned char *)realloc(start, oldsize, buflen);
 				d = lastStart = start + oldsize;
 			}
 			c = nextChar();
 		}
 		if (c != '>' ) {
-			free(start);
+			safe_free(start, buflen);
 			return SYNTAX_ERROR;
 		}
 
@@ -456,7 +488,7 @@ newObject()
 #if DEBUG
 	debugUnserializeAllocCount++;
 #endif
-	return (object_t *)malloc(sizeof(object_t));
+	return malloc_type(object_t);
 }
 
 void
@@ -465,7 +497,7 @@ freeObject(object_t *o)
 #if DEBUG
 	debugUnserializeAllocCount--;
 #endif
-	free(o);
+	free_type(object_t, o);
 }
 
 static OSDictionary *tags;
@@ -566,7 +598,7 @@ buildOSString(object_t *o)
 {
 	OSString *s = OSString::withCString((char *)o);
 
-	free(o);
+	safe_free(o, strlen((char *)o) + 1);
 
 	return s;
 };
@@ -581,7 +613,7 @@ buildOSData(object_t *o)
 	} else {
 		d = OSData::withCapacity(0);
 	}
-	free(o->object);
+	safe_free(o->object, o->size);
 	freeObject(o);
 	return d;
 };
@@ -630,9 +662,9 @@ OSUnserialize(const char *buffer, OSString **errorString)
 	tags = OSDictionary::withCapacity(128);
 	if (yyparse() == 0) {
 		object = parsedObject;
-		if (errorString) *errorString = 0;
+		if (errorString) *errorString = NULL;
 	} else {
-		object = 0;
+		object = NULL;
 		if (errorString)
 			*errorString = OSString::withCString(yyerror_message);
 	}
@@ -648,6 +680,8 @@ OSUnserialize(const char *buffer, OSString **errorString)
 
 	return object;
 }
+
+#endif // not __clang_analyzer__
 
 
 //

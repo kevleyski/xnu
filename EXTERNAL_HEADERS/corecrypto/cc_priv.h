@@ -1,34 +1,39 @@
-/*
- *  cc_priv.h
- *  corecrypto
+/* Copyright (c) (2010-2012,2014-2022) Apple Inc. All rights reserved.
  *
- *  Created by Michael Brouwer on 12/1/10.
- *  Copyright 2010,2011 Apple Inc. All rights reserved.
- *
+ * corecrypto is licensed under Apple Inc.’s Internal Use License Agreement (which
+ * is contained in the License.txt file distributed with corecrypto) and only to
+ * people who accept that license. IMPORTANT:  Any license rights granted to you by
+ * Apple Inc. (if any) are limited to internal use within your organization only on
+ * devices and computers you own or control, for the sole purpose of verifying the
+ * security characteristics and correct functioning of the Apple Software.  You may
+ * not, directly or indirectly, redistribute the Apple Software or any portions thereof.
  */
 
 #ifndef _CORECRYPTO_CC_PRIV_H_
 #define _CORECRYPTO_CC_PRIV_H_
 
 #include <corecrypto/cc.h>
-#include <stdint.h>
+
+CC_PTRCHECK_CAPABLE_HEADER()
+
+#if !CC_EXCLAVEKIT
+// Fork handlers for the stateful components of corecrypto.
+void cc_atfork_prepare(void);
+void cc_atfork_parent(void);
+void cc_atfork_child(void);
+#endif
+
+#ifndef __has_builtin
+#define __has_builtin(x) 0
+#endif
+
+#ifndef __DECONST
+#define __DECONST(type, var) ((type)(uintptr_t)(const void *)(var))
+#endif
 
 /* defines the following macros :
 
- CC_MEMCPY  : optimized memcpy.
- CC_MEMMOVE : optimized memmove.
- CC_MEMSET  : optimized memset.
- CC_BZERO   : optimized bzero.
-
- CC_STORE32_BE : store 32 bit value in big endian in unaligned buffer.
- CC_STORE32_LE : store 32 bit value in little endian in unaligned buffer.
- CC_STORE64_BE : store 64 bit value in big endian in unaligned buffer.
- CC_STORE64_LE : store 64 bit value in little endian in unaligned buffer.
-
- CC_LOAD32_BE : load 32 bit value in big endian from unaligned buffer.
- CC_LOAD32_LE : load 32 bit value in little endian from unaligned buffer.
- CC_LOAD64_BE : load 64 bit value in big endian from unaligned buffer.
- CC_LOAD64_LE : load 64 bit value in little endian from unaligned buffer.
+ CC_ARRAY_LEN: returns the number of elements in an array
 
  CC_ROR  : Rotate Right 32 bits. Rotate count can be a variable.
  CC_ROL  : Rotate Left 32 bits. Rotate count can be a variable.
@@ -45,318 +50,290 @@
  CC_H2BE32 : convert a 32 bits value between host and big endian order.
  CC_H2LE32 : convert a 32 bits value between host and little endian order.
 
-The following are not defined yet... define them if needed.
-
- CC_BSWAPc   : byte swap a 32 bits constant
-
  CC_BSWAP64  : byte swap a 64 bits variable
- CC_BSWAP64c : byte swap a 64 bits constant
-
- CC_READ_LE32 : read a 32 bits little endian value
- CC_READ_LE64 : read a 64 bits little endian value
- CC_READ_BE32 : read a 32 bits big endian value
- CC_READ_BE64 : read a 64 bits big endian value
-
- CC_WRITE_LE32 : write a 32 bits little endian value
- CC_WRITE_LE64 : write a 64 bits little endian value
- CC_WRITE_BE32 : write a 32 bits big endian value
- CC_WRITE_BE64 : write a 64 bits big endian value
 
  CC_H2BE64 : convert a 64 bits value between host and big endian order
  CC_H2LE64 : convert a 64 bits value between host and little endian order
- 
+
 */
 
-/* TODO: optimized versions */
-#define CC_MEMCPY(D,S,L) memcpy((D),(S),(L))
-#define CC_MEMMOVE(D,S,L) memmove((D),(S),(L))
-#define CC_MEMSET(D,V,L) memset((D),(V),(L))
-#define CC_BZERO(D,L) memset((D),0,(L))
+// RTKitOSPlatform should replace CC_MEMCPY with memcpy
+#define CC_MEMCPY(D,S,L) cc_memcpy((D),(S),(L))
+#define CC_MEMMOVE(D,S,L) cc_memmove((D),(S),(L))
+#define CC_MEMSET(D,V,L) cc_memset((D),(V),(L))
 
-
-#pragma mark - Loads and Store
-
-#pragma mark -- 32 bits - little endian
-
-#pragma mark --- Default version
-
-#define	CC_STORE32_LE(x, y) do {                                    \
-    ((unsigned char *)(y))[3] = (unsigned char)(((x)>>24)&255);		\
-    ((unsigned char *)(y))[2] = (unsigned char)(((x)>>16)&255);		\
-    ((unsigned char *)(y))[1] = (unsigned char)(((x)>>8)&255);		\
-    ((unsigned char *)(y))[0] = (unsigned char)((x)&255);			\
-} while(0)
-
-#define	CC_LOAD32_LE(x, y) do {                                     \
-x = ((uint32_t)(((unsigned char *)(y))[3] & 255)<<24) |			    \
-    ((uint32_t)(((unsigned char *)(y))[2] & 255)<<16) |			    \
-    ((uint32_t)(((unsigned char *)(y))[1] & 255)<<8)  |			    \
-    ((uint32_t)(((unsigned char *)(y))[0] & 255));				    \
-} while(0)
-
-#pragma mark -- 64 bits - little endian
-
-#define	CC_STORE64_LE(x, y) do {                                    \
-    ((unsigned char *)(y))[7] = (unsigned char)(((x)>>56)&255);     \
-    ((unsigned char *)(y))[6] = (unsigned char)(((x)>>48)&255);		\
-    ((unsigned char *)(y))[5] = (unsigned char)(((x)>>40)&255);		\
-    ((unsigned char *)(y))[4] = (unsigned char)(((x)>>32)&255);		\
-    ((unsigned char *)(y))[3] = (unsigned char)(((x)>>24)&255);		\
-    ((unsigned char *)(y))[2] = (unsigned char)(((x)>>16)&255);		\
-    ((unsigned char *)(y))[1] = (unsigned char)(((x)>>8)&255);		\
-    ((unsigned char *)(y))[0] = (unsigned char)((x)&255);			\
-} while(0)
-
-#define	CC_LOAD64_LE(x, y) do {                                     \
-x = (((uint64_t)(((unsigned char *)(y))[7] & 255))<<56) |           \
-    (((uint64_t)(((unsigned char *)(y))[6] & 255))<<48) |           \
-    (((uint64_t)(((unsigned char *)(y))[5] & 255))<<40) |           \
-    (((uint64_t)(((unsigned char *)(y))[4] & 255))<<32) |           \
-    (((uint64_t)(((unsigned char *)(y))[3] & 255))<<24) |           \
-    (((uint64_t)(((unsigned char *)(y))[2] & 255))<<16) |           \
-    (((uint64_t)(((unsigned char *)(y))[1] & 255))<<8)  |           \
-    (((uint64_t)(((unsigned char *)(y))[0] & 255)));                \
-} while(0)
-
-#pragma mark -- 32 bits - big endian
-#pragma mark --- intel version
-
-#if (defined(__i386__) || defined(__x86_64__))
-
-#define CC_STORE32_BE(x, y)     \
-    __asm__ __volatile__ (      \
-    "bswapl %0     \n\t"        \
-    "movl   %0,(%1)\n\t"        \
-    "bswapl %0     \n\t"        \
-    ::"r"(x), "r"(y))
-
-#define CC_LOAD32_BE(x, y)      \
-    __asm__ __volatile__ (      \
-    "movl (%1),%0\n\t"          \
-    "bswapl %0\n\t"             \
-    :"=r"(x): "r"(y))
-
+#if CC_EFI
+    void *cc_memcpy(void *dst, const void *src, size_t len);
+    #define cc_memcpy_nochk(dst, src, len) cc_memcpy((dst), (src), (len))
+#elif __has_builtin(__builtin___memcpy_chk) && !defined(_MSC_VER) && !CC_SGX && !CC_ARM_ARCH_6M
+    #define cc_memcpy(dst, src, len) __builtin___memcpy_chk((dst), (src), (len), __builtin_object_size((dst), 1))
+    #define cc_memcpy_nochk(dst, src, len) __builtin___memcpy_chk((dst), (src), (len), __builtin_object_size((dst), 0))
 #else
-#pragma mark --- default version
-#define	CC_STORE32_BE(x, y) do {                                \
-    ((unsigned char *)(y))[0] = (unsigned char)(((x)>>24)&255);	\
-    ((unsigned char *)(y))[1] = (unsigned char)(((x)>>16)&255);	\
-    ((unsigned char *)(y))[2] = (unsigned char)(((x)>>8)&255);	\
-    ((unsigned char *)(y))[3] = (unsigned char)((x)&255);       \
-} while(0)
-
-#define	CC_LOAD32_BE(x, y) do {                             \
-x = ((uint32_t)(((unsigned char *)(y))[0] & 255)<<24) |	    \
-    ((uint32_t)(((unsigned char *)(y))[1] & 255)<<16) |		\
-    ((uint32_t)(((unsigned char *)(y))[2] & 255)<<8)  |		\
-    ((uint32_t)(((unsigned char *)(y))[3] & 255));          \
-} while(0)
-
+    #define cc_memcpy(dst, src, len) memcpy((dst), (src), (len))
+    #define cc_memcpy_nochk(dst, src, len) memcpy((dst), (src), (len))
 #endif
 
-#pragma mark -- 64 bits - big endian
-
-#pragma mark --- intel 64 bits version
-
-#if defined(__x86_64__)
-
-#define	CC_STORE64_BE(x, y)   \
-__asm__ __volatile__ (        \
-"bswapq %0     \n\t"          \
-"movq   %0,(%1)\n\t"          \
-"bswapq %0     \n\t"          \
-::"r"(x), "r"(y))
-
-#define	CC_LOAD64_BE(x, y)    \
-__asm__ __volatile__ (        \
-"movq (%1),%0\n\t"            \
-"bswapq %0\n\t"               \
-:"=r"(x): "r"(y))
-
+#if CC_EFI
+    void *cc_memmove(void *dst, const void *src, size_t len);
+#elif __has_builtin(__builtin___memmove_chk) && !defined(_MSC_VER) && !CC_SGX && !CC_ARM_ARCH_6M
+    #define cc_memmove(dst, src, len) __builtin___memmove_chk((dst), (src), (len), __builtin_object_size((dst), 1))
 #else
-
-#pragma mark --- default version
-
-#define CC_STORE64_BE(x, y) do {                                    \
-    ((unsigned char *)(y))[0] = (unsigned char)(((x)>>56)&255);		\
-    ((unsigned char *)(y))[1] = (unsigned char)(((x)>>48)&255);		\
-    ((unsigned char *)(y))[2] = (unsigned char)(((x)>>40)&255);		\
-    ((unsigned char *)(y))[3] = (unsigned char)(((x)>>32)&255);		\
-    ((unsigned char *)(y))[4] = (unsigned char)(((x)>>24)&255);		\
-    ((unsigned char *)(y))[5] = (unsigned char)(((x)>>16)&255);		\
-    ((unsigned char *)(y))[6] = (unsigned char)(((x)>>8)&255);		\
-    ((unsigned char *)(y))[7] = (unsigned char)((x)&255);			\
-} while(0)
-
-#define	CC_LOAD64_BE(x, y) do {                                     \
-x = (((uint64_t)(((unsigned char *)(y))[0] & 255))<<56) |           \
-    (((uint64_t)(((unsigned char *)(y))[1] & 255))<<48) |           \
-    (((uint64_t)(((unsigned char *)(y))[2] & 255))<<40) |           \
-    (((uint64_t)(((unsigned char *)(y))[3] & 255))<<32) |           \
-    (((uint64_t)(((unsigned char *)(y))[4] & 255))<<24) |           \
-    (((uint64_t)(((unsigned char *)(y))[5] & 255))<<16) |           \
-    (((uint64_t)(((unsigned char *)(y))[6] & 255))<<8)  |          	\
-    (((uint64_t)(((unsigned char *)(y))[7] & 255)));	            \
-} while(0)
-
+    #define cc_memmove(dst, src, len) memmove((dst), (src), (len))
 #endif
 
-#pragma mark - 32-bit Rotates
-
-#if defined(_MSC_VER)
-#pragma mark -- MSVC version
-
-#include <stdlib.h>
-#pragma intrinsic(_lrotr,_lrotl)
-#define	CC_ROR(x,n) _lrotr(x,n)
-#define	CC_ROL(x,n) _lrotl(x,n)
-#define	CC_RORc(x,n) _lrotr(x,n)
-#define	CC_ROLc(x,n) _lrotl(x,n)
-
-#elif (defined(__i386__) || defined(__x86_64__))
-#pragma mark -- intel asm version
-
-static inline uint32_t CC_ROL(uint32_t word, int i)
-{
-    __asm__ ("roll %%cl,%0"
-         :"=r" (word)
-         :"0" (word),"c" (i));
-    return word;
-}
-
-static inline uint32_t CC_ROR(uint32_t word, int i)
-{
-    __asm__ ("rorl %%cl,%0"
-         :"=r" (word)
-         :"0" (word),"c" (i));
-    return word;
-}
-
-/* Need to be a macro here, because 'i' is an immediate (constant) */
-#define CC_ROLc(word, i)                \
-({  uint32_t _word=(word);              \
-    __asm__ __volatile__ ("roll %2,%0"  \
-        :"=r" (_word)                   \
-        :"0" (_word),"I" (i));          \
-    _word;                              \
-})
-
-
-#define CC_RORc(word, i)                \
-({  uint32_t _word=(word);              \
-    __asm__ __volatile__ ("rorl %2,%0"  \
-        :"=r" (_word)                   \
-        :"0" (_word),"I" (i));          \
-    _word;                              \
-})
-
+#if CC_EFI
+    void *cc_memset(void *dst, int val, size_t num);
+#elif __has_builtin(__builtin___memset_chk) && !defined(_MSC_VER) && !CC_SGX && !CC_ARM_ARCH_6M
+    #define cc_memset(dst, val, len) __builtin___memset_chk((dst), (val), (len), __builtin_object_size((dst), 1))
 #else
-
-#pragma mark -- default version
-
-static inline uint32_t CC_ROL(uint32_t word, int i)
-{
-    return ( (word<<(i&31)) | (word>>(32-(i&31))) );
-}
-
-static inline uint32_t CC_ROR(uint32_t word, int i)
-{
-    return ( (word>>(i&31)) | (word<<(32-(i&31))) );
-}
-
-#define	CC_ROLc(x, y) CC_ROL(x, y)
-#define	CC_RORc(x, y) CC_ROR(x, y)
-
+    #define cc_memset(dst, val, len) memset((dst), (val), (len))
 #endif
 
-#pragma mark - 64 bits rotates
+#define CC_ARRAY_LEN(x) (sizeof((x))/sizeof((x)[0]))
 
-#if defined(__x86_64__)
-#pragma mark -- intel 64 asm version
+// MARK: - Loads and Store
 
-static inline uint64_t CC_ROL64(uint64_t word, int i)
+// 64 bit load & store big endian
+#if defined(__x86_64__) && !defined(_MSC_VER)
+CC_INLINE void cc_store64_be(uint64_t x, uint8_t cc_sized_by(8) * y)
 {
-    __asm__("rolq %%cl,%0"
-        :"=r" (word)
-        :"0" (word),"c" (i));
-    return word;
+    __asm__("bswapq %1     \n\t"
+            "movq   %1, %0 \n\t"
+            "bswapq %1     \n\t"
+            : "=m"(*(y))
+            : "r"(x));
 }
-
-static inline uint64_t CC_ROR64(uint64_t word, int i)
+CC_INLINE uint64_t cc_load64_be(const uint8_t cc_sized_by(8) * y)
 {
-    __asm__("rorq %%cl,%0"
-        :"=r" (word)
-        :"0" (word),"c" (i));
-    return word;
+    uint64_t x;
+    __asm__("movq %1, %0 \n\t"
+            "bswapq %0   \n\t"
+            : "=r"(x)
+            : "m"(*(y)));
+    return x;
 }
-
-/* Need to be a macro here, because 'i' is an immediate (constant) */
-#define CC_ROL64c(word, i)      \
-({                              \
-    uint64_t _word=(word);      \
-    __asm__("rolq %2,%0"        \
-        :"=r" (_word)           \
-        :"0" (_word),"J" (i));  \
-    _word;                      \
-})
-
-#define CC_ROR64c(word, i)      \
-({                              \
-    uint64_t _word=(word);      \
-    __asm__("rorq %2,%0"        \
-        :"=r" (_word)           \
-        :"0" (_word),"J" (i));  \
-    _word;                      \
-})
-
-
-#else /* Not x86_64  */
-
-#pragma mark -- default C version
-
-static inline uint64_t CC_ROL64(uint64_t word, int i)
+#else
+CC_INLINE void cc_store64_be(uint64_t x, uint8_t cc_sized_by(8) * y)
 {
-    return ( (word<<(i&63)) | (word>>(64-(i&63))) );
+    y[0] = (uint8_t)(x >> 56);
+    y[1] = (uint8_t)(x >> 48);
+    y[2] = (uint8_t)(x >> 40);
+    y[3] = (uint8_t)(x >> 32);
+    y[4] = (uint8_t)(x >> 24);
+    y[5] = (uint8_t)(x >> 16);
+    y[6] = (uint8_t)(x >> 8);
+    y[7] = (uint8_t)(x);
 }
-
-static inline uint64_t CC_ROR64(uint64_t word, int i)
+CC_INLINE uint64_t cc_load64_be(const uint8_t cc_sized_by(8) * y)
 {
-    return ( (word>>(i&63)) | (word<<(64-(i&63))) );
+    return (((uint64_t)(y[0])) << 56) | (((uint64_t)(y[1])) << 48) | (((uint64_t)(y[2])) << 40) | (((uint64_t)(y[3])) << 32) |
+           (((uint64_t)(y[4])) << 24) | (((uint64_t)(y[5])) << 16) | (((uint64_t)(y[6])) << 8) | ((uint64_t)(y[7]));
 }
-
-#define	CC_ROL64c(x, y) CC_ROL64(x, y)
-#define	CC_ROR64c(x, y) CC_ROR64(x, y)
-
 #endif
 
-
-#pragma mark - Byte Swaps
-
-static inline uint32_t CC_BSWAP(uint32_t x)
+// 32 bit load & store big endian
+#if (defined(__i386__) || defined(__x86_64__)) && !defined(_MSC_VER)
+CC_INLINE void cc_store32_be(uint32_t x, uint8_t cc_sized_by(4) * y)
 {
-    return (
-        ((x>>24)&0x000000FF) |
-        ((x<<24)&0xFF000000) |
-        ((x>>8) &0x0000FF00) |
-        ((x<<8) &0x00FF0000)
-    );
+    __asm__("bswapl %1     \n\t"
+            "movl   %1, %0 \n\t"
+            "bswapl %1     \n\t"
+            : "=m"(*(y))
+            : "r"(x));
 }
+CC_INLINE uint32_t cc_load32_be(const uint8_t cc_sized_by(4) * y)
+{
+    uint32_t x;
+    __asm__("movl %1, %0 \n\t"
+            "bswapl %0   \n\t"
+            : "=r"(x)
+            : "m"(*(y)));
+    return x;
+}
+#else
+CC_INLINE void cc_store32_be(uint32_t x, uint8_t cc_sized_by(4) * y)
+{
+    y[0] = (uint8_t)(x >> 24);
+    y[1] = (uint8_t)(x >> 16);
+    y[2] = (uint8_t)(x >> 8);
+    y[3] = (uint8_t)(x);
+}
+CC_INLINE uint32_t cc_load32_be(const uint8_t cc_sized_by(4) * y)
+{
+    return (((uint32_t)(y[0])) << 24) | (((uint32_t)(y[1])) << 16) | (((uint32_t)(y[2])) << 8) | ((uint32_t)(y[3]));
+}
+#endif
+
+CC_INLINE void cc_store16_be(uint16_t x, uint8_t cc_sized_by(2) * y)
+{
+    y[0] = (uint8_t)(x >> 8);
+    y[1] = (uint8_t)(x);
+}
+CC_INLINE uint16_t cc_load16_be(const uint8_t cc_sized_by(2) * y)
+{
+    return (uint16_t) (((uint16_t)(y[0])) << 8) | ((uint16_t)(y[1]));
+}
+
+// 64 bit load & store little endian
+CC_INLINE void cc_store64_le(uint64_t x, uint8_t cc_sized_by(8) * y)
+{
+    y[7] = (uint8_t)(x >> 56);
+    y[6] = (uint8_t)(x >> 48);
+    y[5] = (uint8_t)(x >> 40);
+    y[4] = (uint8_t)(x >> 32);
+    y[3] = (uint8_t)(x >> 24);
+    y[2] = (uint8_t)(x >> 16);
+    y[1] = (uint8_t)(x >> 8);
+    y[0] = (uint8_t)(x);
+}
+CC_INLINE uint64_t cc_load64_le(const uint8_t cc_sized_by(8) * y)
+{
+    return (((uint64_t)(y[7])) << 56) | (((uint64_t)(y[6])) << 48) | (((uint64_t)(y[5])) << 40) | (((uint64_t)(y[4])) << 32) |
+           (((uint64_t)(y[3])) << 24) | (((uint64_t)(y[2])) << 16) | (((uint64_t)(y[1])) << 8) | ((uint64_t)(y[0]));
+}
+
+// 32 bit load & store little endian
+CC_INLINE void cc_store32_le(uint32_t x, uint8_t cc_sized_by(4) * y)
+{
+    y[3] = (uint8_t)(x >> 24);
+    y[2] = (uint8_t)(x >> 16);
+    y[1] = (uint8_t)(x >> 8);
+    y[0] = (uint8_t)(x);
+}
+CC_INLINE uint32_t cc_load32_le(const uint8_t cc_sized_by(4) * y)
+{
+    return (((uint32_t)(y[3])) << 24) | (((uint32_t)(y[2])) << 16) | (((uint32_t)(y[1])) << 8) | ((uint32_t)(y[0]));
+}
+
+#if (CCN_UNIT_SIZE == 8)
+ #define cc_load_le cc_load64_le
+ #define cc_store_le cc_store64_le
+#else
+ #define cc_load_le cc_load32_le
+ #define cc_store_le cc_store32_le
+#endif
+
+// MARK: - Byte Swaps
+
+#if __has_builtin(__builtin_bswap32)
+#define CC_BSWAP32(x) __builtin_bswap32(x)
+#else
+CC_INLINE uint32_t CC_BSWAP32(uint32_t x)
+{
+    return
+        ((x & 0xff000000) >> 24) |
+        ((x & 0x00ff0000) >>  8) |
+        ((x & 0x0000ff00) <<  8) |
+        ((x & 0x000000ff) << 24);
+}
+#endif
+
+#if __has_builtin(__builtin_bswap64)
+#define CC_BSWAP64(x) __builtin_bswap64(x)
+#else
+CC_INLINE uint64_t CC_BSWAP64(uint64_t x)
+{
+    return
+        ((x & 0xff00000000000000ULL) >> 56) |
+        ((x & 0x00ff000000000000ULL) >> 40) |
+        ((x & 0x0000ff0000000000ULL) >> 24) |
+        ((x & 0x000000ff00000000ULL) >>  8) |
+        ((x & 0x00000000ff000000ULL) <<  8) |
+        ((x & 0x0000000000ff0000ULL) << 24) |
+        ((x & 0x000000000000ff00ULL) << 40) |
+        ((x & 0x00000000000000ffULL) << 56);
+}
+#endif
 
 #ifdef __LITTLE_ENDIAN__
-#define CC_H2BE32(x) CC_BSWAP(x)
+#define CC_H2BE32(x) CC_BSWAP32(x)
 #define CC_H2LE32(x) (x)
+#define CC_H2BE64(x) CC_BSWAP64(x)
+#define CC_H2LE64(x) (x)
 #else
-#error not good.
 #define CC_H2BE32(x) (x)
-#define CC_H2LE32(x) CC_BSWAP(x)
+#define CC_H2LE32(x) CC_BSWAP32(x)
+#define CC_H2BE64(x) (x)
+#define CC_H2LE64(x) CC_BSWAP64(x)
 #endif
 
+#define cc_ceiling(a,b)  (((a)+((b)-1))/(b))
+#define CC_BITLEN_TO_BYTELEN(x) cc_ceiling((x), 8)
 
-/* extract a byte portably */
-#ifdef _MSC_VER
-#define cc_byte(x, n) ((unsigned char)((x) >> (8 * (n))))
+#define CC_PROVIDES_ABORT (!(CC_BASEBAND || CC_EFI || CC_RTKITROM || CC_USE_SEPROM))
+
+/*!
+ @function cc_abort
+ @abstract Abort execution unconditionally
+ */
+CC_NORETURN
+void cc_abort(const char *msg);
+
+/*!
+  @function cc_try_abort
+  @abstract Abort execution iff the platform provides a function like @p abort() or @p panic()
+
+  @discussion If the platform does not provide a means to abort execution, this function does nothing; therefore, callers should return an error code after calling this function.
+*/
+void cc_try_abort(const char *msg);
+
+#if __has_builtin(__builtin_expect)
+ #define CC_LIKELY(cond) __builtin_expect(!!(cond), 1)
+ #define CC_UNLIKELY(cond) __builtin_expect(!!(cond), 0)
 #else
-#define cc_byte(x, n) (((x) >> (8 * (n))) & 255)
+ #define CC_LIKELY(cond) cond
+ #define CC_UNLIKELY(cond) cond
 #endif
+
+#define cc_abort_if(cond, msg)                  \
+    do {                                        \
+        if (CC_UNLIKELY(cond)) {                \
+            cc_abort(msg);                      \
+        }                                       \
+    } while (0)
+
+void cc_try_abort_if(bool condition, const char *msg);
+
+/*
+  Unfortunately, since we export this symbol, this declaration needs
+  to be in a public header to satisfy TAPI.
+
+  See fipspost_trace_priv.h for more details.
+*/
+extern const void *fipspost_trace_vtable;
+
+
+// MARK: -- Deprecated macros
+/*
+ Use `cc_store32_be`, `cc_store32_le`, `cc_store64_be`, `cc_store64_le`, and
+ `cc_load32_be`, `cc_load32_le`, `cc_load64_be`, `cc_load64_le` instead.
+ 
+ CC_STORE32_BE : store 32 bit value in big endian in unaligned buffer.
+ CC_STORE32_LE : store 32 bit value in little endian in unaligned buffer.
+ CC_STORE64_BE : store 64 bit value in big endian in unaligned buffer.
+ CC_STORE64_LE : store 64 bit value in little endian in unaligned buffer.
+ CC_LOAD32_BE : load 32 bit value in big endian from unaligned buffer.
+ CC_LOAD32_LE : load 32 bit value in little endian from unaligned buffer.
+ CC_LOAD64_BE : load 64 bit value in big endian from unaligned buffer.
+ CC_LOAD64_LE : load 64 bit value in little endian from unaligned buffer.
+ CC_READ_LE32 : read a 32 bits little endian value
+ CC_WRITE_LE32 : write a 32 bits little endian value
+ CC_WRITE_LE64 : write a 64 bits little endian value
+*/
+
+#define CC_STORE32_BE(x, y) cc_store32_be((uint32_t)(x), (uint8_t *)(y))
+#define CC_STORE32_LE(x, y) cc_store32_le((uint32_t)(x), (uint8_t *)(y))
+#define CC_STORE64_BE(x, y) cc_store64_be((uint64_t)(x), (uint8_t *)(y))
+#define CC_STORE64_LE(x, y) cc_store64_le((uint64_t)(x), (uint8_t *)(y))
+
+#define CC_LOAD32_BE(x, y) ((x) = cc_load32_be((uint8_t *)(y)))
+#define CC_LOAD32_LE(x, y) ((x) = cc_load32_le((uint8_t *)(y)))
+#define CC_LOAD64_BE(x, y) ((x) = cc_load64_be((uint8_t *)(y)))
+#define CC_LOAD64_LE(x, y) ((x) = cc_load64_le((uint8_t *)(y)))
+
+#define CC_READ_LE32(ptr) cc_load32_le((uint8_t *)(ptr))
+
+#define CC_WRITE_LE32(ptr, x) cc_store32_le((uint32_t)(x), (uint8_t *)(ptr))
+#define CC_WRITE_LE64(ptr, x) cc_store64_le((uint64_t)(x), (uint8_t *)(ptr))
 
 #endif /* _CORECRYPTO_CC_PRIV_H_ */

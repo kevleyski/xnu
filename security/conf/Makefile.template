@@ -17,13 +17,7 @@ include $(MakeInc_def)
 # XXX: CFLAGS
 #
 CFLAGS+= -include meta_features.h -DBSD_KERNEL_PRIVATE
-
-# Objects that don't want -Wcast-align warning (8474835)
-OBJS_NO_CAST_ALIGN =		\
-		mac_alloc.o	\
-		mac_base.o
-
-$(foreach file,$(OBJS_NO_CAST_ALIGN),$(eval $(call add_perfile_cflags,$(file),-Wno-cast-align)))
+SFLAGS+= -include meta_features.h
 
 #
 # INCFLAGS to include security prototypes
@@ -33,21 +27,13 @@ INCFLAGS_MAKEFILE= -I$(SOURCE)/..
 #
 # Directories for mig generated files
 #
-COMP_SUBDIRS = 
+COMP_SUBDIRS =
 
 #
 #  Make sure we don't remove this by accident if interrupted at the wrong
 #  time.
 #
 .PRECIOUS: Makefile
-
-VERSION_FILES= \
-	$(SOURCE_DIR)/$(COMPONENT)/conf/version.major  \
-	$(SOURCE_DIR)/$(COMPONENT)/conf/version.minor   \
-	$(SOURCE_DIR)/$(COMPONENT)/conf/version.variant
-
-COPYRIGHT_FILES = \
-	$(SOURCE_DIR)/$(COMPONENT)/conf/copyright.nai
 
 #
 #  Theses macros are filled in by the config program depending on the
@@ -59,38 +45,66 @@ COPYRIGHT_FILES = \
 
 %OBJS
 
+%LIBOBJS
+
 %CFILES
+
+%CXXFILES
 
 %SFILES
 
 %MACHDEP
 
 #
-#  OBJSDEPS is the set of files (defined in the machine dependent
-#  template if necessary) which all objects depend on (such as an
-#  in-line assembler expansion filter)
+# Diagnostic opt-outs.  We need to make this list empty.
 #
-${OBJS}: ${OBJSDEPS}
+# DO NOT ADD MORE HERE.
+#
+# -Wno-cast-align
+mac_base.o_CWARNFLAGS_ADD += -Wno-cast-align
+# -Wno-shorten-64-to-32
+mac_audit.o_CWARNFLAGS_ADD += -Wno-shorten-64-to-32
+mac_base.o_CWARNFLAGS_ADD += -Wno-shorten-64-to-32
+mac_process.o_CWARNFLAGS_ADD += -Wno-shorten-64-to-32
+# -Wno-sign-conversion
+mac_base.o_CWARNFLAGS_ADD += -Wno-sign-conversion
+mac_mach.o_CWARNFLAGS_ADD += -Wno-sign-conversion
+mac_vfs.o_CWARNFLAGS_ADD += -Wno-sign-conversion
+mac_vfs_subr.o_CWARNFLAGS_ADD += -Wno-sign-conversion
 
-LDOBJS = $(OBJS)
+# Rebuild if per-file overrides change
+${OBJS}: $(firstword $(MAKEFILE_LIST))
 
-$(COMPONENT).filelist: $(LDOBJS) vers.o
-	@echo LDFILELIST $(COMPONENT)
-	$(_v)( for obj in ${LDOBJS} vers.o; do	\
-		 echo $(TARGET)/$(CURRENT_KERNEL_CONFIG)/$${obj}; \
-	done; ) > $(COMPONENT).filelist
+# Rebuild if global compile flags change
+$(COBJS): .CFLAGS
+.CFLAGS: ALWAYS
+	$(_v)$(REPLACECONTENTS) $@ $(KCC) $(CFLAGS) $(INCFLAGS)
+$(CXXOBJS): .CXXFLAGS
+.CXXFLAGS: ALWAYS
+	$(_v)$(REPLACECONTENTS) $@ $(KC++) $(CXXFLAGS) $(INCFLAGS)
+$(SOBJS): .SFLAGS
+.SFLAGS: ALWAYS
+	$(_v)$(REPLACECONTENTS) $@ $(S_KCC) $(SFLAGS) $(INCFLAGS)
 
+$(COMPONENT).filelist: $(OBJS)
+	@$(LOG_LDFILELIST) "$(COMPONENT)"
+	$(_v)for obj in ${OBJS}; do	\
+		 $(ECHO) $(TARGET)/$(CURRENT_KERNEL_CONFIG)/$${obj}; \
+	done > $(COMPONENT).filelist
+
+$(COMPONENT).libfilelist: $(LIBOBJS)
+	@$(LOG_LDFILELIST) "lib$(COMPONENT)"
+	$(_v)for obj in ${LIBOBJS}; do	\
+		 $(ECHO) $(TARGET)/$(CURRENT_KERNEL_CONFIG)/$${obj}; \
+	done > $(COMPONENT).libfilelist
+
+ifeq ($(RC_ProjectName),xnu_libraries)
+do_all: $(COMPONENT).libfilelist
+else
 do_all: $(COMPONENT).filelist
+endif
 
 do_build_all:: do_all
-
-vers.o: vers.c
-	@echo CC $@
-	$(_v)${KCC} $(CFLAGS) -o ${@} -c ${INCFLAGS} $<
-
-vers.c:
-	$(_v)$(SRCROOT)/SETUP/newvers \
-		`$(CAT) ${VERSION_FILES}` ${COPYRIGHT_FILES}
 
 %RULES
 

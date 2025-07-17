@@ -24,10 +24,6 @@
  * Use is subject to license terms.
  */
 
-/*
- * #pragma ident	"@(#)dtrace_subr.c	1.16	07/09/18 SMI"
- */
-
 #include <sys/dtrace.h>
 #include <sys/dtrace_glue.h>
 #include <sys/dtrace_impl.h>
@@ -45,7 +41,6 @@ int (*dtrace_return_probe_ptr)(x86_saved_state_t *);
  * here. FIXME!
  */
 #define	T_INT3			3		/* int 3 instruction */
-#define T_DTRACE_RET		0x7f		/* DTrace pid return */
 
 kern_return_t
 dtrace_user_probe(x86_saved_state_t *);
@@ -78,16 +73,15 @@ dtrace_user_probe(x86_saved_state_t *regs)
         }
 
 	lck_rw_t *rwp;
-	struct proc *p = current_proc();
 
-	uthread_t uthread = (uthread_t)get_bsdthread_info(current_thread());
+	uthread_t uthread = current_uthread();
 	if (user_mode /*|| (rp->r_ps & PS_VM)*/) {
 		/*
 		 * DTrace accesses t_cred in probe context.  t_cred
 		 * must always be either NULL, or point to a valid,
 		 * allocated cred structure.
 		 */
-		kauth_cred_uthread_update(uthread, p);
+		current_cached_proc_cred_update();
 	}
 
 	if (trapno == T_DTRACE_RET) {
@@ -130,7 +124,7 @@ dtrace_user_probe(x86_saved_state_t *regs)
 			if (regs64) {
 				regs64->isf.rip = npc;
 			} else {
-				regs32->eip = npc;
+				regs32->eip = (uint32_t)npc;
 			}
 			return KERN_SUCCESS;
 		}
@@ -149,7 +143,7 @@ dtrace_user_probe(x86_saved_state_t *regs)
 		if (regs64) {
 			regs64->isf.rip = npc;
 		} else {
-			regs32->eip = npc;
+			regs32->eip = (uint32_t)npc;
 		}
 
 		return KERN_SUCCESS;
@@ -205,105 +199,7 @@ dtrace_user_probe(x86_saved_state_t *regs)
 }
 
 void
-dtrace_safe_synchronous_signal(void)
+dtrace_flush_caches(void)
 {
-#if 0
-	kthread_t *t = curthread;
-	struct regs *rp = lwptoregs(ttolwp(t));
-	size_t isz = t->t_dtrace_npc - t->t_dtrace_pc;
 
-	ASSERT(t->t_dtrace_on);
-
-	/*
-	 * If we're not in the range of scratch addresses, we're not actually
-	 * tracing user instructions so turn off the flags. If the instruction
-	 * we copied out caused a synchonous trap, reset the pc back to its
-	 * original value and turn off the flags.
-	 */
-	if (rp->r_pc < t->t_dtrace_scrpc ||
-			rp->r_pc > t->t_dtrace_astpc + isz) {
-		t->t_dtrace_ft = 0;
-	} else if (rp->r_pc == t->t_dtrace_scrpc ||
-			rp->r_pc == t->t_dtrace_astpc) {
-		rp->r_pc = t->t_dtrace_pc;
-		t->t_dtrace_ft = 0;
-	}
-#endif /* 0 */
-}
-
-int
-dtrace_safe_defer_signal(void)
-{
-#if 0
-	kthread_t *t = curthread;
-	struct regs *rp = lwptoregs(ttolwp(t));
-	size_t isz = t->t_dtrace_npc - t->t_dtrace_pc;
-
-	ASSERT(t->t_dtrace_on);
-
-	/*
-	 * If we're not in the range of scratch addresses, we're not actually
-	 * tracing user instructions so turn off the flags.
-	 */
-	if (rp->r_pc < t->t_dtrace_scrpc ||
-			rp->r_pc > t->t_dtrace_astpc + isz) {
-		t->t_dtrace_ft = 0;
-		return (0);
-	}
-
-	/*
-	 * If we've executed the original instruction, but haven't performed
-	 * the jmp back to t->t_dtrace_npc or the clean up of any registers
-	 * used to emulate %rip-relative instructions in 64-bit mode, do that
-	 * here and take the signal right away. We detect this condition by
-	 * seeing if the program counter is the range [scrpc + isz, astpc).
-	 */
-	if (t->t_dtrace_astpc - rp->r_pc <
-			t->t_dtrace_astpc - t->t_dtrace_scrpc - isz) {
-#ifdef __sol64
-		/*
-		 * If there is a scratch register and we're on the
-		 * instruction immediately after the modified instruction,
-		 * restore the value of that scratch register.
-		 */
-		if (t->t_dtrace_reg != 0 &&
-				rp->r_pc == t->t_dtrace_scrpc + isz) {
-			switch (t->t_dtrace_reg) {
-				case REG_RAX:
-					rp->r_rax = t->t_dtrace_regv;
-					break;
-				case REG_RCX:
-					rp->r_rcx = t->t_dtrace_regv;
-					break;
-				case REG_R8:
-					rp->r_r8 = t->t_dtrace_regv;
-					break;
-				case REG_R9:
-					rp->r_r9 = t->t_dtrace_regv;
-					break;
-			}
-		}
-#endif
-		rp->r_pc = t->t_dtrace_npc;
-		t->t_dtrace_ft = 0;
-		return (0);
-	}
-
-	/*
-	 * Otherwise, make sure we'll return to the kernel after executing
-	 * the copied out instruction and defer the signal.
-	 */
-	if (!t->t_dtrace_step) {
-		ASSERT(rp->r_pc < t->t_dtrace_astpc);
-		rp->r_pc += t->t_dtrace_astpc - t->t_dtrace_scrpc;
-		t->t_dtrace_step = 1;
-	}
-
-	t->t_dtrace_ast = 1;
-
-	return (1);
-
-#endif /* 0 */
-
-	return 0;
 }

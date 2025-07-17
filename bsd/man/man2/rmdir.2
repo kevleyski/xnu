@@ -46,7 +46,7 @@
 .Fa "const char *path"
 .Fc
 .Sh DESCRIPTION
-.Fn Rmdir
+.Fn rmdir
 removes a directory file
 whose name is given by
 .Fa path .
@@ -116,7 +116,8 @@ The directory entry to be removed resides on a read-only file system.
 .El
 .Sh SEE ALSO
 .Xr mkdir 2 ,
-.Xr unlink 2
+.Xr unlink 2 ,
+.Xr unlinkat 2
 .Sh HISTORY
 The
 .Fn rmdir

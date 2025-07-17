@@ -2,7 +2,7 @@
  * Copyright (c) 2007 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
- * 
+ *
  * This file contains Original Code and/or Modifications of Original Code
  * as defined in and that are subject to the Apple Public Source License
  * Version 2.0 (the 'License'). You may not use this file except in
@@ -11,10 +11,10 @@
  * unlawful or unlicensed copies of an Apple operating system, or to
  * circumvent, violate, or enable the circumvention or violation of, any
  * terms of an Apple operating system software license agreement.
- * 
+ *
  * Please obtain a copy of the License at
  * http://www.opensource.apple.com/apsl/ and read it before using this file.
- * 
+ *
  * The Original Code and all software distributed under the License are
  * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
@@ -22,7 +22,7 @@
  * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
  * Please see the License for the specific language governing rights and
  * limitations under the License.
- * 
+ *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
 
@@ -74,26 +74,17 @@ mac_system_check_acct(kauth_cred_t cred, struct vnode *vp)
 {
 	int error;
 
-	if (!mac_system_enforce)
-		return (0);
+#if SECURITY_MAC_CHECK_ENFORCE
+	/* 21167099 - only check if we allow write */
+	if (!mac_system_enforce) {
+		return 0;
+	}
+#endif
 
 	MAC_CHECK(system_check_acct, cred, vp,
-	    vp != NULL ? vp->v_label : NULL);
+	    vp != NULL ? mac_vnode_label(vp) : NULL);
 
-	return (error);
-}
-
-int
-mac_system_check_chud(kauth_cred_t cred)
-{
-	int error;
-
-	if (!mac_system_enforce)
-		return (0);
-
-	MAC_CHECK(system_check_chud, cred);
-
-	return (error);
+	return error;
 }
 
 int
@@ -101,12 +92,16 @@ mac_system_check_host_priv(kauth_cred_t cred)
 {
 	int error;
 
-	if (!mac_system_enforce)
-		return (0);
+#if SECURITY_MAC_CHECK_ENFORCE
+	/* 21167099 - only check if we allow write */
+	if (!mac_system_enforce) {
+		return 0;
+	}
+#endif
 
 	MAC_CHECK(system_check_host_priv, cred);
 
-	return (error);
+	return error;
 }
 
 int
@@ -114,12 +109,16 @@ mac_system_check_info(kauth_cred_t cred, const char *info_type)
 {
 	int error;
 
-	if (!mac_system_enforce)
-		return (0);
+#if SECURITY_MAC_CHECK_ENFORCE
+	/* 21167099 - only check if we allow write */
+	if (!mac_system_enforce) {
+		return 0;
+	}
+#endif
 
 	MAC_CHECK(system_check_info, cred, info_type);
 
-	return (error);
+	return error;
 }
 
 int
@@ -127,12 +126,16 @@ mac_system_check_nfsd(kauth_cred_t cred)
 {
 	int error;
 
-	if (!mac_system_enforce)
-		return (0);
+#if SECURITY_MAC_CHECK_ENFORCE
+	/* 21167099 - only check if we allow write */
+	if (!mac_system_enforce) {
+		return 0;
+	}
+#endif
 
 	MAC_CHECK(system_check_nfsd, cred);
 
-	return (error);
+	return error;
 }
 
 int
@@ -140,25 +143,34 @@ mac_system_check_reboot(kauth_cred_t cred, int howto)
 {
 	int error;
 
-	if (!mac_system_enforce)
-		return (0);
+#if SECURITY_MAC_CHECK_ENFORCE
+	/* 21167099 - only check if we allow write */
+	if (!mac_system_enforce) {
+		return 0;
+	}
+#endif
 
 	MAC_CHECK(system_check_reboot, cred, howto);
 
-	return (error);
+	return error;
 }
+
 
 int
 mac_system_check_settime(kauth_cred_t cred)
 {
 	int error;
 
-	if (!mac_system_enforce)
-		return (0);
+#if SECURITY_MAC_CHECK_ENFORCE
+	/* 21167099 - only check if we allow write */
+	if (!mac_system_enforce) {
+		return 0;
+	}
+#endif
 
 	MAC_CHECK(system_check_settime, cred);
 
-	return (error);
+	return error;
 }
 
 int
@@ -166,11 +178,15 @@ mac_system_check_swapon(kauth_cred_t cred, struct vnode *vp)
 {
 	int error;
 
-	if (!mac_system_enforce)
-		return (0);
+#if SECURITY_MAC_CHECK_ENFORCE
+	/* 21167099 - only check if we allow write */
+	if (!mac_system_enforce) {
+		return 0;
+	}
+#endif
 
-	MAC_CHECK(system_check_swapon, cred, vp, vp->v_label);
-	return (error);
+	MAC_CHECK(system_check_swapon, cred, vp, mac_vnode_label(vp));
+	return error;
 }
 
 int
@@ -178,32 +194,35 @@ mac_system_check_swapoff(kauth_cred_t cred, struct vnode *vp)
 {
 	int error;
 
+#if SECURITY_MAC_CHECK_ENFORCE
+	/* 21167099 - only check if we allow write */
+	if (!mac_system_enforce) {
+		return 0;
+	}
+#endif
 
-
-	if (!mac_system_enforce)
-		return (0);
-
-	MAC_CHECK(system_check_swapoff, cred, vp, vp->v_label);
-	return (error);
+	MAC_CHECK(system_check_swapoff, cred, vp, mac_vnode_label(vp));
+	return error;
 }
 
 int
-mac_system_check_sysctl(kauth_cred_t cred, int *name, u_int namelen,
-    user_addr_t old, user_addr_t oldlenp, int inkernel, user_addr_t new, size_t newlen)
+mac_system_check_sysctlbyname(kauth_cred_t cred, const char *namestring, int *name,
+    size_t namelen, user_addr_t oldctl, size_t oldlen,
+    user_addr_t newctl, size_t newlen)
 {
 	int error;
 
-	/*
-	 * XXXMAC: We're very much like to assert the SYSCTL_LOCK here,
-	 * but since it's not exported from kern_sysctl.c, we can't.
-	 */
-	if (!mac_system_enforce)
-		return (0);
+#if SECURITY_MAC_CHECK_ENFORCE
+	/* 21167099 - only check if we allow write */
+	if (!mac_system_enforce) {
+		return 0;
+	}
+#endif
 
-	MAC_CHECK(system_check_sysctl, cred, name, namelen, old, oldlenp,
-	    inkernel, new, newlen);
+	MAC_CHECK(system_check_sysctlbyname, cred, namestring,
+	    name, namelen, oldctl, oldlen, newctl, newlen);
 
-	return (error);
+	return error;
 }
 
 int
@@ -211,10 +230,14 @@ mac_system_check_kas_info(kauth_cred_t cred, int selector)
 {
 	int error;
 
-	if (!mac_system_enforce)
-		return (0);
+#if SECURITY_MAC_CHECK_ENFORCE
+	/* 21167099 - only check if we allow write */
+	if (!mac_system_enforce) {
+		return 0;
+	}
+#endif
 
 	MAC_CHECK(system_check_kas_info, cred, selector);
 
-	return (error);
+	return error;
 }

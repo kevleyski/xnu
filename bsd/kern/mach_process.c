@@ -2,7 +2,7 @@
  * Copyright (c) 2000-2006 Apple Computer, Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
- * 
+ *
  * This file contains Original Code and/or Modifications of Original Code
  * as defined in and that are subject to the Apple Public Source License
  * Version 2.0 (the 'License'). You may not use this file except in
@@ -11,10 +11,10 @@
  * unlawful or unlicensed copies of an Apple operating system, or to
  * circumvent, violate, or enable the circumvention or violation of, any
  * terms of an Apple operating system software license agreement.
- * 
+ *
  * Please obtain a copy of the License at
  * http://www.opensource.apple.com/apsl/ and read it before using this file.
- * 
+ *
  * The Original Code and all software distributed under the License are
  * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
@@ -22,7 +22,7 @@
  * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
  * Please see the License for the specific language governing rights and
  * limitations under the License.
- * 
+ *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
 /* Copyright (c) 1995 NeXT Computer, Inc. All Rights Reserved */
@@ -83,27 +83,30 @@
 #include <sys/mount_internal.h>
 #include <sys/sysproto.h>
 #include <sys/kdebug.h>
-#include <sys/codesign.h>		/* cs_allow_invalid() */
+#include <sys/codesign.h>               /* cs_allow_invalid() */
 
 #include <security/audit/audit.h>
 
 #include <kern/task.h>
 #include <kern/thread.h>
 
-#include <mach/task.h>			/* for task_resume() */
-#include <kern/sched_prim.h>		/* for thread_exception_return() */
+#include <mach/task.h>                  /* for task_resume() */
+#include <kern/sched_prim.h>            /* for thread_exception_return() */
 
 #include <pexpert/pexpert.h>
+
+#if CONFIG_MACF
+#include <security/mac_framework.h>
+#endif
 
 /* XXX ken/bsd_kern.c - prototype should be in common header */
 int get_task_userstop(task_t);
 
 /* Macros to clear/set/test flags. */
-#define	SET(t, f)	(t) |= (f)
-#define	CLR(t, f)	(t) &= ~(f)
-#define	ISSET(t, f)	((t) & (f))
+#define SET(t, f)       (t) |= (f)
+#define CLR(t, f)       (t) &= ~(f)
+#define ISSET(t, f)     ((t) & (f))
 
-extern thread_t	port_name_to_thread(mach_port_name_t port_name);
 extern thread_t get_firstthread(task_t);
 
 
@@ -114,10 +117,11 @@ extern thread_t get_firstthread(task_t);
 int
 ptrace(struct proc *p, struct ptrace_args *uap, int32_t *retval)
 {
-	struct proc *t = current_proc();	/* target process */
-	task_t		task;
-	thread_t	th_act;
-	struct uthread 	*ut;
+	struct proc     *t; /* target process */
+	struct proc_ident tident; /* target ident */
+	task_t          task;
+	thread_t        th_act = THREAD_NULL;
+	struct uthread  *ut;
 	int tr_sigexc = 0;
 	int error = 0;
 	int stopped = 0;
@@ -128,103 +132,168 @@ ptrace(struct proc *p, struct ptrace_args *uap, int32_t *retval)
 	AUDIT_ARG(value32, uap->data);
 
 	if (uap->req == PT_DENY_ATTACH) {
+#if (DEVELOPMENT || DEBUG) && !defined(XNU_TARGET_OS_OSX)
+		if (PE_i_can_has_debugger(NULL)) {
+			return 0;
+		}
+#endif
 		proc_lock(p);
 		if (ISSET(p->p_lflag, P_LTRACED)) {
 			proc_unlock(p);
 			KERNEL_DEBUG_CONSTANT(BSDDBG_CODE(DBG_BSD_PROC, BSD_PROC_FRCEXIT) | DBG_FUNC_NONE,
-					      p->p_pid, W_EXITCODE(ENOTSUP, 0), 4, 0, 0);
+			    proc_getpid(p), W_EXITCODE(ENOTSUP, 0), 4, 0, 0);
 			exit1(p, W_EXITCODE(ENOTSUP, 0), retval);
-			/* drop funnel before we return */
+
 			thread_exception_return();
 			/* NOTREACHED */
 		}
 		SET(p->p_lflag, P_LNOATTACH);
 		proc_unlock(p);
 
-		return(0);
+		return 0;
 	}
 
 	if (uap->req == PT_FORCEQUOTA) {
 		if (kauth_cred_issuser(kauth_cred_get())) {
+			t = current_proc();
 			OSBitOrAtomic(P_FORCEQUOTA, &t->p_flag);
-			return (0);
-		} else
-			return (EPERM);
+			return 0;
+		} else {
+			return EPERM;
+		}
 	}
 
 	/*
 	 *	Intercept and deal with "please trace me" request.
-	 */	 
+	 */
 	if (uap->req == PT_TRACE_ME) {
+retry_trace_me: ;
+		proc_t pproc = proc_parent(p);
+		if (pproc == NULL) {
+			return EINVAL;
+		}
+		/* holding ref on pproc */
+
+#if CONFIG_MACF
+		/*
+		 * NB: Cannot call kauth_authorize_process(..., KAUTH_PROCESS_CANTRACE, ...)
+		 *     since that assumes the process being checked is the current process
+		 *     when, in this case, it is the current process's parent.
+		 *     Most of the other checks in cantrace() don't apply either.
+		 */
+		struct proc_ident p_ident = proc_ident(p);
+		struct proc_ident pproc_ident = proc_ident(pproc);
+		kauth_cred_t pproc_cred = kauth_cred_proc_ref(pproc);
+
+		/* Release pproc and find it again after MAC call to avoid deadlock */
+		proc_rele(pproc);
+		error = mac_proc_check_debug(&pproc_ident, pproc_cred, &p_ident);
+		kauth_cred_unref(&pproc_cred);
+
+		if (error != 0) {
+			return error;
+		}
+		if (proc_find_ident(&pproc_ident) == PROC_NULL) {
+			return ESRCH;
+		}
+		/* re-holding ref on pproc */
+#endif
 		proc_lock(p);
+		/* Make sure the process wasn't re-parented. */
+		if (p->p_ppid != proc_getpid(pproc)) {
+			proc_unlock(p);
+			proc_rele(pproc);  /* pproc ref released */
+			goto retry_trace_me;
+		}
 		SET(p->p_lflag, P_LTRACED);
 		/* Non-attached case, our tracer is our parent. */
 		p->p_oppid = p->p_ppid;
-		/* Check whether child and parent are allowed to run modified
-		 * code (they'll have to) */
-		struct proc *pproc=proc_find(p->p_oppid);
 		proc_unlock(p);
+		/* Child and parent will have to be able to run modified code. */
 		cs_allow_invalid(p);
-		if(pproc) {
-			cs_allow_invalid(pproc);
-			proc_rele(pproc);
-		}
-		return(0);
+		cs_allow_invalid(pproc);
+		proc_rele(pproc);  /* pproc ref released */
+
+		return error;
 	}
 	if (uap->req == PT_SIGEXC) {
 		proc_lock(p);
 		if (ISSET(p->p_lflag, P_LTRACED)) {
 			SET(p->p_lflag, P_LSIGEXC);
 			proc_unlock(p);
-			return(0);
+			return 0;
 		} else {
 			proc_unlock(p);
-			return(EINVAL);
+			return EINVAL;
 		}
 	}
 
-	/* 
-	 * We do not want ptrace to do anything with kernel or launchd 
+	/*
+	 * We do not want ptrace to do anything with kernel or launchd
 	 */
 	if (uap->pid < 2) {
-		return(EPERM);
+		return EPERM;
 	}
 
+retry_proc_find:
 	/*
 	 *	Locate victim, and make sure it is traceable.
 	 */
-	if ((t = proc_find(uap->pid)) == NULL)
-			return (ESRCH);
+	if ((t = proc_find(uap->pid)) == NULL) {
+		return ESRCH;
+	}
+
+	/* Check if the proc has trace wait flag set */
+	if (t->p_lflag & P_LTRACE_WAIT) {
+		proc_rele(t);
+		delay(1);
+		goto retry_proc_find;
+	}
 
 	AUDIT_ARG(process, t);
 
-	task = t->task;
+	task = proc_task(t);
+	tident = proc_ident(t);
 	if (uap->req == PT_ATTACHEXC) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
 		uap->req = PT_ATTACH;
 		tr_sigexc = 1;
 	}
 	if (uap->req == PT_ATTACH) {
-		int		err;
-		
-		if ( kauth_authorize_process(proc_ucred(p), KAUTH_PROCESS_CANTRACE, 
-									 t, (uintptr_t)&err, 0, 0) == 0 ) {
+#pragma clang diagnostic pop
+		int             err, cb_err;
+
+#if !defined(XNU_TARGET_OS_OSX)
+		if (tr_sigexc == 0) {
+			error = ENOTSUP;
+			goto out;
+		}
+#endif
+
+		err = kauth_authorize_process(kauth_cred_get(), KAUTH_PROCESS_CANTRACE,
+		    t, (uintptr_t)&cb_err, 0, 0);
+
+		if (err == 0) {
 			/* it's OK to attach */
 			proc_lock(t);
 			SET(t->p_lflag, P_LTRACED);
-			if (tr_sigexc) 
+			if (tr_sigexc) {
 				SET(t->p_lflag, P_LSIGEXC);
-	
+			}
+
 			t->p_oppid = t->p_ppid;
 			/* Check whether child and parent are allowed to run modified
 			 * code (they'll have to) */
 			proc_unlock(t);
 			cs_allow_invalid(t);
 			cs_allow_invalid(p);
-			if (t->p_pptr != p)
+			if (t->p_pptr != p) {
 				proc_reparentlocked(t, p, 1, 0);
-	
+			}
+
 			proc_lock(t);
-			if (get_task_userstop(task) > 0 ) {
+			if (get_task_userstop(task) > 0) {
 				stopped = 1;
 			}
 			t->p_xstat = 0;
@@ -235,18 +304,24 @@ ptrace(struct proc *p, struct ptrace_args *uap, int32_t *retval)
 			 * issignal() again to properly connect to the tracing
 			 * process.
 			 */
-			if (stopped)
-				task_resume(task);       
+			if (stopped) {
+				task_resume(task);
+			}
 			error = 0;
 			goto out;
-		}
-		else {
+		} else {
+			error = cb_err;
+			if (error == ESRCH) {
+				/*
+				 * The target 't' is not valid anymore as it
+				 * could not be found after the MAC check.
+				 */
+				return error;
+			}
 			/* not allowed to attach, proper error code returned by kauth_authorize_process */
 			if (ISSET(t->p_lflag, P_LNOATTACH)) {
 				psignal(p, SIGSEGV);
 			}
-			
-			error = err;
 			goto out;
 		}
 	}
@@ -286,7 +361,6 @@ ptrace(struct proc *p, struct ptrace_args *uap, int32_t *retval)
 	 */
 	/* proc lock is held here */
 	switch (uap->req) {
-
 	case PT_DETACH:
 		if (t->p_oppid != t->p_ppid) {
 			struct proc *pp;
@@ -311,7 +385,7 @@ ptrace(struct proc *p, struct ptrace_args *uap, int32_t *retval)
 		CLR(t->p_lflag, P_LSIGEXC);
 		proc_unlock(t);
 		goto resume;
-		
+
 	case PT_KILL:
 		/*
 		 *	Tell child process to kill itself after it
@@ -319,15 +393,16 @@ ptrace(struct proc *p, struct ptrace_args *uap, int32_t *retval)
 		 */
 		proc_unlock(t);
 #if CONFIG_MACF
-		error = mac_proc_check_signal(p, t, SIGKILL);
-		if (0 != error)
+		error = mac_proc_check_signal(p, NULL, &tident, SIGKILL);
+		if (0 != error) {
 			goto resume;
+		}
 #endif
 		psignal(t, SIGKILL);
 		goto resume;
 
-	case PT_STEP:			/* single step the child */
-	case PT_CONTINUE:		/* continue the child */
+	case PT_STEP:                   /* single step the child */
+	case PT_CONTINUE:               /* continue the child */
 		proc_unlock(t);
 		th_act = (thread_t)get_firstthread(task);
 		if (th_act == THREAD_NULL) {
@@ -347,16 +422,22 @@ ptrace(struct proc *p, struct ptrace_args *uap, int32_t *retval)
 		}
 
 		if (uap->data != 0) {
+#if CONFIG_MACF
+			error = mac_proc_check_signal(p, NULL, &tident, uap->data);
+			if (0 != error) {
+				goto out;
+			}
+#endif
 			psignal(t, uap->data);
-                }
+		}
 
 		if (uap->req == PT_STEP) {
-		        /*
-			 * set trace bit 
+			/*
+			 * set trace bit
 			 * we use sending SIGSTOP as a comparable security check.
 			 */
 #if CONFIG_MACF
-			error = mac_proc_check_signal(p, t, SIGSTOP);
+			error = mac_proc_check_signal(p, NULL, &tident, SIGSTOP);
 			if (0 != error) {
 				goto out;
 			}
@@ -366,12 +447,12 @@ ptrace(struct proc *p, struct ptrace_args *uap, int32_t *retval)
 				goto out;
 			}
 		} else {
-		        /*
+			/*
 			 * clear trace bit if on
 			 * we use sending SIGCONT as a comparable security check.
 			 */
 #if CONFIG_MACF
-			error = mac_proc_check_signal(p, t, SIGCONT);
+			error = mac_proc_check_signal(p, NULL, &tident, SIGCONT);
 			if (0 != error) {
 				goto out;
 			}
@@ -380,8 +461,8 @@ ptrace(struct proc *p, struct ptrace_args *uap, int32_t *retval)
 				error = ENOTSUP;
 				goto out;
 			}
-		}	
-	resume:
+		}
+resume:
 		proc_lock(t);
 		t->p_xstat = uap->data;
 		t->p_stat = SRUN;
@@ -391,31 +472,35 @@ ptrace(struct proc *p, struct ptrace_args *uap, int32_t *retval)
 			if ((t->p_lflag & P_LSIGEXC) == 0) {
 				task_resume(task);
 			}
-		} else
+		} else {
 			proc_unlock(t);
-			
+		}
+
 		break;
-		
+
 	case PT_THUPDATE:  {
 		proc_unlock(t);
 		if ((unsigned)uap->data >= NSIG) {
 			error = EINVAL;
 			goto out;
 		}
-		th_act = port_name_to_thread(CAST_MACH_PORT_TO_NAME(uap->addr));
-		if (th_act == THREAD_NULL)
-			return (ESRCH);
+		th_act = port_name_to_thread(CAST_MACH_PORT_TO_NAME(uap->addr),
+		    PORT_INTRANS_OPTIONS_NONE);
+		if (th_act == THREAD_NULL) {
+			error = ESRCH;
+			goto out;
+		}
 		ut = (uthread_t)get_bsdthread_info(th_act);
-		if (uap->data)
+		if (uap->data) {
 			ut->uu_siglist |= sigmask(uap->data);
+		}
 		proc_lock(t);
 		t->p_xstat = uap->data;
 		t->p_stat = SRUN;
 		proc_unlock(t);
-		thread_deallocate(th_act);
 		error = 0;
-		}
-		break;
+	}
+	break;
 	default:
 		proc_unlock(t);
 		error = EINVAL;
@@ -425,7 +510,10 @@ ptrace(struct proc *p, struct ptrace_args *uap, int32_t *retval)
 	error = 0;
 out:
 	proc_rele(t);
-	return(error);
+	if (th_act) {
+		thread_deallocate(th_act);
+	}
+	return error;
 }
 
 
@@ -436,14 +524,14 @@ out:
 int
 cantrace(proc_t cur_procp, kauth_cred_t creds, proc_t traced_procp, int *errp)
 {
-	int		my_err;
+	int             my_err;
 	/*
 	 * You can't trace a process if:
 	 *	(1) it's the process that's doing the tracing,
 	 */
-	if (traced_procp->p_pid == cur_procp->p_pid) {
+	if (proc_getpid(traced_procp) == proc_getpid(cur_procp)) {
 		*errp = EINVAL;
-		return (0);
+		return 0;
 	}
 
 	/*
@@ -451,28 +539,59 @@ cantrace(proc_t cur_procp, kauth_cred_t creds, proc_t traced_procp, int *errp)
 	 */
 	if (ISSET(traced_procp->p_lflag, P_LTRACED)) {
 		*errp = EBUSY;
-		return (0);
+		return 0;
 	}
 
-	/*
-	 *	(3) it's not owned by you, or is set-id on exec
-	 *	    (unless you're root).
-	 */
-	if ((kauth_cred_getruid(creds) != kauth_cred_getruid(proc_ucred(traced_procp)) ||
-		ISSET(traced_procp->p_flag, P_SUGID)) &&
-		(my_err = suser(creds, &cur_procp->p_acflag)) != 0) {
-		*errp = my_err;
-		return (0);
+	if (!proc_is_third_party_debuggable_driver(traced_procp)) {
+		kauth_cred_t    traced_cred;
+
+		/*
+		 *	(3) it's not owned by you, or is set-id on exec
+		 *	    (unless you're root).
+		 */
+		traced_cred = kauth_cred_proc_ref(traced_procp);
+		if ((kauth_cred_getruid(creds) != kauth_cred_getruid(traced_cred) ||
+		    ISSET(traced_procp->p_flag, P_SUGID)) &&
+		    (my_err = suser(creds, &cur_procp->p_acflag)) != 0) {
+			kauth_cred_unref(&traced_cred);
+			*errp = my_err;
+			return 0;
+		}
+		kauth_cred_unref(&traced_cred);
 	}
 
 	if ((cur_procp->p_lflag & P_LTRACED) && isinferior(cur_procp, traced_procp)) {
 		*errp = EPERM;
-		return (0);
+		return 0;
 	}
 
 	if (ISSET(traced_procp->p_lflag, P_LNOATTACH)) {
 		*errp = EBUSY;
-		return (0);
+		return 0;
 	}
-	return(1);
+
+#if CONFIG_MACF
+	struct proc_ident cur_ident = proc_ident(cur_procp);
+	struct proc_ident traced_ident = proc_ident(traced_procp);
+	kauth_cred_t cur_cred = kauth_cred_proc_ref(cur_procp);
+
+	/*
+	 * Drop the proc reference to avoid a deadlock during an upcall and find
+	 * (reference) the proc again so our caller can keep using it.
+	 */
+	proc_rele(traced_procp);
+	my_err = mac_proc_check_debug(&cur_ident, cur_cred, &traced_ident);
+	kauth_cred_unref(&cur_cred);
+
+	if (proc_find_ident(&traced_ident) == PROC_NULL) {
+		*errp = ESRCH;
+		return 0;
+	}
+	/* restored ref on traced_procp */
+	if (my_err != 0) {
+		*errp = my_err;
+		return 0;
+	}
+#endif
+	return 1;
 }

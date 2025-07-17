@@ -2,7 +2,7 @@
  * Copyright (c) 2012 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
- * 
+ *
  * This file contains Original Code and/or Modifications of Original Code
  * as defined in and that are subject to the Apple Public Source License
  * Version 2.0 (the 'License'). You may not use this file except in
@@ -11,10 +11,10 @@
  * unlawful or unlicensed copies of an Apple operating system, or to
  * circumvent, violate, or enable the circumvention or violation of, any
  * terms of an Apple operating system software license agreement.
- * 
+ *
  * Please obtain a copy of the License at
  * http://www.opensource.apple.com/apsl/ and read it before using this file.
- * 
+ *
  * The Original Code and all software distributed under the License are
  * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
@@ -22,11 +22,13 @@
  * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
  * Please see the License for the specific language governing rights and
  * limitations under the License.
- * 
+ *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
 #ifndef _MACHINE_X86_64_KPC_H
 #define _MACHINE_X86_64_KPC_H
+
+#include <stdint.h>
 
 /* x86 config registers are 64-bit */
 typedef uint64_t kpc_config_t;
@@ -38,14 +40,5 @@ typedef uint64_t kpc_config_t;
 
 /* number of fixed config registers on x86_64 */
 #define KPC_X86_64_FIXED_CONFIGS (1)
-
-#define FIXED_ACTIONID(ctr) (kpc_actionid[(ctr)])
-#define CONFIGURABLE_ACTIONID(ctr) (kpc_actionid[(ctr) + kpc_fixed_count()])
-
-#define FIXED_RELOAD(ctr) (current_cpu_datap()->cpu_kpc_reload[(ctr)])
-#define CONFIGURABLE_RELOAD(ctr) (current_cpu_datap()->cpu_kpc_reload[(ctr) + kpc_fixed_count()])
-
-#define FIXED_SHADOW(ctr) (current_cpu_datap()->cpu_kpc_shadow[(ctr)])
-#define CONFIGURABLE_SHADOW(ctr) (current_cpu_datap()->cpu_kpc_shadow[(ctr) + kpc_fixed_count()])
 
 #endif /* _MACHINE_X86_64_KPC_H */

@@ -15,13 +15,13 @@ WARNFLAGS = -Wall
 LDFLAGS = -isysroot $(HOST_SDKROOT) -mmacosx-version-min=$(HOST_OS_VERSION)
 
 installfile: $(OBJS)
-	@echo HOST_LD $@
+	@$(LOG_HOST_LD) "$@"
 	$(_v)$(HOST_CC) $(LDFLAGS) -o $@ $^
-	@echo HOST_CODESIGN $@
+	@$(LOG_HOST_CODESIGN) "$@"
 	$(_v)env CODESIGN_ALLOCATE=$(HOST_CODESIGN_ALLOCATE) $(HOST_CODESIGN) -s - $@
 
 %.o: %.c
-	@echo HOST_CC $@
+	@$(LOG_HOST_CC) "$@"
 	$(_v)$(HOST_CC) $(WARNFLAGS) $(CFLAGS) -c -o $@ $<
 
 do_build_setup:: installfile

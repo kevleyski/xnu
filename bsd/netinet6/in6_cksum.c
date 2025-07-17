@@ -2,7 +2,7 @@
  * Copyright (c) 2009-2012 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
- * 
+ *
  * This file contains Original Code and/or Modifications of Original Code
  * as defined in and that are subject to the Apple Public Source License
  * Version 2.0 (the 'License'). You may not use this file except in
@@ -11,10 +11,10 @@
  * unlawful or unlicensed copies of an Apple operating system, or to
  * circumvent, violate, or enable the circumvention or violation of, any
  * terms of an Apple operating system software license agreement.
- * 
+ *
  * Please obtain a copy of the License at
  * http://www.opensource.apple.com/apsl/ and read it before using this file.
- * 
+ *
  * The Original Code and all software distributed under the License are
  * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
@@ -22,7 +22,7 @@
  * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
  * Please see the License for the specific language governing rights and
  * limitations under the License.
- * 
+ *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
 
@@ -147,20 +147,22 @@ in6_pseudo(const struct in6_addr *src, const struct in6_addr *dst, uint32_t x)
 	/*
 	 * IPv6 source address
 	 */
-	w = (const uint16_t *)src;
+	w = (const uint16_t *)(const struct in6_addr *__bidi_indexable)src;
 	sum += w[0];
-	if (!IN6_IS_SCOPE_EMBED(src))
+	if (!IN6_IS_SCOPE_EMBED(src)) {
 		sum += w[1];
+	}
 	sum += w[2]; sum += w[3]; sum += w[4]; sum += w[5];
 	sum += w[6]; sum += w[7];
 
 	/*
 	 * IPv6 destination address
 	 */
-	w = (const uint16_t *)dst;
+	w = (const uint16_t *)(const struct in6_addr *__bidi_indexable)dst;
 	sum += w[0];
-	if (!IN6_IS_SCOPE_EMBED(dst))
+	if (!IN6_IS_SCOPE_EMBED(dst)) {
 		sum += w[1];
+	}
 	sum += w[2]; sum += w[3]; sum += w[4]; sum += w[5];
 	sum += w[6]; sum += w[7];
 
@@ -175,7 +177,7 @@ in6_pseudo(const struct in6_addr *src, const struct in6_addr *dst, uint32_t x)
 	/* fold in carry bits */
 	ADDCARRY(sum);
 
-	return (sum);
+	return (uint16_t)sum;
 }
 
 /*
@@ -192,8 +194,8 @@ inet6_cksum(struct mbuf *m, uint32_t nxt, uint32_t off, uint32_t len)
 	sum = m_sum16(m, off, len);
 
 	if (nxt != 0) {
-		struct ip6_hdr *ip6;
-		unsigned char buf[sizeof (*ip6)] __attribute__((aligned(8)));
+		struct ip6_hdr *__single ip6;
+		unsigned char buf[sizeof(*ip6)] __attribute__((aligned(8)));
 		uint32_t mlen;
 
 		/*
@@ -203,7 +205,7 @@ inet6_cksum(struct mbuf *m, uint32_t nxt, uint32_t off, uint32_t len)
 		 * the caller setting m_pkthdr.len correctly, if the mbuf is
 		 * a M_PKTHDR one.
 		 */
-		if ((mlen = m_length2(m, NULL)) < sizeof (*ip6)) {
+		if ((mlen = m_length2(m, NULL)) < sizeof(*ip6)) {
 			panic("%s: mbuf %p pkt too short (%d) for IPv6 header",
 			    __func__, m, mlen);
 			/* NOTREACHED */
@@ -214,12 +216,12 @@ inet6_cksum(struct mbuf *m, uint32_t nxt, uint32_t off, uint32_t len)
 		 * aligned, copy it to a local buffer.  Note here that we
 		 * expect the data pointer to point to the IPv6 header.
 		 */
-		if ((sizeof (*ip6) > m->m_len) ||
+		if ((sizeof(*ip6) > m->m_len) ||
 		    !IP6_HDR_ALIGNED_P(mtod(m, caddr_t))) {
-			m_copydata(m, 0, sizeof (*ip6), (caddr_t)buf);
+			m_copydata(m, 0, sizeof(*ip6), (caddr_t)buf);
 			ip6 = (struct ip6_hdr *)(void *)buf;
 		} else {
-			ip6 = (struct ip6_hdr *)(void *)(m->m_data);
+			ip6 = (struct ip6_hdr *)m_mtod_current(m);
 		}
 
 		/* add pseudo header checksum */
@@ -230,5 +232,71 @@ inet6_cksum(struct mbuf *m, uint32_t nxt, uint32_t off, uint32_t len)
 		ADDCARRY(sum);
 	}
 
-	return (~sum & 0xffff);
+	return ~sum & 0xffff;
+}
+
+/*
+ * buffer MUST contain at least an IPv6 header, if nxt is specified;
+ * nxt is the upper layer protocol number;
+ * off is an offset where TCP/UDP/ICMP6 header starts;
+ * len is a total length of a transport segment (e.g. TCP header + TCP payload)
+ */
+u_int16_t
+inet6_cksum_buffer(const uint8_t *__sized_by(buffer_len)buffer, uint32_t nxt, uint32_t off,
+    uint32_t len, uint32_t buffer_len)
+{
+	uint32_t sum;
+	uint32_t tmp;
+
+	if (__improbable(off >= buffer_len)) {
+		panic("%s: off (%u) >=  buffer_len (%u)",
+		    __func__, off, buffer_len);
+		/* NOTREACHED */
+	}
+
+	if (__improbable(len == 0 || len > buffer_len)) {
+		panic("%s: len == 0 OR len (%u) >=  buffer_len (%u)",
+		    __func__, len, buffer_len);
+		/* NOTREACHED */
+	}
+
+	if (__improbable(os_add_overflow(off, len, &tmp))) {
+		panic("%s: off(%u), len(%u) add overflow",
+		    __func__, off, len);
+		/* NOTREACHED */
+	}
+
+	if (__improbable(tmp > buffer_len)) {
+		panic("%s: off(%u) + len(%u) >=  buffer_len (%u)",
+		    __func__, off, len, buffer_len);
+		/* NOTREACHED */
+	}
+
+	sum = b_sum16(&((const uint8_t *)buffer)[off], len);
+
+	if (nxt != 0) {
+		const struct ip6_hdr *ip6;
+		unsigned char buf[sizeof(*ip6)] __attribute__((aligned(8)));
+
+		/*
+		 * In case the IPv6 header is not contiguous, or not 32-bit
+		 * aligned, copy it to a local buffer.  Note here that we
+		 * expect the data pointer to point to the IPv6 header.
+		 */
+		if (!IP6_HDR_ALIGNED_P(buffer)) {
+			memcpy(buf, buffer, sizeof(*ip6));
+			ip6 = (const struct ip6_hdr *)(const void *)buf;
+		} else {
+			ip6 = (const struct ip6_hdr *)buffer;
+		}
+
+		/* add pseudo header checksum */
+		sum += in6_pseudo(&ip6->ip6_src, &ip6->ip6_dst,
+		    htonl(nxt + len));
+
+		/* fold in carry bits */
+		ADDCARRY(sum);
+	}
+
+	return ~sum & 0xffff;
 }

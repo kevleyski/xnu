@@ -71,12 +71,19 @@ The file may only be appended to.
 The directory is opaque when viewed through a union stack.
 .It UF_HIDDEN
 The file or directory is not intended to be displayed to the user.
+.It UF_COMPRESSED
+File is compressed at the file system level.
 .It SF_ARCHIVED
 The file has been archived.
 .It SF_IMMUTABLE
 The file may not be changed.
 .It SF_APPEND
 The file may only be appended to.
+.It SF_DATALESS 
+The file is a dataless placeholder.
+The system will attempt to materialize it when accessed according to the dataless file materialization policy of the accessing thread or process.
+See
+.Xr getiopolicy_np 3 .
 .El
 .Pp
 The
@@ -93,18 +100,21 @@ The
 and
 .Dq SF_APPEND
 flags may only be set or unset by the super-user.
-They may be set at any time, but normally may only be unset when
-the system is in single-user mode.
-(See
-.Xr init 8
-for details.)
+.Pp
+The
+.Dq SF_DATALESS
+and
+.Dq UF_COMPRESSED
+flags are internal flags and may not be set or unset from user space.  Attempting to modify them using
+.Fn chflags
+will result in undefined behaviour.
 .Sh RETURN VALUES
 Upon successful completion, a value of 0 is returned.
 Otherwise, -1 is returned and the global variable
 .Va errno
 is set to indicate the error.
 .Sh ERRORS
-.Fn Chflags
+.Fn chflags
 will fail if:
 .Bl -tag -width Er
 .It Bq Er ENOTDIR
@@ -137,7 +147,7 @@ error occurred while reading from or writing to the file system.
 The operation isn't supported by the filesystem.
 .El
 .Pp
-.Fn Fchflags
+.Fn fchflags
 will fail if:
 .Bl -tag -width Er
 .It Bq Er EBADF
@@ -162,7 +172,7 @@ The operation isn't supported by the filesystem.
 .Xr fflagstostr 3 ,
 .Xr lchflags 3 ,
 .Xr strtofflags 3 ,
-.Xr init 8
+.Xr launchd 8
 .Sh HISTORY
 The
 .Fn chflags

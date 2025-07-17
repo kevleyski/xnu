@@ -6,12 +6,13 @@ export MakeInc_dir=${SRCROOT}/makedefs/MakeInc.dir
 include $(MakeInc_cmd)
 include $(MakeInc_def)
 
-SETUP_SUBDIRS = 	\
+SETUP_SUBDIRS =		\
 	config		\
 	kextsymboltool	\
 	setsegname	\
 	decomment	\
-	installfile
+	installfile	\
+	replacecontents
 
 include $(MakeInc_rule)
 include $(MakeInc_dir)

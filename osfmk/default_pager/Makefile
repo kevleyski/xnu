@@ -10,23 +10,24 @@ MIG_TYPES = \
 	default_pager_types.defs
 
 MIG_DEFS = \
-	default_pager_alerts.defs
 
 MIG_USHDRS = \
 
 MIG_UUHDRS = \
-	default_pager_object.h
-
 
 MIGINCLUDES = ${MIG_UUHDRS} ${MIG_USHDRS}
 
 DATAFILES = \
 	default_pager_types.h \
-	${MIG_DEFS} 
+	${MIG_DEFS}
 
-INSTALL_MI_LIST	= ${DATAFILES} 
+INSTALL_MI_LIST	= ${DATAFILES}
+
+INSTALL_SF_MI_LCL_LIST = ${DATAFILES}
 
 INSTALL_MI_GEN_LIST = ${MIGINCLUDES}
+
+INSTALL_SF_MI_LCL_GEN_LIST = ${MIGINCLUDES}
 
 INSTALL_MI_DIR = default_pager
 
@@ -42,46 +43,39 @@ ${MIGINCLUDES} : ${MIG_TYPES}
 
 ${MIG_UUHDRS} : \
 	%.h : %.defs
-	@echo MIG $@
+	@$(LOG_MIG) $@
 	$(_v)$(MIG) $(MIGFLAGS)		\
 		-server /dev/null	\
 		-user /dev/null		\
-		-header $@ 		\
+		-header $@		\
 		$<
 
 ${MIG_USHDRS} : \
 	%_server.h : %.defs
-	@echo MIG $@
+	@$(LOG_MIG) $@
 	$(_v)$(MIG) $(MIGFLAGS)		\
 		-server /dev/null	\
 		-user /dev/null		\
 		-header /dev/null	\
-		-sheader $@ 		\
+		-sheader $@		\
 		$<
 
 #
 # Build path
-#       
+#
 INCFLAGS_MAKEFILE= -I..
-
-MIGKSFLAGS	= -DMACH_KERNEL_PRIVATE -DKERNEL_SERVER=1
-MIGKUFLAGS	= -DMACH_KERNEL_PRIVATE -DKERNEL_USER=1 -maxonstack 1024
 
 #
 # MIG-generated headers that are traditionally used by kernel
 # level code.
 #
 MIG_KUHDRS = \
-	default_pager_alerts.h 
 
 MIG_KUSRC = \
-	default_pager_alerts_user.c
 
 MIG_KSHDRS = \
-	default_pager_object.h
 
 MIG_KSSRC = \
-	default_pager_object_server.c
 
 #
 # JMM -
@@ -98,7 +92,7 @@ MIG_KSSRC = \
 # even require that as we move towards making all the environments look
 # the same.
 #
-COMP_FILES = ${MIG_KUSRC} ${MIG_KSSRC} 
+COMP_FILES = ${MIG_KUSRC} ${MIG_KSSRC}
 
 do_build_all:: $(COMP_FILES)
 
@@ -106,7 +100,7 @@ ${COMP_FILES} : ${MIG_TYPES}
 
 ${MIG_KUSRC} : \
 	%_user.c : %.defs
-	@echo MIG $@
+	@$(LOG_MIG) $@
 	$(_v)${MIG} ${MIGFLAGS} ${MIGKUFLAGS}        \
 		-user    $*_user.c              \
 		-header  $*.h              \
@@ -116,7 +110,7 @@ ${MIG_KUSRC} : \
 
 ${MIG_KSSRC}: \
 	%_server.c : %.defs
-	@echo MIG $@
+	@$(LOG_MIG) $@
 	$(_v)${MIG} ${MIGFLAGS} ${MIGKSFLAGS}        \
 		-user    /dev/null              \
 		-header  /dev/null              \

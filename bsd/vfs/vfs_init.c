@@ -2,7 +2,7 @@
  * Copyright (c) 2000-2010 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
- * 
+ *
  * This file contains Original Code and/or Modifications of Original Code
  * as defined in and that are subject to the Apple Public Source License
  * Version 2.0 (the 'License'). You may not use this file except in
@@ -11,10 +11,10 @@
  * unlawful or unlicensed copies of an Apple operating system, or to
  * circumvent, violate, or enable the circumvention or violation of, any
  * terms of an Apple operating system software license agreement.
- * 
+ *
  * Please obtain a copy of the License at
  * http://www.opensource.apple.com/apsl/ and read it before using this file.
- * 
+ *
  * The Original Code and all software distributed under the License are
  * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
@@ -22,7 +22,7 @@
  * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
  * Please see the License for the specific language governing rights and
  * limitations under the License.
- * 
+ *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
 /* Copyright (c) 1995 NeXT Computer, Inc. All Rights Reserved */
@@ -82,15 +82,20 @@
 #include <sys/namei.h>
 #include <sys/ucred.h>
 #include <sys/errno.h>
-#include <sys/malloc.h>
+#include <kern/kalloc.h>
+#include <kern/smr.h>
+#include <sys/decmpfs.h>
 
-#include <vfs/vfs_journal.h>	/* journal_init() */
 #if CONFIG_MACF
 #include <security/mac_framework.h>
 #include <sys/kauth.h>
 #endif
 #if QUOTA
 #include <sys/quota.h>
+#endif
+
+#if CONFIG_EXCLAVES
+#include <vfs/vfs_exclave_fs.h>
 #endif
 
 /*
@@ -102,12 +107,17 @@
 #define DODEBUG(A)
 #endif
 
+KALLOC_TYPE_DEFINE(mount_zone, struct mount, KT_DEFAULT);
+
+SMR_DEFINE(_vfs_smr, "VFS");
+const smr_t vfs_smr = &_vfs_smr;
+
 __private_extern__ void vntblinit(void);
 
-extern struct vnodeopv_desc *vfs_opv_descs[];
-				/* a list of lists of vnodeops defns */
+extern const struct vnodeopv_desc *vfs_opv_descs[];
+/* a list of lists of vnodeops defns */
 extern struct vnodeop_desc *vfs_op_descs[];
-				/* and the operations they perform */
+/* and the operations they perform */
 /*
  * This code doesn't work if the defn is **vnodop_defns with cc.
  * The problem is because of the compiler sometimes putting in an
@@ -116,7 +126,7 @@ extern struct vnodeop_desc *vfs_op_descs[];
  */
 int vfs_opv_numops;
 
-typedef int (*PFIvp)(void *); 
+typedef int (*PFIvp)(void *);
 
 /*
  * A miscellaneous routine.
@@ -125,8 +135,7 @@ typedef int (*PFIvp)(void *);
 int
 vn_default_error(void)
 {
-
-	return (ENOTSUP);
+	return ENOTSUP;
 }
 
 /*
@@ -149,29 +158,35 @@ void
 vfs_opv_init(void)
 {
 	int i, j, k;
-	int (***opv_desc_vector_p)(void *);
-	int (**opv_desc_vector)(void *);
-	struct vnodeopv_entry_desc *opve_descp;
+	int(***opv_desc_vector_p)(void *);
+	int(**opv_desc_vector)(void *);
+	const struct vnodeopv_entry_desc *opve_descp;
 
 	/*
 	 * Allocate the dynamic vectors and fill them in.
 	 */
-	for (i=0; vfs_opv_descs[i]; i++) {
+	for (i = 0; vfs_opv_descs[i]; i++) {
 		opv_desc_vector_p = vfs_opv_descs[i]->opv_desc_vector_p;
 		/*
 		 * Allocate and init the vector, if it needs it.
 		 * Also handle backwards compatibility.
 		 */
 		if (*opv_desc_vector_p == NULL) {
-			MALLOC(*opv_desc_vector_p, PFIvp*,
-			       vfs_opv_numops*sizeof(PFIvp), M_TEMP, M_WAITOK);
-			bzero (*opv_desc_vector_p, vfs_opv_numops*sizeof(PFIvp));
+			*opv_desc_vector_p = zalloc_permanent(vfs_opv_numops * sizeof(PFIvp),
+			    ZALIGN(PFIvp));
 			DODEBUG(printf("vector at %x allocated\n",
 			    opv_desc_vector_p));
 		}
 		opv_desc_vector = *opv_desc_vector_p;
-		for (j=0; vfs_opv_descs[i]->opv_desc_ops[j].opve_op; j++) {
+		for (j = 0; vfs_opv_descs[i]->opv_desc_ops[j].opve_op; j++) {
 			opve_descp = &(vfs_opv_descs[i]->opv_desc_ops[j]);
+
+			/* Silently skip known-disabled operations */
+			if (opve_descp->opve_op->vdesc_flags & VDESC_DISABLED) {
+				printf("vfs_fsadd: Ignoring reference in %p to disabled operation %s.\n",
+				    vfs_opv_descs[i], opve_descp->opve_op->vdesc_name);
+				continue;
+			}
 
 			/*
 			 * Sanity check:  is this operation listed
@@ -191,18 +206,18 @@ vfs_opv_init(void)
 			 * list of supported operations.
 			 */
 			if (opve_descp->opve_op->vdesc_offset == 0 &&
-				    opve_descp->opve_op->vdesc_offset !=
-				    	VOFFSET(vnop_default)) {
+			    opve_descp->opve_op !=
+			    VDESC(vnop_default)) {
 				printf("operation %s not listed in %s.\n",
 				    opve_descp->opve_op->vdesc_name,
 				    "vfs_op_descs");
-				panic ("vfs_opv_init: bad operation");
+				panic("vfs_opv_init: bad operation");
 			}
 			/*
 			 * Fill in this entry.
 			 */
 			opv_desc_vector[opve_descp->opve_op->vdesc_offset] =
-					opve_descp->opve_impl;
+			    opve_descp->opve_impl;
 		}
 	}
 	/*
@@ -215,13 +230,15 @@ vfs_opv_init(void)
 		/*
 		 * Force every operations vector to have a default routine.
 		 */
-		if (opv_desc_vector[VOFFSET(vnop_default)]==NULL) {
+		if (opv_desc_vector[VOFFSET(vnop_default)] == NULL) {
 			panic("vfs_opv_init: operation vector without default routine.");
 		}
-		for (k = 0; k<vfs_opv_numops; k++)
-			if (opv_desc_vector[k] == NULL)
-				opv_desc_vector[k] = 
-					opv_desc_vector[VOFFSET(vnop_default)];
+		for (k = 0; k < vfs_opv_numops; k++) {
+			if (opv_desc_vector[k] == NULL) {
+				opv_desc_vector[k] =
+				    opv_desc_vector[VOFFSET(vnop_default)];
+			}
+		}
 	}
 }
 
@@ -237,17 +254,22 @@ vfs_op_init(void)
 	/*
 	 * Set all vnode vectors to a well known value.
 	 */
-	for (i = 0; vfs_opv_descs[i]; i++)
+	for (i = 0; vfs_opv_descs[i]; i++) {
 		*(vfs_opv_descs[i]->opv_desc_vector_p) = NULL;
+	}
 	/*
 	 * Figure out how many ops there are by counting the table,
 	 * and assign each its offset.
 	 */
 	for (vfs_opv_numops = 0, i = 0; vfs_op_descs[i]; i++) {
+		/* Silently skip known-disabled operations */
+		if (vfs_op_descs[i]->vdesc_flags & VDESC_DISABLED) {
+			continue;
+		}
 		vfs_op_descs[i]->vdesc_offset = vfs_opv_numops;
 		vfs_opv_numops++;
 	}
-	DODEBUG(printf ("vfs_opv_numops=%d\n", vfs_opv_numops));
+	DODEBUG(printf("vfs_opv_numops=%d\n", vfs_opv_numops));
 }
 
 /*
@@ -256,47 +278,31 @@ vfs_op_init(void)
 extern struct vnodeops dead_vnodeops;
 extern struct vnodeops spec_vnodeops;
 
-/* vars for vnode lock */
-lck_grp_t * vnode_lck_grp;
-lck_grp_attr_t * vnode_lck_grp_attr;
-lck_attr_t * vnode_lck_attr;
-
-#if CONFIG_TRIGGERS
-/* vars for vnode trigger resolver */
-lck_grp_t * trigger_vnode_lck_grp;
-lck_grp_attr_t * trigger_vnode_lck_grp_attr;
-lck_attr_t * trigger_vnode_lck_attr;
-#endif
-
 /* vars for vnode list lock */
-lck_grp_t * vnode_list_lck_grp;
-lck_grp_attr_t * vnode_list_lck_grp_attr;
-lck_attr_t * vnode_list_lck_attr;
-lck_spin_t * vnode_list_spin_lock;
-lck_mtx_t * spechash_mtx_lock;
-
-/* vars for vfsconf lock */
-lck_grp_t * fsconf_lck_grp;
-lck_grp_attr_t * fsconf_lck_grp_attr;
-lck_attr_t * fsconf_lck_attr;
-
+static LCK_GRP_DECLARE(vnode_list_lck_grp, "vnode list");
+static LCK_ATTR_DECLARE(vnode_list_lck_attr, 0, 0);
+static LCK_SPIN_DECLARE_ATTR(vnode_list_spin_lock,
+    &vnode_list_lck_grp, &vnode_list_lck_attr);
+static LCK_MTX_DECLARE_ATTR(spechash_mtx_lock,
+    &vnode_list_lck_grp, &vnode_list_lck_attr);
+LCK_MTX_DECLARE_ATTR(pkg_extensions_lck,
+    &vnode_list_lck_grp, &vnode_list_lck_attr);
 
 /* vars for mount lock */
-lck_grp_t * mnt_lck_grp;
-lck_grp_attr_t * mnt_lck_grp_attr;
-lck_attr_t * mnt_lck_attr;
+static LCK_GRP_DECLARE(mnt_lck_grp, "mount");
+static LCK_ATTR_DECLARE(mnt_lck_attr, 0, 0);
 
 /* vars for mount list lock */
-lck_grp_t * mnt_list_lck_grp;
-lck_grp_attr_t * mnt_list_lck_grp_attr;
-lck_attr_t * mnt_list_lck_attr;
-lck_mtx_t * mnt_list_mtx_lock;
+static LCK_GRP_DECLARE(mnt_list_lck_grp, "mount list");
+LCK_MTX_DECLARE(mnt_list_mtx_lock, &mnt_list_lck_grp);
 
-lck_mtx_t *pkg_extensions_lck;
-
-struct mount * dead_mountp;
-
-extern void nspace_handler_init(void);
+/*
+ * We want dead_mountp to be a constant pointer, but vfsinit() runs
+ * pretty late, so we'll allocate the dead_mount statically and
+ * statically-initialized dead_mountp.
+ */
+static struct mount dead_mount_store;
+struct mount * const dead_mountp = &dead_mount_store;
 
 /*
  * Initialize the vnode structures and initialize each file system type.
@@ -307,67 +313,6 @@ vfsinit(void)
 	struct vfstable *vfsp;
 	int i, maxtypenum;
 	struct mount * mp;
-	
-	/* Allocate vnode list lock group attribute and group */
-	vnode_list_lck_grp_attr = lck_grp_attr_alloc_init();
-
-	vnode_list_lck_grp = lck_grp_alloc_init("vnode list",  vnode_list_lck_grp_attr);
-	
-	/* Allocate vnode list lock attribute */
-	vnode_list_lck_attr = lck_attr_alloc_init();
-
-	/* Allocate vnode list lock */
-	vnode_list_spin_lock = lck_spin_alloc_init(vnode_list_lck_grp, vnode_list_lck_attr);
-
-	/* Allocate spec hash list lock */
-	spechash_mtx_lock = lck_mtx_alloc_init(vnode_list_lck_grp, vnode_list_lck_attr);
-
-	/* Allocate the package extensions table lock */
-	pkg_extensions_lck = lck_mtx_alloc_init(vnode_list_lck_grp, vnode_list_lck_attr);
-
-	/* allocate vnode lock group attribute and group */
-	vnode_lck_grp_attr= lck_grp_attr_alloc_init();
-
-	vnode_lck_grp = lck_grp_alloc_init("vnode",  vnode_lck_grp_attr);
-
-	/* Allocate vnode lock attribute */
-	vnode_lck_attr = lck_attr_alloc_init();
-
-#if CONFIG_TRIGGERS
-	trigger_vnode_lck_grp_attr = lck_grp_attr_alloc_init();
-	trigger_vnode_lck_grp = lck_grp_alloc_init("trigger_vnode", trigger_vnode_lck_grp_attr);
-	trigger_vnode_lck_attr = lck_attr_alloc_init();
-#endif
-
-	/* Allocate fs config lock group attribute and group */
-	fsconf_lck_grp_attr= lck_grp_attr_alloc_init();
-
-	fsconf_lck_grp = lck_grp_alloc_init("fs conf",  fsconf_lck_grp_attr);
-	
-	/* Allocate fs config lock attribute */
-	fsconf_lck_attr = lck_attr_alloc_init();
-
-	/* Allocate mount point related lock structures  */
-
-	/* Allocate mount list lock group attribute and group */
-	mnt_list_lck_grp_attr= lck_grp_attr_alloc_init();
-
-	mnt_list_lck_grp = lck_grp_alloc_init("mount list",  mnt_list_lck_grp_attr);
-	
-	/* Allocate mount list lock attribute */
-	mnt_list_lck_attr = lck_attr_alloc_init();
-
-	/* Allocate mount list lock */
-	mnt_list_mtx_lock = lck_mtx_alloc_init(mnt_list_lck_grp, mnt_list_lck_attr);
-
-
-	/* allocate mount lock group attribute and group */
-	mnt_lck_grp_attr= lck_grp_attr_alloc_init();
-
-	mnt_lck_grp = lck_grp_alloc_init("mount",  mnt_lck_grp_attr);
-
-	/* Allocate mount lock attribute */
-	mnt_lck_attr = lck_attr_alloc_init();
 
 	/*
 	 * Initialize the vnode table
@@ -382,14 +327,6 @@ vfsinit(void)
 	 */
 	nchinit();
 
-#if JOURNALING
-	/*
-	 * Initialize the journaling locks
-	 */
-	journal_init();
-#endif 
-	nspace_handler_init();
-
 	/*
 	 * Build vnode operation vectors.
 	 */
@@ -399,15 +336,19 @@ vfsinit(void)
 	 * Initialize each file system type in the static list,
 	 * until the first NULL ->vfs_vfsops is encountered.
 	 */
-	numused_vfsslots = maxtypenum = 0;
+	maxtypenum = VT_NON;
 	for (vfsp = vfsconf, i = 0; i < maxvfsslots; i++, vfsp++) {
 		struct vfsconf vfsc;
-		if (vfsp->vfc_vfsops == (struct	vfsops *)0)
+		if (vfsp->vfc_vfsops == (struct vfsops *)0) {
 			break;
-		if (i) vfsconf[i-1].vfc_next = vfsp;
-		if (maxtypenum <= vfsp->vfc_typenum)
+		}
+		if (i) {
+			vfsconf[i - 1].vfc_next = vfsp;
+		}
+		if (maxtypenum <= vfsp->vfc_typenum) {
 			maxtypenum = vfsp->vfc_typenum + 1;
-		
+		}
+
 		bzero(&vfsc, sizeof(struct vfsconf));
 		vfsc.vfc_reserved1 = 0;
 		bcopy(vfsp->vfc_name, vfsc.vfc_name, sizeof(vfsc.vfc_name));
@@ -417,12 +358,26 @@ vfsinit(void)
 		vfsc.vfc_reserved2 = 0;
 		vfsc.vfc_reserved3 = 0;
 
+		if (vfsp->vfc_vfsops->vfs_sysctl) {
+			struct sysctl_oid *oidp = NULL;
+			struct sysctl_oid oid = SYSCTL_STRUCT_INIT(_vfs, vfsp->vfc_typenum, , CTLTYPE_NODE | CTLFLAG_KERN | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, vfs_sysctl_node, "-", "");
+
+			oidp = kalloc_type(struct sysctl_oid, Z_WAITOK);
+			*oidp = oid;
+
+			/* Memory for VFS oid held by vfsentry forever */
+			vfsp->vfc_sysctl = oidp;
+			oidp->oid_name = vfsp->vfc_name;
+			sysctl_register_oid(vfsp->vfc_sysctl);
+		}
+
 		(*vfsp->vfc_vfsops->vfs_init)(&vfsc);
 
 		numused_vfsslots++;
+		numregistered_fses++;
 	}
 	/* next vfc_typenum to be used */
-	maxvfsconf = maxtypenum;
+	maxvfstypenum = maxtypenum;
 
 	/*
 	 * Initialize the vnop authorization scope.
@@ -430,18 +385,9 @@ vfsinit(void)
 	vnode_authorize_init();
 
 	/*
-	 * Initialiize the quota system.
-	 */
-#if QUOTA
-	dqinit();
-#endif
-	
-	/* 
 	 * create a mount point for dead vnodes
 	 */
-	MALLOC_ZONE(mp, struct mount *, sizeof(struct mount),
-		M_MOUNT, M_WAITOK);
-	bzero((char *)mp, sizeof(struct mount));
+	mp = &dead_mount_store;
 	/* Initialize the default IO constraints */
 	mp->mnt_maxreadcnt = mp->mnt_maxwritecnt = MAXPHYS;
 	mp->mnt_segreadcnt = mp->mnt_segwritecnt = 32;
@@ -454,7 +400,7 @@ vfsinit(void)
 	mp->mnt_ioflags = 0;
 	mp->mnt_realrootvp = NULLVP;
 	mp->mnt_authcache_ttl = CACHED_LOOKUP_RIGHT_TTL;
-    
+
 	TAILQ_INIT(&mp->mnt_vnodelist);
 	TAILQ_INIT(&mp->mnt_workerqueue);
 	TAILQ_INIT(&mp->mnt_newvnodes);
@@ -466,47 +412,62 @@ vfsinit(void)
 	mac_mount_label_init(mp);
 	mac_mount_label_associate(vfs_context_kernel(), mp);
 #endif
-	dead_mountp = mp;
+	/*
+	 * dead_mountp is a statically-initialized constant pointer
+	 * to dead_mount_store.
+	 */
+
+#if FS_COMPRESSION
+	decmpfs_init();
+#endif
+
+	nspace_resolver_init();
+
+#if CONFIG_EXCLAVES
+	vfs_exclave_fs_start();
+#endif
 }
 
 void
 vnode_list_lock(void)
 {
-	lck_spin_lock(vnode_list_spin_lock);
+	lck_spin_lock_grp(&vnode_list_spin_lock, &vnode_list_lck_grp);
 }
 
 void
 vnode_list_unlock(void)
 {
-	lck_spin_unlock(vnode_list_spin_lock);
+	lck_spin_unlock(&vnode_list_spin_lock);
 }
 
 void
 mount_list_lock(void)
 {
-	lck_mtx_lock(mnt_list_mtx_lock);
+	lck_mtx_lock(&mnt_list_mtx_lock);
 }
 
 void
 mount_list_unlock(void)
 {
-	lck_mtx_unlock(mnt_list_mtx_lock);
+	lck_mtx_unlock(&mnt_list_mtx_lock);
 }
 
 void
 mount_lock_init(mount_t mp)
 {
-	lck_mtx_init(&mp->mnt_mlock, mnt_lck_grp, mnt_lck_attr);
-	lck_mtx_init(&mp->mnt_renamelock, mnt_lck_grp, mnt_lck_attr);
-	lck_rw_init(&mp->mnt_rwlock, mnt_lck_grp, mnt_lck_attr);
+	lck_mtx_init(&mp->mnt_mlock, &mnt_lck_grp, &mnt_lck_attr);
+	lck_mtx_init(&mp->mnt_iter_lock, &mnt_lck_grp, &mnt_lck_attr);
+	lck_mtx_init(&mp->mnt_renamelock, &mnt_lck_grp, &mnt_lck_attr);
+	lck_rw_init(&mp->mnt_rwlock, &mnt_lck_grp, &mnt_lck_attr);
 }
 
 void
 mount_lock_destroy(mount_t mp)
 {
-	lck_mtx_destroy(&mp->mnt_mlock, mnt_lck_grp);
-	lck_mtx_destroy(&mp->mnt_renamelock, mnt_lck_grp);
-	lck_rw_destroy(&mp->mnt_rwlock, mnt_lck_grp);
+	lck_mtx_destroy(&mp->mnt_mlock, &mnt_lck_grp);
+	lck_mtx_destroy(&mp->mnt_iter_lock, &mnt_lck_grp);
+	lck_mtx_destroy(&mp->mnt_renamelock, &mnt_lck_grp);
+	lck_rw_destroy(&mp->mnt_rwlock, &mnt_lck_grp);
 }
 
 
@@ -534,6 +495,15 @@ vfstable_add(struct vfstable  *nvfsp)
 {
 	int slot;
 	struct vfstable *slotp, *allocated = NULL;
+	struct sysctl_oid *oidp = NULL;
+
+
+	if (nvfsp->vfc_vfsops->vfs_sysctl) {
+		struct sysctl_oid oid = SYSCTL_STRUCT_INIT(_vfs, nvfsp->vfc_typenum, , CTLTYPE_NODE | CTLFLAG_KERN | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, vfs_sysctl_node, "-", "");
+
+		oidp = kalloc_type(struct sysctl_oid, Z_WAITOK);
+		*oidp = oid;
+	}
 
 	/*
 	 * Find the next empty slot; we recognize an empty slot by a
@@ -543,19 +513,18 @@ vfstable_add(struct vfstable  *nvfsp)
 findslot:
 	mount_list_lock();
 	for (slot = 0; slot < maxvfsslots; slot++) {
-		if (vfsconf[slot].vfc_vfsops == NULL)
+		if (vfsconf[slot].vfc_vfsops == NULL) {
 			break;
+		}
 	}
 	if (slot == maxvfsslots) {
 		if (allocated == NULL) {
 			mount_list_unlock();
 			/* out of static slots; allocate one instead */
-			MALLOC(allocated, struct vfstable *, sizeof(struct vfstable),
-					M_TEMP, M_WAITOK);
+			allocated = kalloc_type(struct vfstable, Z_WAITOK);
 			goto findslot;
 		} else {
 			slotp = allocated;
-			allocated = NULL;
 		}
 	} else {
 		slotp = &vfsconf[slot];
@@ -575,15 +544,28 @@ findslot:
 	} else {
 		slotp->vfc_next = NULL;
 	}
-	numused_vfsslots++;
+
+	if (slotp != allocated) {
+		/* used a statically allocated slot */
+		numused_vfsslots++;
+	}
+	numregistered_fses++;
+
+	if (oidp) {
+		/* Memory freed in vfstable_del after unregistration */
+		slotp->vfc_sysctl = oidp;
+		oidp->oid_name = slotp->vfc_name;
+		sysctl_register_oid(slotp->vfc_sysctl);
+	}
 
 	mount_list_unlock();
 
-	if (allocated != NULL) {
-		FREE(allocated, M_TEMP);
+	if (allocated && allocated != slotp) {
+		/* did allocation, but ended up using static slot */
+		kfree_type(struct vfstable, allocated);
 	}
 
-	return(slotp);
+	return slotp;
 }
 
 /*
@@ -606,7 +588,7 @@ vfstable_del(struct vfstable  * vtbl)
 	struct vfstable *vcdelp;
 
 #if DEBUG
-	lck_mtx_assert(mnt_list_mtx_lock, LCK_MTX_ASSERT_OWNED);
+	lck_mtx_assert(&mnt_list_mtx_lock, LCK_MTX_ASSERT_OWNED);
 #endif /* DEBUG */
 
 	/*
@@ -614,13 +596,20 @@ vfstable_del(struct vfstable  * vtbl)
 	 * will contain the address of the pointer to the entry to
 	 * be removed.
 	 */
-	for( vcpp = &vfsconf; *vcpp; vcpp = &(*vcpp)->vfc_next) {
-		if (*vcpp == vtbl)
-            break;
-        }
+	for (vcpp = &vfsconf; *vcpp; vcpp = &(*vcpp)->vfc_next) {
+		if (*vcpp == vtbl) {
+			break;
+		}
+	}
 
-	if (*vcpp == NULL)
-	   return(ESRCH);	/* vtbl not on vfsconf list */
+	if (*vcpp == NULL) {
+		return ESRCH; /* vtbl not on vfsconf list */
+	}
+	if ((*vcpp)->vfc_sysctl) {
+		sysctl_unregister_oid((*vcpp)->vfc_sysctl);
+		(*vcpp)->vfc_sysctl->oid_name = NULL;
+		kfree_type(struct sysctl_oid, (*vcpp)->vfc_sysctl);
+	}
 
 	/* Unlink entry */
 	vcdelp = *vcpp;
@@ -631,38 +620,45 @@ vfstable_del(struct vfstable  * vtbl)
 	 * seeing if the pointer to the object to be deleted places
 	 * the object in the address space containing the table (or not).
 	 */
-	if (vcdelp >= vfsconf && vcdelp < (vfsconf + maxvfsslots)) {	/* Y */
+	if (vcdelp >= vfsconf && vcdelp < (vfsconf + maxvfsslots)) {    /* Y */
 		/* Mark as empty for vfscon_add() */
 		bzero(vcdelp, sizeof(struct vfstable));
+		numregistered_fses--;
 		numused_vfsslots--;
-	} else {							/* N */
+	} else {                                                        /* N */
 		/*
 		 * This entry was dynamically allocated; we must free it;
 		 * we would prefer to have just linked the caller's
 		 * vfsconf onto our list, but it may not be persistent
 		 * because of the previous (copying) implementation.
 		 */
+		numregistered_fses--;
 		mount_list_unlock();
-		FREE(vcdelp, M_TEMP);
+		kfree_type(struct vfstable, vcdelp);
 		mount_list_lock();
 	}
 
 #if DEBUG
-	lck_mtx_assert(mnt_list_mtx_lock, LCK_MTX_ASSERT_OWNED);
+	lck_mtx_assert(&mnt_list_mtx_lock, LCK_MTX_ASSERT_OWNED);
 #endif /* DEBUG */
 
-	return(0);
+	return 0;
+}
+
+lck_mtx_t *
+SPECHASH_LOCK_ADDR(void)
+{
+	return &spechash_mtx_lock;
 }
 
 void
 SPECHASH_LOCK(void)
 {
-	lck_mtx_lock(spechash_mtx_lock);
+	lck_mtx_lock(&spechash_mtx_lock);
 }
 
 void
 SPECHASH_UNLOCK(void)
 {
-	lck_mtx_unlock(spechash_mtx_lock);
+	lck_mtx_unlock(&spechash_mtx_lock);
 }
-

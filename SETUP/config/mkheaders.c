@@ -2,7 +2,7 @@
  * Copyright (c) 1999-2006 Apple Computer, Inc. All rights reserved.
  *
  * @APPLE_LICENSE_HEADER_START@
- * 
+ *
  * "Portions Copyright (c) 1999 Apple Computer, Inc.  All Rights
  * Reserved.  This file contains Original Code and/or Modifications of
  * Original Code as defined in and that are subject to the Apple Public
@@ -10,7 +10,7 @@
  * except in compliance with the License.  Please obtain a copy of the
  * License at http://www.apple.com/publicsource and read it before using
  * this file.
- * 
+ *
  * The Original Code and all software distributed under the License are
  * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
@@ -18,10 +18,10 @@
  * FITNESS FOR A PARTICULAR PURPOSE OR NON-INFRINGEMENT.  Please see the
  * License for the specific language governing rights and limitations
  * under the License."
- * 
+ *
  * @APPLE_LICENSE_HEADER_END@
  */
-/* 
+/*
  * Mach Operating System
  * Copyright (c) 1990 Carnegie-Mellon University
  * Copyright (c) 1989 Carnegie-Mellon University
@@ -57,25 +57,26 @@ static char sccsid[] __attribute__((used)) = "@(#)mkheaders.c	5.5 (Berkeley) 6/1
  */
 
 #include <stdio.h>
-#include <unistd.h>	/* unlink */
+#include <unistd.h>     /* unlink */
 #include <ctype.h>
 #include "config.h"
 #include "parser.h"
 
-static void	do_count(const char *dev, const char *hname, int search);
-static void	do_header(const char *dev, const char *hname, int count);
-static int	file_needed(const char *name);
-static char 	*toheader(const char *dev);
-static char	*tomacro(const char *dev);
+static void     do_count(const char *dev, const char *hname, int search);
+static void     do_header(const char *dev, const char *hname, int count);
+static char     *toheader(const char *dev);
+static char     *tomacro(const char *dev);
 
 void
 headers(void)
 {
 	struct file_list *fl;
 
-	for (fl = ftab; fl != 0; fl = fl->f_next)
-		if (fl->f_needs != 0)
+	for (fl = ftab; fl != 0; fl = fl->f_next) {
+		if (fl->f_needs != 0) {
 			do_count(fl->f_needs, fl->f_needs, 1);
+		}
+	}
 }
 
 /*
@@ -85,73 +86,22 @@ headers(void)
 void
 do_count(const char *dev, const char *hname, int search)
 {
-	struct device *dp, *mp;
+	struct device *dp;
 	int count;
 
-	for (count = 0,dp = dtab; dp != 0; dp = dp->d_next)
-		if (dp->d_unit != -1 && eq(dp->d_name, dev)) {
-			/*
-			 * Avoid making .h files for bus types on sun machines
-			 */
-			if ((machine == MACHINE_SUN2 ||
-			     machine == MACHINE_SUN3 ||
-			     machine == MACHINE_SUN4)
-			    && dp->d_conn == TO_NEXUS){
-				return;
-			}
+	for (count = 0, dp = dtab; dp != 0; dp = dp->d_next) {
+		if (eq(dp->d_name, dev)) {
 			if (dp->d_type == PSEUDO_DEVICE) {
 				count =
 				    dp->d_slave != UNKNOWN ? dp->d_slave : 1;
-				if (dp->d_flags)
+				if (dp->d_flags) {
 					dev = NULL;
+				}
 				break;
 			}
-                        if (machine != MACHINE_SUN2 && machine != MACHINE_SUN3
-			    && machine != MACHINE_SUN4)
-				/* avoid ie0,ie0,ie1 setting NIE to 3 */
-			count++;
-			/*
-			 * Allow holes in unit numbering,
-			 * assumption is unit numbering starts
-			 * at zero.
-			 */
-			if (dp->d_unit + 1 > count)
-				count = dp->d_unit + 1;
-			if (search) {
-				mp = dp->d_conn;
-                                if (mp != 0 && mp != TO_NEXUS &&
-				    mp->d_conn != TO_NEXUS) {
-                                        /*
-					 * Check for the case of the
-					 * controller that the device
-					 * is attached to is in a separate
-					 * file (e.g. "sd" and "sc").
-					 * In this case, do NOT define
-					 * the number of controllers
-					 * in the hname .h file.
-					 */
-					if (!file_needed(mp->d_name))
-					    do_count(mp->d_name, hname, 0);
-					search = 0;
-				}
-			}
 		}
-	do_header(dev, hname, count);
-}
-
-/*
- * Scan the file list to see if name is needed to bring in a file.
- */
-static int
-file_needed(const char *name)
-{
-	struct file_list *fl;
-
-	for (fl = ftab; fl != 0; fl = fl->f_next) {
-		if (fl->f_needs && strcmp(fl->f_needs, name) == 0)
-			return (1);
 	}
-	return (0);
+	do_header(dev, hname, count);
 }
 
 static void
@@ -160,7 +110,7 @@ do_header(const char *dev, const char *hname, int count)
 	char *file, *name;
 	const char *inw;
 	char *inwcopy;
-	struct file_list *fl = NULL;	/* may exit for(;;) uninitted */
+	struct file_list *fl = NULL;    /* may exit for(;;) uninitted */
 	struct file_list *fl_head, *fl_prev;
 	FILE *inf, *outf;
 	int inc, oldcount;
@@ -191,22 +141,26 @@ do_header(const char *dev, const char *hname, int count)
 	fl_head = 0;
 	for (;;) {
 		const char *cp;
-		if ((inw = get_word(inf)) == 0 || inw == (char *)EOF)
+		if ((inw = get_word(inf)) == 0 || inw == (char *)EOF) {
 			break;
-		if ((inw = get_word(inf)) == 0 || inw == (char *)EOF)
+		}
+		if ((inw = get_word(inf)) == 0 || inw == (char *)EOF) {
 			break;
+		}
 		inwcopy = ns(inw);
 		cp = get_word(inf);
-		if (cp == 0 || cp == (char *)EOF)
+		if (cp == 0 || cp == (char *)EOF) {
 			break;
+		}
 		inc = atoi(cp);
 		if (eq(inwcopy, name)) {
 			oldcount = inc;
 			inc = count;
 		}
 		cp = get_word(inf);
-		if (cp == (char *)EOF)
+		if (cp == (char *)EOF) {
 			break;
+		}
 		fl = (struct file_list *) malloc(sizeof *fl);
 		fl->f_fn = inwcopy;
 		fl->f_type = inc;
@@ -215,7 +169,7 @@ do_header(const char *dev, const char *hname, int count)
 	}
 	(void) fclose(inf);
 	if (count == oldcount) {
-		while (fl !=0) {
+		while (fl != 0) {
 			fl_prev = fl;
 			fl = fl->f_next;
 			free((char *)fl_prev);
@@ -251,8 +205,8 @@ toheader(const char *dev)
 {
 	static char hbuf[MAXPATHLEN];
 	(void) snprintf(hbuf, sizeof hbuf, "%s.h", path(dev));
-	hbuf[MAXPATHLEN-1] = '\0';
-	return (hbuf);
+	hbuf[MAXPATHLEN - 1] = '\0';
+	return hbuf;
 }
 
 /*
@@ -266,11 +220,13 @@ tomacro(const char *dev)
 
 	cp = mbuf;
 	*cp++ = 'N';
-	while (*dev)
-		if (!islower(*dev))
+	while (*dev) {
+		if (!islower(*dev)) {
 			*cp++ = *dev++;
-		else
+		} else {
 			*cp++ = toupper(*dev++);
+		}
+	}
 	*cp++ = 0;
-	return (mbuf);
+	return mbuf;
 }

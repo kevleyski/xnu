@@ -12,8 +12,7 @@ DATAFILES = \
 	audit.4 \
 	auditpipe.4	\
 	bpf.4	\
-	divert.4	\
-        dummynet.4 \
+	dummynet.4 \
 	fd.4	\
 	gif.4	\
 	icmp.4	\
@@ -23,7 +22,6 @@ DATAFILES = \
 	inet6.4	\
 	ip.4	\
 	ip6.4	\
-	ipfirewall.4	\
 	ipl.4	\
 	ipsec.4	\
 	lo.4	\
@@ -43,6 +41,7 @@ DATAFILES = \
 	udp.4	\
 	unix.4	\
 	urandom.4	\
+	vsock.4	\
 
 INSTALL_MAN_LIST = ${DATAFILES}
 
@@ -50,4 +49,3 @@ INSTALL_MAN_DIR = man4
 
 include $(MakeInc_rule)
 include $(MakeInc_dir)
-

@@ -2,7 +2,7 @@
  * Copyright (c) 2007 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
- * 
+ *
  * This file contains Original Code and/or Modifications of Original Code
  * as defined in and that are subject to the Apple Public Source License
  * Version 2.0 (the 'License'). You may not use this file except in
@@ -11,10 +11,10 @@
  * unlawful or unlicensed copies of an Apple operating system, or to
  * circumvent, violate, or enable the circumvention or violation of, any
  * terms of an Apple operating system software license agreement.
- * 
+ *
  * Please obtain a copy of the License at
  * http://www.opensource.apple.com/apsl/ and read it before using this file.
- * 
+ *
  * The Original Code and all software distributed under the License are
  * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
@@ -22,7 +22,7 @@
  * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
  * Please see the License for the specific language governing rights and
  * limitations under the License.
- * 
+ *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
 /*-
@@ -58,71 +58,95 @@
 #warning "MAC policy is not KPI, see Technical Q&A QA1574, this header will be removed in next version"
 #endif
 
-int mac_task_check_service(task_t self, task_t obj, const char *perm);
-void mac_task_label_update_internal(struct label *pl, struct task *t);
-int mac_port_label_compute(struct label *subj, struct label *obj,
-    const char *serv, struct label *out);
-int mac_port_check_method(task_t task, struct label *sub, struct label *obj, int msgid);
+#include <mach/mach_types.h>
+#include <stdint.h>
 
 /* mac_do_machexc() flags */
 #define	MAC_DOEXCF_TRACED	0x01	/* Only do mach exeception if
 					   being ptrace()'ed */
+struct exception_action;
+struct proc;
 struct uthread;
+struct task;
+
 int	mac_do_machexc(int64_t code, int64_t subcode, uint32_t flags __unused);
 int	mac_schedule_userret(void);
-struct label *mac_thread_get_threadlabel(struct thread *thread);
-struct label *mac_thread_get_uthreadlabel(struct uthread *uthread);
+
+/* telemetry */
+int mac_schedule_telemetry(void);
 
 #if CONFIG_MACF
 void mac_policy_init(void);
 void mac_policy_initmach(void);
 
 /* tasks */
-void mac_task_label_init(struct label *);
-void mac_task_label_copy(struct label *src, struct label *dest);
-void mac_task_label_destroy(struct label *);
-void mac_task_label_associate(struct task *, struct task *, struct label *,
-    struct label *, struct label *);
-void mac_task_label_associate_kernel(struct task *, struct label *, struct label *);
-void mac_task_label_modify( struct task *pt, void *arg,
-    void (*f)(struct label *l, void *arg));
-struct label *mac_task_get_label(struct task *task);
+int	mac_task_check_expose_task(struct task *t, mach_task_flavor_t flavor);
+int	mac_task_check_task_id_token_get_task(struct task *t, mach_task_flavor_t flavor);
+int	mac_task_check_set_host_special_port(struct task *task,
+	    int id, struct ipc_port *port);
+int	mac_task_check_set_host_exception_port(struct task *task,
+	    unsigned int exception);
+int	mac_task_check_set_host_exception_ports(struct task *task,
+	    unsigned int exception_mask);
+int	mac_task_check_get_task_special_port(struct task *task,
+	    struct task *target, int which);
+int	mac_task_check_set_task_special_port(struct task *task,
+	    struct task *target, int which, struct ipc_port *port);
+int	mac_task_check_set_task_exception_ports(struct task *task,
+	    struct task *target, unsigned int exception_mask, int new_behavior);
+int	mac_task_check_set_thread_exception_ports(struct task *task,
+	    struct task *target, unsigned int exception_mask, int new_behavior);
+int mac_task_check_get_movable_control_port(void);
+int mac_task_check_dyld_process_info_notify_register(void);
 
-/* ports */
-void mac_port_label_init(struct label *l);
-void mac_port_label_destroy(struct label *l);
-void mac_port_label_associate(struct label *it, struct label *st, struct label *plabel);
-void mac_port_label_associate_kernel(struct label *plabel, int isreply);
-void mac_port_label_update_kobject(struct label *plabel, int kotype);
-void mac_port_label_copy(struct label *src, struct label *dest);
-void mac_port_label_update_cred(struct label *src, struct label *dest);
-int mac_port_check_label_update(struct label *task, struct label *oldl, struct label *newl);
+/* See rdar://problem/58989880 */
+#ifndef bitstr_test
+#   define bitstr_test(name, bit) ((name)[((bit) >> 3)] & (1 << ((bit) & 0x7)))
+#endif /* ! bitstr_test */
 
-int mac_port_check_send(struct label *task, struct label *port);
-int mac_port_check_receive(struct label *task, struct label *sender);
-int mac_port_check_make_send(struct label *task, struct label *port);
-int mac_port_check_make_send_once(struct label *task, struct label *port);
-int mac_port_check_move_receive(struct label *task, struct label *port);
-int mac_port_check_copy_send(struct label *task, struct label *port);
-int mac_port_check_move_send(struct label *task, struct label *port);
-int mac_port_check_move_send_once(struct label *task, struct label *port);
+typedef int (*mac_task_mach_filter_cbfunc_t)(struct proc *bsdinfo, int num);
+typedef int (*mac_task_kobj_filter_cbfunc_t)(struct proc *bsdinfo, int msgid, int index);
+extern mac_task_mach_filter_cbfunc_t mac_task_mach_trap_evaluate;
+extern mac_task_kobj_filter_cbfunc_t mac_task_kobj_msg_evaluate;
+extern const int mach_trap_count;
+extern int mach_kobj_count;
 
-int mac_port_check_hold_send(struct label *task, struct label *port);
-int mac_port_check_hold_send_once(struct label *task, struct label *port);
-int mac_port_check_hold_receive(struct label *task, struct label *port);
+uint8_t *mac_task_get_mach_filter_mask(struct task *task);
+uint8_t *mac_task_get_kobj_filter_mask(struct task *task);
 
-int mac_task_label_externalize(struct label *, char *e, char *out, size_t olen, int flags);
-int mac_task_label_internalize(struct label *label, char *string);
-int mac_port_label_externalize(struct label *, char *e, char *out, size_t olen, int flags);
-int mac_port_label_internalize(struct label *label, char *string);
-
-void	mac_task_label_update(struct label *cred, struct label *task);
-int	mac_port_check_service(struct label *subj, struct label *obj,
-	    const char *serv, const char *perm);
+void mac_task_set_mach_filter_mask(struct task *task, uint8_t *maskptr);
+void mac_task_set_kobj_filter_mask(struct task *task, uint8_t *maskptr);
+int  mac_task_register_filter_callbacks(
+		const mac_task_mach_filter_cbfunc_t mach_cbfunc,
+		const mac_task_kobj_filter_cbfunc_t kobj_cbfunc);
 
 /* threads */
 void	act_set_astmacf(struct thread *);
 void	mac_thread_userret(struct thread *);
+void	mac_thread_telemetry(struct thread *, int, void *, size_t);
+
+/* exception actions */
+struct label *mac_exc_create_label(struct exception_action *action);
+struct label *mac_exc_label(struct exception_action *action);
+void mac_exc_set_label(struct exception_action *action, struct label *label);
+void mac_exc_free_label(struct label *label);
+
+void mac_exc_associate_action_label(struct exception_action *action, struct label *label);
+void mac_exc_free_action_label(struct exception_action *action);
+
+int mac_exc_update_action_label(struct exception_action *action, struct label *newlabel);
+int mac_exc_inherit_action_label(struct exception_action *parent, struct exception_action *child);
+int mac_exc_update_task_crash_label(struct task *task, struct label *newlabel);
+
+int mac_exc_action_check_exception_send(struct task *victim_task, struct exception_action *action);
+
+void mac_proc_notify_exec_complete(struct proc *proc);
+int mac_proc_check_remote_thread_create(struct task *task, int flavor, thread_state_t new_state, mach_msg_type_number_t new_state_count);
+void mac_proc_notify_service_port_derive(struct mach_service_port_info *sp_info);
+
+struct label *mac_exc_create_label_for_proc(struct proc *proc);
+struct label *mac_exc_create_label_for_current_proc(void);
+
 #endif /* MAC */
 
 #endif	/* !_SECURITY_MAC_MACH_INTERNAL_H_ */

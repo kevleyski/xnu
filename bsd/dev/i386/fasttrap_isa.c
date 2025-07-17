@@ -24,16 +24,6 @@
  * Use is subject to license terms.
  */
 
-/*
- * #pragma ident	"@(#)fasttrap_isa.c	1.27	08/04/09 SMI"
- */
-
-#ifdef KERNEL
-#ifndef _KERNEL
-#define _KERNEL /* Solaris vs. Darwin */
-#endif
-#endif
-
 #include <sys/fasttrap_isa.h>
 #include <sys/fasttrap_impl.h>
 #include <sys/dtrace.h>
@@ -135,7 +125,6 @@ extern dtrace_id_t dtrace_probeid_error;
 
 #define	FASTTRAP_INT3		0xcc
 #define	FASTTRAP_INT		0xcd
-#define	T_DTRACE_RET		0x7f
 
 #define	FASTTRAP_2_BYTE_OP	0x0f
 #define	FASTTRAP_GROUP5_OP	0xff
@@ -197,21 +186,19 @@ extern dtrace_id_t dtrace_probeid_error;
  *
  * REG_RAX -> EAX
  * REG_RCX -> ECX
- * ...
+ * REG_RDX -> EDX
+ * REG_RBX -> EBX
+ * REG_RSP -> UESP
+ * REG_RBP -> EBP
+ * REG_RSI -> ESI
  * REG_RDI -> EDI
  *
  * The fasttrap_getreg function knows how to make the correct transformation.
  */
-#if __sol64 || defined(__APPLE__)
 static const uint8_t regmap[16] = {
 	REG_RAX, REG_RCX, REG_RDX, REG_RBX, REG_RSP, REG_RBP, REG_RSI, REG_RDI,
 	REG_R8, REG_R9, REG_R10, REG_R11, REG_R12, REG_R13, REG_R14, REG_R15,
 };
-#else
-static const uint8_t regmap[8] = {
-	EAX, ECX, EDX, EBX, UESP, EBP, ESI, EDI
-};
-#endif
 
 static user_addr_t fasttrap_getreg(x86_saved_state_t *, uint_t);
 
@@ -237,7 +224,7 @@ fasttrap_anarg(x86_saved_state_t *regs, int function_entry, int argno)
 
 	if (p_model == DATAMODEL_LP64) {
 		user_addr_t stack;
-		
+
 		/*
 		 * In 64-bit mode, the first six arguments are stored in
 		 * registers.
@@ -325,22 +312,22 @@ fasttrap_tracepoint_init(proc_t *p, fasttrap_tracepoint_t *tp, user_addr_t pc,
 		switch (instr[start]) {
 		case FASTTRAP_PREFIX_SS:
 			seg++;
-			/*FALLTHRU*/
+			OS_FALLTHROUGH;
 		case FASTTRAP_PREFIX_GS:
 			seg++;
-			/*FALLTHRU*/
+			OS_FALLTHROUGH;
 		case FASTTRAP_PREFIX_FS:
 			seg++;
-			/*FALLTHRU*/
+			OS_FALLTHROUGH;
 		case FASTTRAP_PREFIX_ES:
 			seg++;
-			/*FALLTHRU*/
+			OS_FALLTHROUGH;
 		case FASTTRAP_PREFIX_DS:
 			seg++;
-			/*FALLTHRU*/
+			OS_FALLTHROUGH;
 		case FASTTRAP_PREFIX_CS:
 			seg++;
-			/*FALLTHRU*/
+			OS_FALLTHROUGH;
 		case FASTTRAP_PREFIX_OPERAND:
 		case FASTTRAP_PREFIX_ADDRESS:
 		case FASTTRAP_PREFIX_LOCK:
@@ -363,13 +350,11 @@ fasttrap_tracepoint_init(proc_t *p, fasttrap_tracepoint_t *tp, user_addr_t pc,
 		break;
 	}
 
-#if __sol64 || defined(__APPLE__)
 	/*
 	 * Identify the REX prefix on 64-bit processes.
 	 */
 	if (p_model == DATAMODEL_LP64 && (instr[start] & 0xf0) == 0x40)
 		rex = instr[start++];
-#endif
 
 	/*
 	 * Now that we're pretty sure that the instruction is okay, copy the
@@ -452,11 +437,9 @@ fasttrap_tracepoint_init(proc_t *p, fasttrap_tracepoint_t *tp, user_addr_t pc,
 				 * modes, there is a 32-bit operand.
 				 */
 				if (mod == 0 && rm == 5) {
-#if __sol64 || defined(__APPLE__)
 					if (p_model == DATAMODEL_LP64)
 						tp->ftt_base = REG_RIP;
 					else
-#endif
 						tp->ftt_base = FASTTRAP_NOREG;
 					sz = 4;
 				} else  {
@@ -554,7 +537,6 @@ fasttrap_tracepoint_init(proc_t *p, fasttrap_tracepoint_t *tp, user_addr_t pc,
 			break;
 
 		case FASTTRAP_NOP:
-#if __sol64 || defined(__APPLE__)
 			ASSERT(p_model == DATAMODEL_LP64 || rex == 0);
 
 			/*
@@ -564,7 +546,6 @@ fasttrap_tracepoint_init(proc_t *p, fasttrap_tracepoint_t *tp, user_addr_t pc,
 			 * (e.g. xchgl %r8d, %eax or xcghq %r8, %rax).
 			 */
 			if (FASTTRAP_REX_B(rex) == 0)
-#endif
 				tp->ftt_type = FASTTRAP_T_NOP;
 			break;
 
@@ -591,7 +572,6 @@ fasttrap_tracepoint_init(proc_t *p, fasttrap_tracepoint_t *tp, user_addr_t pc,
 		}
 	}
 
-#if __sol64 || defined(__APPLE__)
 	if (p_model == DATAMODEL_LP64 && tp->ftt_type == FASTTRAP_T_COMMON) {
 		/*
 		 * If the process is 64-bit and the instruction type is still
@@ -637,7 +617,6 @@ fasttrap_tracepoint_init(proc_t *p, fasttrap_tracepoint_t *tp, user_addr_t pc,
 			}
 		}
 	}
-#endif
 
 	return (0);
 }
@@ -649,6 +628,8 @@ fasttrap_tracepoint_install(proc_t *p, fasttrap_tracepoint_t *tp)
 
 	if (uwrite(p, &instr, 1, tp->ftt_pc) != 0)
 		return (-1);
+
+	tp->ftt_installed = 1;
 
 	return (0);
 }
@@ -663,11 +644,13 @@ fasttrap_tracepoint_remove(proc_t *p, fasttrap_tracepoint_t *tp)
 	 * instruction.
 	 */
 	if (uread(p, &instr, 1, tp->ftt_pc) != 0)
-		return (0);
+		goto end;
 	if (instr != FASTTRAP_INSTR)
-		return (0);
+		goto end;
 	if (uwrite(p, &tp->ftt_instr[0], 1, tp->ftt_pc) != 0)
 		return (-1);
+end:
+	tp->ftt_installed = 0;
 
 	return (0);
 }
@@ -679,6 +662,7 @@ fasttrap_return_common(x86_saved_state_t *regs, user_addr_t pc, pid_t pid,
 	x86_saved_state64_t *regs64;
 	x86_saved_state32_t *regs32;
 	unsigned int p_model;
+	int retire_tp = 1;
 
 	dtrace_icookie_t cookie;
 
@@ -718,6 +702,7 @@ fasttrap_return_common(x86_saved_state_t *regs, user_addr_t pc, pid_t pid,
 	}
 
 	for (id = tp->ftt_retids; id != NULL; id = id->fti_next) {
+		fasttrap_probe_t *probe = id->fti_probe;
 		/*
 		 * If there's a branch that could act as a return site, we
 		 * need to trace it, and check here if the program counter is
@@ -725,10 +710,23 @@ fasttrap_return_common(x86_saved_state_t *regs, user_addr_t pc, pid_t pid,
 		 */
 		if (tp->ftt_type != FASTTRAP_T_RET &&
 		    tp->ftt_type != FASTTRAP_T_RET16 &&
-		    new_pc - id->fti_probe->ftp_faddr <
-		    id->fti_probe->ftp_fsize)
+		    new_pc - probe->ftp_faddr < probe->ftp_fsize)
 			continue;
 
+		if (probe->ftp_prov->ftp_provider_type == DTFTP_PROVIDER_ONESHOT) {
+			if (os_atomic_xchg(&probe->ftp_triggered, 1, relaxed)) {
+				/* already triggered */
+				continue;
+			}
+		}
+		/*
+		 * If we have at least one probe associated that
+		 * is not a oneshot probe, don't remove the
+		 * tracepoint
+		 */
+		else {
+			retire_tp = 0;
+		}
 		/*
 		 * Provide a hint to the stack trace functions to add the
 		 * following pc to the top of the stack since it's missing
@@ -737,14 +735,14 @@ fasttrap_return_common(x86_saved_state_t *regs, user_addr_t pc, pid_t pid,
 		cookie = dtrace_interrupt_disable();
 		cpu_core[CPU->cpu_id].cpuc_missing_tos = pc;
 		if (ISSET(current_proc()->p_lflag, P_LNOATTACH)) {
-			dtrace_probe(dtrace_probeid_error, 0 /* state */, id->fti_probe->ftp_id, 
+			dtrace_probe(dtrace_probeid_error, 0 /* state */, probe->ftp_id,
 				     1 /* ndx */, -1 /* offset */, DTRACEFLT_UPRIV);
 		} else if (p_model == DATAMODEL_LP64) {
-			dtrace_probe(id->fti_probe->ftp_id,
+			dtrace_probe(probe->ftp_id,
 				     pc - id->fti_probe->ftp_faddr,
 				     regs64->rax, regs64->rdx, 0, 0);
 		} else {
-			dtrace_probe(id->fti_probe->ftp_id,
+			dtrace_probe(probe->ftp_id,
 				     pc - id->fti_probe->ftp_faddr,
 				     regs32->eax, regs32->edx, 0, 0);
 		}
@@ -758,14 +756,14 @@ fasttrap_return_common(x86_saved_state_t *regs, user_addr_t pc, pid_t pid,
 
 static void
 fasttrap_sigsegv(proc_t *p, uthread_t t, user_addr_t addr)
-{	
+{
 	proc_lock(p);
 
 	/* Set fault address and mark signal */
 	t->uu_code = addr;
 	t->uu_siglist |= sigmask(SIGSEGV);
 
-	/* 
+	/*
          * XXX These two line may be redundant; if not, then we need
 	 * XXX to potentially set the data address in the machine
 	 * XXX specific thread state structure to indicate the address.
@@ -776,7 +774,7 @@ fasttrap_sigsegv(proc_t *p, uthread_t t, user_addr_t addr)
 	proc_unlock(p);
 
 	/* raise signal */
-	signal_setast(t->uu_context.vc_thread);
+	signal_setast(get_machthread(t));
 }
 
 static void
@@ -963,9 +961,9 @@ fasttrap_pid_probe32(x86_saved_state_t *regs)
 	fasttrap_tracepoint_t *tp, tp_local;
 	pid_t pid;
 	dtrace_icookie_t cookie;
-	uint_t is_enabled = 0;
+	uint_t is_enabled = 0, retire_tp = 1;
 
-	uthread_t uthread = (uthread_t)get_bsdthread_info(current_thread());
+	uthread_t uthread = current_uthread();
 
 	/*
 	 * It's possible that a user (in a veritable orgy of bad planning)
@@ -988,19 +986,8 @@ fasttrap_pid_probe32(x86_saved_state_t *regs)
 	uthread->t_dtrace_scrpc = 0;
 	uthread->t_dtrace_astpc = 0;
 
-	/*
-	 * Treat a child created by a call to vfork(2) as if it were its
-	 * parent. We know that there's only one thread of control in such a
-	 * process: this one.
-	 */
-	/*
-	 * APPLE NOTE: Terry says: "You need to hold the process locks (currently: kernel funnel) for this traversal"
-	 * FIXME: How do we assert this?
-	 */
-	while (p->p_lflag & P_LINVFORK)
-		p = p->p_pptr;
 
-	pid = p->p_pid;
+	pid = proc_getpid(p);
 	pid_mtx = &cpu_core[CPU->cpu_id].cpuc_pid_lock;
 	lck_mtx_lock(pid_mtx);
 	bucket = &fasttrap_tpoints.fth_table[FASTTRAP_TPOINTS_INDEX(pid, pc)];
@@ -1032,10 +1019,10 @@ fasttrap_pid_probe32(x86_saved_state_t *regs)
 
 	if (tp->ftt_ids != NULL) {
 		fasttrap_id_t *id;
-		
+
 		uint32_t s0, s1, s2, s3, s4, s5;
 		uint32_t *stack = (uint32_t *)(uintptr_t)(regs32->uesp);
-		
+
 		/*
 		 * In 32-bit mode, all arguments are passed on the
 		 * stack. If this is a function entry probe, we need
@@ -1049,51 +1036,65 @@ fasttrap_pid_probe32(x86_saved_state_t *regs)
 		fasttrap_fuword32_noerr((user_addr_t)(unsigned long)&stack[3], &s3);
 		fasttrap_fuword32_noerr((user_addr_t)(unsigned long)&stack[4], &s4);
 		fasttrap_fuword32_noerr((user_addr_t)(unsigned long)&stack[5], &s5);
-		
+
 		for (id = tp->ftt_ids; id != NULL; id = id->fti_next) {
 			fasttrap_probe_t *probe = id->fti_probe;
-			
-			if (ISSET(current_proc()->p_lflag, P_LNOATTACH)) {
-				dtrace_probe(dtrace_probeid_error, 0 /* state */, probe->ftp_id, 
-					     1 /* ndx */, -1 /* offset */, DTRACEFLT_UPRIV);
-			} else if (id->fti_ptype == DTFTP_ENTRY) {
-				/*
-				 * We note that this was an entry
-				 * probe to help ustack() find the
-				 * first caller.
-				 */
-				cookie = dtrace_interrupt_disable();
-				DTRACE_CPUFLAG_SET(CPU_DTRACE_ENTRY);
-				dtrace_probe(probe->ftp_id, s1, s2,
-					     s3, s4, s5);
-				DTRACE_CPUFLAG_CLEAR(CPU_DTRACE_ENTRY);
-				dtrace_interrupt_enable(cookie);
-			} else if (id->fti_ptype == DTFTP_IS_ENABLED) {
-				/*
-				 * Note that in this case, we don't
-				 * call dtrace_probe() since it's only
-				 * an artificial probe meant to change
-				 * the flow of control so that it
-				 * encounters the true probe.
-				 */
-				is_enabled = 1;
-			} else if (probe->ftp_argmap == NULL) {
-				dtrace_probe(probe->ftp_id, s0, s1,
-					     s2, s3, s4);
-			} else {
-				uint32_t t[5];
-				
-				fasttrap_usdt_args32(probe, regs32,
-						     sizeof (t) / sizeof (t[0]), t);
-				
-				dtrace_probe(probe->ftp_id, t[0], t[1],
-					     t[2], t[3], t[4]);
-			}
 
-			/* APPLE NOTE: Oneshot probes get one and only one chance... */
-			if (probe->ftp_prov->ftp_provider_type == DTFTP_PROVIDER_ONESHOT) {
-				fasttrap_tracepoint_remove(p, tp);
+			if (ISSET(current_proc()->p_lflag, P_LNOATTACH)) {
+				dtrace_probe(dtrace_probeid_error, 0 /* state */, probe->ftp_id,
+					     1 /* ndx */, -1 /* offset */, DTRACEFLT_UPRIV);
+			} else {
+				if (probe->ftp_prov->ftp_provider_type == DTFTP_PROVIDER_ONESHOT) {
+					if (os_atomic_xchg(&probe->ftp_triggered, 1, relaxed)) {
+						/* already triggered */
+						continue;
+					}
+				}
+				/*
+				 * If we have at least one probe associated that
+				 * is not a oneshot probe, don't remove the
+				 * tracepoint
+				 */
+				else {
+					retire_tp = 0;
+				}
+				if (id->fti_ptype == DTFTP_ENTRY) {
+					/*
+					 * We note that this was an entry
+					 * probe to help ustack() find the
+					 * first caller.
+					 */
+					cookie = dtrace_interrupt_disable();
+					DTRACE_CPUFLAG_SET(CPU_DTRACE_ENTRY);
+					dtrace_probe(probe->ftp_id, s1, s2,
+						     s3, s4, s5);
+					DTRACE_CPUFLAG_CLEAR(CPU_DTRACE_ENTRY);
+					dtrace_interrupt_enable(cookie);
+				} else if (id->fti_ptype == DTFTP_IS_ENABLED) {
+					/*
+					 * Note that in this case, we don't
+					 * call dtrace_probe() since it's only
+					 * an artificial probe meant to change
+					 * the flow of control so that it
+					 * encounters the true probe.
+					 */
+					is_enabled = 1;
+				} else if (probe->ftp_argmap == NULL) {
+					dtrace_probe(probe->ftp_id, s0, s1,
+						     s2, s3, s4);
+				} else {
+					uint32_t t[5];
+
+					fasttrap_usdt_args32(probe, regs32,
+							     sizeof (t) / sizeof (t[0]), t);
+
+					dtrace_probe(probe->ftp_id, t[0], t[1],
+						     t[2], t[3], t[4]);
+				}
 			}
+		}
+		if (retire_tp) {
+			fasttrap_tracepoint_retire(p, tp);
 		}
 	}
 
@@ -1159,10 +1160,10 @@ fasttrap_pid_probe32(x86_saved_state_t *regs)
 				new_pc = pc;
 				break;
 			}
-			
+
 			if (tp->ftt_type == FASTTRAP_T_RET16)
 				addr += tp->ftt_dest;
-			
+
 			regs32->uesp = addr;
 			new_pc = dst;
 			break;
@@ -1171,7 +1172,7 @@ fasttrap_pid_probe32(x86_saved_state_t *regs)
 		case FASTTRAP_T_JCC:
 		{
 			uint_t taken;
-			
+
 			switch (tp->ftt_code) {
 				case FASTTRAP_JO:
 					taken = (regs32->efl & FASTTRAP_EFLAGS_OF) != 0;
@@ -1232,7 +1233,7 @@ fasttrap_pid_probe32(x86_saved_state_t *regs)
 				default:
 					taken = FALSE;
 			}
-			
+
 			if (taken)
 				new_pc = tp->ftt_dest;
 			else
@@ -1260,7 +1261,7 @@ fasttrap_pid_probe32(x86_saved_state_t *regs)
 				default:
 					taken = FALSE;
 			}
-			
+
 			if (taken)
 				new_pc = tp->ftt_dest;
 			else
@@ -1271,7 +1272,7 @@ fasttrap_pid_probe32(x86_saved_state_t *regs)
 		case FASTTRAP_T_JCXZ:
 		{
 			greg_t cx = regs32->ecx;
-			
+
 			if (cx == 0)
 				new_pc = tp->ftt_dest;
 			else
@@ -1283,18 +1284,18 @@ fasttrap_pid_probe32(x86_saved_state_t *regs)
 		{
 			user_addr_t addr = regs32->uesp - sizeof (uint32_t);
 			int ret = fasttrap_suword32(addr, (uint32_t)regs32->ebp);
-			
+
 			if (ret == -1) {
 				fasttrap_sigsegv(p, uthread, addr);
 				new_pc = pc;
 				break;
 			}
-			
+
 			regs32->uesp = addr;
 			new_pc = pc + tp->ftt_size;
 			break;
 		}
-		
+
 		case FASTTRAP_T_NOP:
 			new_pc = pc + tp->ftt_size;
 			break;
@@ -1311,7 +1312,7 @@ fasttrap_pid_probe32(x86_saved_state_t *regs)
 				if (tp->ftt_index != FASTTRAP_NOREG)
 					addr += fasttrap_getreg(regs, tp->ftt_index) <<
 						tp->ftt_scale;
-				
+
 				if (tp->ftt_code == 1) {
 					/*
 					 * If there's a segment prefix for this
@@ -1325,7 +1326,7 @@ fasttrap_pid_probe32(x86_saved_state_t *regs)
 						new_pc = pc;
 						break;
 					}
-					
+
 					uint32_t value32;
 					addr = (user_addr_t)(uint32_t)addr;
 					if (fasttrap_fuword32(addr, &value32) == -1) {
@@ -1348,20 +1349,20 @@ fasttrap_pid_probe32(x86_saved_state_t *regs)
 			if (tp->ftt_type == FASTTRAP_T_CALL) {
 				user_addr_t addr = regs32->uesp - sizeof (uint32_t);
 				int ret = fasttrap_suword32(addr, (uint32_t)(pc + tp->ftt_size));
-				
+
 				if (ret == -1) {
 					fasttrap_sigsegv(p, uthread, addr);
 					new_pc = pc;
 					break;
 				}
-				
+
 				regs32->uesp = addr;
 			}
 			break;
 
 		case FASTTRAP_T_COMMON:
 		{
-			user_addr_t addr;
+			user_addr_t addr, write_addr;
 			uint8_t scratch[2 * FASTTRAP_MAX_INSTR_SIZE + 7];
 			uint_t i = 0;
 
@@ -1405,8 +1406,9 @@ fasttrap_pid_probe32(x86_saved_state_t *regs)
 			 */
 
 			addr = uthread->t_dtrace_scratch->addr;
+			write_addr = uthread->t_dtrace_scratch->write_addr;
 
-			if (addr == 0LL) {
+			if (addr == 0LL || write_addr == 0LL) {
 				fasttrap_sigtrap(p, uthread, pc); // Should be killing target proc
 				new_pc = pc;
 				break;
@@ -1432,15 +1434,15 @@ fasttrap_pid_probe32(x86_saved_state_t *regs)
 			i += tp->ftt_size;
 			scratch[i++] = FASTTRAP_INT;
 			scratch[i++] = T_DTRACE_RET;
-			
+
 			ASSERT(i <= sizeof (scratch));
 
-			if (fasttrap_copyout(scratch, addr, i)) {
+			if (fasttrap_copyout(scratch, write_addr, i)) {
 				fasttrap_sigtrap(p, uthread, pc);
 				new_pc = pc;
 				break;
 			}
-			
+
 			if (tp->ftt_retids != NULL) {
 				uthread->t_dtrace_step = 1;
 				uthread->t_dtrace_ret = 1;
@@ -1448,17 +1450,17 @@ fasttrap_pid_probe32(x86_saved_state_t *regs)
 			} else {
 				new_pc = uthread->t_dtrace_scrpc;
 			}
-			
+
 			uthread->t_dtrace_pc = pc;
 			uthread->t_dtrace_npc = pc + tp->ftt_size;
 			uthread->t_dtrace_on = 1;
 			break;
 		}
-		
+
 		default:
 			panic("fasttrap: mishandled an instruction");
 	}
-	
+
 done:
 	/*
 	 * APPLE NOTE:
@@ -1522,8 +1524,9 @@ fasttrap_pid_probe64(x86_saved_state_t *regs)
 	pid_t pid;
 	dtrace_icookie_t cookie;
 	uint_t is_enabled = 0;
+	int retire_tp = 1;
 
-	uthread_t uthread = (uthread_t)get_bsdthread_info(current_thread());
+	uthread_t uthread = current_uthread();
 
 	/*
 	 * It's possible that a user (in a veritable orgy of bad planning)
@@ -1547,19 +1550,8 @@ fasttrap_pid_probe64(x86_saved_state_t *regs)
 	uthread->t_dtrace_astpc = 0;
 	uthread->t_dtrace_regv = 0;
 
-	/*
-	 * Treat a child created by a call to vfork(2) as if it were its
-	 * parent. We know that there's only one thread of control in such a
-	 * process: this one.
-	 */
-	/*
-	 * APPLE NOTE: Terry says: "You need to hold the process locks (currently: kernel funnel) for this traversal"
-	 * FIXME: How do we assert this?
-	 */
-	while (p->p_lflag & P_LINVFORK)
-		p = p->p_pptr;
 
-	pid = p->p_pid;
+	pid = proc_getpid(p);
 	pid_mtx = &cpu_core[CPU->cpu_id].cpuc_pid_lock;
 	lck_mtx_lock(pid_mtx);
 	bucket = &fasttrap_tpoints.fth_table[FASTTRAP_TPOINTS_INDEX(pid, pc)];
@@ -1594,9 +1586,23 @@ fasttrap_pid_probe64(x86_saved_state_t *regs)
 
 		for (id = tp->ftt_ids; id != NULL; id = id->fti_next) {
 			fasttrap_probe_t *probe = id->fti_probe;
-			
+
+			if (probe->ftp_prov->ftp_provider_type == DTFTP_PROVIDER_ONESHOT) {
+				if (os_atomic_xchg(&probe->ftp_triggered, 1, relaxed)) {
+					/* already triggered */
+					continue;
+				}
+			}
+			/*
+			 * If we have at least probe associated that
+			 * is not a oneshot probe, don't remove the
+			 * tracepoint
+			 */
+			else {
+				retire_tp = 0;
+			}
 			if (ISSET(current_proc()->p_lflag, P_LNOATTACH)) {
-				dtrace_probe(dtrace_probeid_error, 0 /* state */, probe->ftp_id, 
+				dtrace_probe(dtrace_probeid_error, 0 /* state */, probe->ftp_id,
 					     1 /* ndx */, -1 /* offset */, DTRACEFLT_UPRIV);
 			} else if (id->fti_ptype == DTFTP_ENTRY) {
 				/*
@@ -1626,18 +1632,17 @@ fasttrap_pid_probe64(x86_saved_state_t *regs)
 					     regs64->r8);
 			} else {
 				uint64_t t[5];
-				
+
 				fasttrap_usdt_args64(probe, regs64,
 						     sizeof (t) / sizeof (t[0]), t);
-				
+
 				dtrace_probe(probe->ftp_id, t[0], t[1],
 					     t[2], t[3], t[4]);
 			}
 
-			/* APPLE NOTE: Oneshot probes get one and only one chance... */
-			if (probe->ftp_prov->ftp_provider_type == DTFTP_PROVIDER_ONESHOT) {
-				fasttrap_tracepoint_remove(p, tp);
-			}
+		}
+		if (retire_tp) {
+			fasttrap_tracepoint_retire(p, tp);
 		}
 	}
 
@@ -1687,7 +1692,7 @@ fasttrap_pid_probe64(x86_saved_state_t *regs)
 			user_addr_t dst;
 			user_addr_t addr;
 			int ret;
-			
+
 			/*
 			 * We have to emulate _every_ facet of the behavior of a ret
 			 * instruction including what happens if the load from %esp
@@ -1695,25 +1700,25 @@ fasttrap_pid_probe64(x86_saved_state_t *regs)
 			 */
 			ret = fasttrap_fuword64((user_addr_t)regs64->isf.rsp, &dst);
 			addr = regs64->isf.rsp + sizeof (uint64_t);
-			
+
 			if (ret == -1) {
 				fasttrap_sigsegv(p, uthread, (user_addr_t)regs64->isf.rsp);
 				new_pc = pc;
 				break;
 			}
-			
+
 			if (tp->ftt_type == FASTTRAP_T_RET16)
 				addr += tp->ftt_dest;
-			
+
 			regs64->isf.rsp = addr;
 			new_pc = dst;
 			break;
 		}
-		
+
 		case FASTTRAP_T_JCC:
 		{
 			uint_t taken;
-			
+
 			switch (tp->ftt_code) {
 				case FASTTRAP_JO:
 					taken = (regs64->isf.rflags & FASTTRAP_EFLAGS_OF) != 0;
@@ -1774,7 +1779,7 @@ fasttrap_pid_probe64(x86_saved_state_t *regs)
 				default:
 					taken = FALSE;
 			}
-			
+
 			if (taken)
 				new_pc = tp->ftt_dest;
 			else
@@ -1786,7 +1791,7 @@ fasttrap_pid_probe64(x86_saved_state_t *regs)
 		{
 			uint_t taken;
 			uint64_t cx = regs64->rcx--;
-			
+
 			switch (tp->ftt_code) {
 				case FASTTRAP_LOOPNZ:
 					taken = (regs64->isf.rflags & FASTTRAP_EFLAGS_ZF) == 0 &&
@@ -1802,14 +1807,14 @@ fasttrap_pid_probe64(x86_saved_state_t *regs)
 				default:
 					taken = FALSE;
 			}
-			
+
 			if (taken)
 				new_pc = tp->ftt_dest;
 			else
 				new_pc = pc + tp->ftt_size;
 			break;
 		}
-		
+
 		case FASTTRAP_T_JCXZ:
 		{
 			uint64_t cx = regs64->rcx;
@@ -1825,18 +1830,18 @@ fasttrap_pid_probe64(x86_saved_state_t *regs)
 		{
 			user_addr_t addr = regs64->isf.rsp - sizeof (uint64_t);
 			int ret = fasttrap_suword64(addr, (uint64_t)regs64->rbp);
-			
+
 			if (ret == -1) {
 				fasttrap_sigsegv(p, uthread, addr);
 				new_pc = pc;
 				break;
 			}
-			
+
 			regs64->isf.rsp = addr;
 			new_pc = pc + tp->ftt_size;
 			break;
 		}
-		
+
 		case FASTTRAP_T_NOP:
 			new_pc = pc + tp->ftt_size;
 			break;
@@ -1847,13 +1852,13 @@ fasttrap_pid_probe64(x86_saved_state_t *regs)
 				new_pc = tp->ftt_dest;
 			} else {
 				user_addr_t value, addr = tp->ftt_dest;
-				
+
 				if (tp->ftt_base != FASTTRAP_NOREG)
 					addr += fasttrap_getreg(regs, tp->ftt_base);
 				if (tp->ftt_index != FASTTRAP_NOREG)
 					addr += fasttrap_getreg(regs, tp->ftt_index) <<
 						tp->ftt_scale;
-				
+
 				if (tp->ftt_code == 1) {
 					/*
 					 * If there's a segment prefix for this
@@ -1867,7 +1872,7 @@ fasttrap_pid_probe64(x86_saved_state_t *regs)
 						new_pc = pc;
 						break;
 					}
-					
+
 					if (fasttrap_fuword64(addr, &value) == -1) {
 						fasttrap_sigsegv(p, uthread, addr);
 						new_pc = pc;
@@ -1888,23 +1893,23 @@ fasttrap_pid_probe64(x86_saved_state_t *regs)
 			if (tp->ftt_type == FASTTRAP_T_CALL) {
 				user_addr_t addr = regs64->isf.rsp - sizeof (uint64_t);
 				int ret = fasttrap_suword64(addr, pc + tp->ftt_size);
-				
+
 				if (ret == -1) {
 					fasttrap_sigsegv(p, uthread, addr);
 					new_pc = pc;
 					break;
 				}
-				
+
 				regs64->isf.rsp = addr;
 			}
 			break;
 
 		case FASTTRAP_T_COMMON:
 		{
-			user_addr_t addr;
+			user_addr_t addr, write_addr;
 			uint8_t scratch[2 * FASTTRAP_MAX_INSTR_SIZE + 22];
 			uint_t i = 0;
-			
+
 			/*
 			 * Generic Instruction Tracing
 			 * ---------------------------
@@ -1989,8 +1994,9 @@ fasttrap_pid_probe64(x86_saved_state_t *regs)
 			 */
 
 			addr = uthread->t_dtrace_scratch->addr;
+			write_addr = uthread->t_dtrace_scratch->write_addr;
 
-			if (addr == 0LL) {
+			if (addr == 0LL || write_addr == 0LL) {
 				fasttrap_sigtrap(p, uthread, pc); // Should be killing target proc
 				new_pc = pc;
 				break;
@@ -2004,10 +2010,10 @@ fasttrap_pid_probe64(x86_saved_state_t *regs)
 
 			if (tp->ftt_ripmode != 0) {
 				uint64_t* reg;
-				
+
 				ASSERT(tp->ftt_ripmode &
 				       (FASTTRAP_RIP_1 | FASTTRAP_RIP_2));
-				
+
 				/*
 				 * If this was a %rip-relative instruction, we change
 				 * it to be either a %rax- or %rcx-relative
@@ -2021,12 +2027,12 @@ fasttrap_pid_probe64(x86_saved_state_t *regs)
 					scratch[i++] = FASTTRAP_REX(1, 0, 0, 1);
 				else
 					scratch[i++] = FASTTRAP_REX(1, 0, 0, 0);
-				
+
 				if (tp->ftt_ripmode & FASTTRAP_RIP_1)
 					scratch[i++] = FASTTRAP_MOV_EAX;
 				else
 					scratch[i++] = FASTTRAP_MOV_ECX;
-				
+
 				switch (tp->ftt_ripmode) {
 					case FASTTRAP_RIP_1:
 						reg = &regs64->rax;
@@ -2048,7 +2054,7 @@ fasttrap_pid_probe64(x86_saved_state_t *regs)
 						reg = NULL;
 						panic("unhandled ripmode in fasttrap_pid_probe64");
 				}
-				
+
 				/* LINTED - alignment */
 				*(uint64_t *)&scratch[i] = *reg;
 				uthread->t_dtrace_regv = *reg;
@@ -2080,7 +2086,7 @@ fasttrap_pid_probe64(x86_saved_state_t *regs)
 
 			ASSERT(i <= sizeof (scratch));
 
-			if (fasttrap_copyout(scratch, addr, i)) {
+			if (fasttrap_copyout(scratch, write_addr, i)) {
 				fasttrap_sigtrap(p, uthread, pc);
 				new_pc = pc;
 				break;
@@ -2093,17 +2099,17 @@ fasttrap_pid_probe64(x86_saved_state_t *regs)
 			} else {
 				new_pc = uthread->t_dtrace_scrpc;
 			}
-			
+
 			uthread->t_dtrace_pc = pc;
 			uthread->t_dtrace_npc = pc + tp->ftt_size;
 			uthread->t_dtrace_on = 1;
 			break;
 		}
-		
+
 		default:
 			panic("fasttrap: mishandled an instruction");
 	}
-	
+
 done:
 	/*
 	 * APPLE NOTE:
@@ -2170,7 +2176,7 @@ fasttrap_return_probe(x86_saved_state_t *regs)
         }
 
 	proc_t *p = current_proc();
-	uthread_t uthread = (uthread_t)get_bsdthread_info(current_thread());
+	uthread_t uthread = current_uthread();
 	user_addr_t pc = uthread->t_dtrace_pc;
 	user_addr_t npc = uthread->t_dtrace_npc;
 
@@ -2179,18 +2185,6 @@ fasttrap_return_probe(x86_saved_state_t *regs)
 	uthread->t_dtrace_scrpc = 0;
 	uthread->t_dtrace_astpc = 0;
 
-	/*
-	 * Treat a child created by a call to vfork(2) as if it were its
-	 * parent. We know that there's only one thread of control in such a
-	 * process: this one.
-	 */
-	/*
-	 * APPLE NOTE: Terry says: "You need to hold the process locks (currently: kernel funnel) for this traversal"
-	 * How do we assert this?
-	 */
-	while (p->p_lflag & P_LINVFORK) {
-		p = p->p_pptr;
-	}
 
 	/*
 	 * We set rp->r_pc to the address of the traced instruction so
@@ -2204,7 +2198,7 @@ fasttrap_return_probe(x86_saved_state_t *regs)
 	else
 		regs32->eip = pc;
 
-	fasttrap_return_common(regs, pc, p->p_pid, npc);
+	fasttrap_return_common(regs, pc, proc_getpid(p), npc);
 
 	return (0);
 }

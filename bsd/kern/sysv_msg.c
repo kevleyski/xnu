@@ -1,8 +1,8 @@
 /*
- * Copyright (c) 2000-2007 Apple Inc. All rights reserved.
+ * Copyright (c) 2000-2019 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
- * 
+ *
  * This file contains Original Code and/or Modifications of Original Code
  * as defined in and that are subject to the Apple Public Source License
  * Version 2.0 (the 'License'). You may not use this file except in
@@ -11,10 +11,10 @@
  * unlawful or unlicensed copies of an Apple operating system, or to
  * circumvent, violate, or enable the circumvention or violation of, any
  * terms of an Apple operating system software license agreement.
- * 
+ *
  * Please obtain a copy of the License at
  * http://www.opensource.apple.com/apsl/ and read it before using this file.
- * 
+ *
  * The Original Code and all software distributed under the License are
  * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
@@ -22,7 +22,7 @@
  * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
  * Please see the License for the specific language governing rights and
  * limitations under the License.
- * 
+ *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
 /*
@@ -67,6 +67,10 @@
 #include <sys/sysproto.h>
 #include <sys/ipcs.h>
 
+#if CONFIG_MACF
+#include <security/mac_framework.h>
+#endif
+
 #if SYSV_MSG
 
 static int msginit(void *);
@@ -77,74 +81,57 @@ static int msginit(void *);
 /* Uncomment this line to see MAC debugging output. */
 /* #define	MAC_DEBUG */
 #if CONFIG_MACF_DEBUG
-#define	MPRINTF(a)	printf(a)
+#define MPRINTF(a)      printf(a)
 #else
-#define	MPRINTF(a)
+#define MPRINTF(a)
 #endif
 static void msg_freehdr(struct msg *msghdr);
 
 typedef int     sy_call_t(struct proc *, void *, int *);
 
 /* XXX casting to (sy_call_t *) is bogus, as usual. */
-static sy_call_t *msgcalls[] = {
+static sy_call_t* const msgcalls[] = {
 	(sy_call_t *)msgctl, (sy_call_t *)msgget,
 	(sy_call_t *)msgsnd, (sy_call_t *)msgrcv
 };
 
-static int		nfree_msgmaps;	/* # of free map entries */
-static short		free_msgmaps;	/* free map entries list head */
-static struct msg	*free_msghdrs;	/* list of free msg headers */
-char			*msgpool;	/* MSGMAX byte long msg buffer pool */
-struct msgmap		*msgmaps;	/* MSGSEG msgmap structures */
-struct msg		*msghdrs;	/* MSGTQL msg headers */
-struct msqid_kernel	*msqids;	/* MSGMNI msqid_kernel structs (wrapping user_msqid_ds structs) */
+static int              nfree_msgmaps;  /* # of free map entries */
+static short            free_msgmaps;   /* free map entries list head */
+static struct msg       *free_msghdrs;  /* list of free msg headers */
+char                    *msgpool;       /* MSGMAX byte long msg buffer pool */
+struct msgmap           *msgmaps;       /* MSGSEG msgmap structures */
+struct msg              *msghdrs;       /* MSGTQL msg headers */
+struct msqid_kernel     *msqids;        /* MSGMNI msqid_kernel structs (wrapping user_msqid_ds structs) */
 
-static lck_grp_t       *sysv_msg_subsys_lck_grp;
-static lck_grp_attr_t  *sysv_msg_subsys_lck_grp_attr;
-static lck_attr_t      *sysv_msg_subsys_lck_attr;
-static lck_mtx_t        sysv_msg_subsys_mutex;
+static LCK_GRP_DECLARE(sysv_msg_subsys_lck_grp, "sysv_msg_subsys_lock");
+static LCK_MTX_DECLARE(sysv_msg_subsys_mutex, &sysv_msg_subsys_lck_grp);
 
 #define SYSV_MSG_SUBSYS_LOCK() lck_mtx_lock(&sysv_msg_subsys_mutex)
 #define SYSV_MSG_SUBSYS_UNLOCK() lck_mtx_unlock(&sysv_msg_subsys_mutex)
 
-void sysv_msg_lock_init(void);
-
-
 #ifdef __APPLE_API_PRIVATE
-	int	msgmax,		/* max chars in a message */
-		msgmni,		/* max message queue identifiers */
-		msgmnb,		/* max chars in a queue */
-		msgtql,		/* max messages in system */
-		msgssz,		/* size of a message segment (see notes above) */
-		msgseg;		/* number of message segments */
+int     msgmax,                 /* max chars in a message */
+    msgmni,                     /* max message queue identifiers */
+    msgmnb,                     /* max chars in a queue */
+    msgtql,                     /* max messages in system */
+    msgssz,                     /* size of a message segment (see notes above) */
+    msgseg;                     /* number of message segments */
 struct msginfo msginfo = {
-		MSGMAX,		/* = (MSGSSZ*MSGSEG) : max chars in a message */
-		MSGMNI,		/* = 40 : max message queue identifiers */
-		MSGMNB,		/* = 2048 : max chars in a queue */
-		MSGTQL,		/* = 40 : max messages in system */
-		MSGSSZ,		/* = 8 : size of a message segment (2^N long) */
-		MSGSEG		/* = 2048 : number of message segments */
+	.msgmax = MSGMAX,               /* = (MSGSSZ*MSGSEG) : max chars in a message */
+	.msgmni = MSGMNI,               /* = 40 : max message queue identifiers */
+	.msgmnb = MSGMNB,               /* = 2048 : max chars in a queue */
+	.msgtql = MSGTQL,               /* = 40 : max messages in system */
+	.msgssz = MSGSSZ,               /* = 8 : size of a message segment (2^N long) */
+	.msgseg = MSGSEG                /* = 2048 : number of message segments */
 };
 #endif /* __APPLE_API_PRIVATE */
-
-/* Initialize the mutex governing access to the SysV msg subsystem */
-__private_extern__ void
-sysv_msg_lock_init( void )
-{
-	sysv_msg_subsys_lck_grp_attr = lck_grp_attr_alloc_init();
-
-	sysv_msg_subsys_lck_grp = lck_grp_alloc_init("sysv_msg_subsys_lock", sysv_msg_subsys_lck_grp_attr);
-
-	sysv_msg_subsys_lck_attr = lck_attr_alloc_init();
-	lck_mtx_init(&sysv_msg_subsys_mutex, sysv_msg_subsys_lck_grp, sysv_msg_subsys_lck_attr);
-}
 
 static __inline__ user_time_t
 sysv_msgtime(void)
 {
-	struct timeval	tv;
+	struct timeval  tv;
 	microtime(&tv);
-	return (tv.tv_sec);
+	return tv.tv_sec;
 }
 
 /*
@@ -153,29 +140,29 @@ sysv_msgtime(void)
 static void
 msqid_ds_kerneltouser32(struct user_msqid_ds *in, struct user32_msqid_ds *out)
 {
-	out->msg_perm	= in->msg_perm;
-	out->msg_qnum	= in->msg_qnum;
-	out->msg_cbytes	= in->msg_cbytes;	/* for ipcs */
-	out->msg_qbytes	= in->msg_qbytes;
-	out->msg_lspid	= in->msg_lspid;
-	out->msg_lrpid	= in->msg_lrpid;
-	out->msg_stime	= in->msg_stime;	/* XXX loss of range */
-	out->msg_rtime	= in->msg_rtime;	/* XXX loss of range */
-	out->msg_ctime	= in->msg_ctime;	/* XXX loss of range */
+	out->msg_perm   = in->msg_perm;
+	out->msg_qnum   = in->msg_qnum;
+	out->msg_cbytes = in->msg_cbytes;       /* for ipcs */
+	out->msg_qbytes = in->msg_qbytes;
+	out->msg_lspid  = in->msg_lspid;
+	out->msg_lrpid  = in->msg_lrpid;
+	out->msg_stime  = in->msg_stime;        /* XXX loss of range */
+	out->msg_rtime  = in->msg_rtime;        /* XXX loss of range */
+	out->msg_ctime  = in->msg_ctime;        /* XXX loss of range */
 }
 
 static void
 msqid_ds_kerneltouser64(struct user_msqid_ds *in, struct user64_msqid_ds *out)
 {
-	out->msg_perm	= in->msg_perm;
-	out->msg_qnum	= in->msg_qnum;
-	out->msg_cbytes	= in->msg_cbytes;	/* for ipcs */
-	out->msg_qbytes	= in->msg_qbytes;
-	out->msg_lspid	= in->msg_lspid;
-	out->msg_lrpid	= in->msg_lrpid;
-	out->msg_stime	= in->msg_stime;	/* XXX loss of range */
-	out->msg_rtime	= in->msg_rtime;	/* XXX loss of range */
-	out->msg_ctime	= in->msg_ctime;	/* XXX loss of range */
+	out->msg_perm   = in->msg_perm;
+	out->msg_qnum   = in->msg_qnum;
+	out->msg_cbytes = in->msg_cbytes;       /* for ipcs */
+	out->msg_qbytes = in->msg_qbytes;
+	out->msg_lspid  = in->msg_lspid;
+	out->msg_lrpid  = in->msg_lrpid;
+	out->msg_stime  = in->msg_stime;        /* XXX loss of range */
+	out->msg_rtime  = in->msg_rtime;        /* XXX loss of range */
+	out->msg_ctime  = in->msg_ctime;        /* XXX loss of range */
 }
 
 /*
@@ -186,29 +173,29 @@ msqid_ds_kerneltouser64(struct user_msqid_ds *in, struct user64_msqid_ds *out)
 static void
 msqid_ds_user32tokernel(struct user32_msqid_ds *in, struct user_msqid_ds *out)
 {
-	out->msg_ctime	= in->msg_ctime;
-	out->msg_rtime	= in->msg_rtime;
-	out->msg_stime	= in->msg_stime;
-	out->msg_lrpid	= in->msg_lrpid;
-	out->msg_lspid	= in->msg_lspid;
-	out->msg_qbytes	= in->msg_qbytes;
-	out->msg_cbytes	= in->msg_cbytes;	/* for ipcs */
-	out->msg_qnum	= in->msg_qnum;
-	out->msg_perm	= in->msg_perm;
+	out->msg_ctime  = in->msg_ctime;
+	out->msg_rtime  = in->msg_rtime;
+	out->msg_stime  = in->msg_stime;
+	out->msg_lrpid  = in->msg_lrpid;
+	out->msg_lspid  = in->msg_lspid;
+	out->msg_qbytes = in->msg_qbytes;
+	out->msg_cbytes = in->msg_cbytes;       /* for ipcs */
+	out->msg_qnum   = in->msg_qnum;
+	out->msg_perm   = in->msg_perm;
 }
 
 static void
 msqid_ds_user64tokernel(struct user64_msqid_ds *in, struct user_msqid_ds *out)
 {
-	out->msg_ctime	= in->msg_ctime;
-	out->msg_rtime	= in->msg_rtime;
-	out->msg_stime	= in->msg_stime;
-	out->msg_lrpid	= in->msg_lrpid;
-	out->msg_lspid	= in->msg_lspid;
-	out->msg_qbytes	= in->msg_qbytes;
-	out->msg_cbytes	= in->msg_cbytes;	/* for ipcs */
-	out->msg_qnum	= in->msg_qnum;
-	out->msg_perm	= in->msg_perm;
+	out->msg_ctime  = in->msg_ctime;
+	out->msg_rtime  = in->msg_rtime;
+	out->msg_stime  = in->msg_stime;
+	out->msg_lrpid  = in->msg_lrpid;
+	out->msg_lspid  = in->msg_lspid;
+	out->msg_qbytes = in->msg_qbytes;
+	out->msg_cbytes = in->msg_cbytes;       /* for ipcs */
+	out->msg_qnum   = in->msg_qnum;
+	out->msg_perm   = in->msg_perm;
 }
 
 /* This routine assumes the system is locked prior to calling this routine */
@@ -216,11 +203,12 @@ static int
 msginit(__unused void *dummy)
 {
 	static int initted = 0;
-	register int i;
+	int i;
 
 	/* Lazy initialization on first system call; we don't have SYSINIT(). */
-	if (initted)
-		return (initted);
+	if (initted) {
+		return initted;
+	}
 
 	/*
 	 * msginfo.msgssz should be a power of two for efficiency reasons.
@@ -228,9 +216,10 @@ msginit(__unused void *dummy)
 	 * or greater than about 256 so ...
 	 */
 	i = 8;
-	while (i < 1024 && i != msginfo.msgssz)
+	while (i < 1024 && i != msginfo.msgssz) {
 		i <<= 1;
-    	if (i != msginfo.msgssz) {
+	}
+	if (i != msginfo.msgssz) {
 		printf("msginfo.msgssz=%d (0x%x) not a small power of 2; resetting to %d\n", msginfo.msgssz, msginfo.msgssz, MSGSSZ);
 		msginfo.msgssz = MSGSSZ;
 	}
@@ -246,30 +235,24 @@ msginit(__unused void *dummy)
 	 * if this fails, fail safely and leave it uninitialized (related
 	 * system calls will fail).
 	 */
-	msgpool = (char *)_MALLOC(msginfo.msgmax, M_SHM, M_WAITOK);
+	msgpool = kalloc_data(msginfo.msgmax, Z_WAITOK);
 	if (msgpool == NULL) {
 		printf("msginit: can't allocate msgpool");
 		goto bad;
 	}
-	MALLOC(msgmaps, struct msgmap *,
-			sizeof(struct msgmap) * msginfo.msgseg, 
-			M_SHM, M_WAITOK);
+	msgmaps = kalloc_data(sizeof(struct msgmap) * msginfo.msgseg, Z_WAITOK);
 	if (msgmaps == NULL) {
 		printf("msginit: can't allocate msgmaps");
 		goto bad;
 	}
 
-	MALLOC(msghdrs, struct msg *,
-			sizeof(struct msg) * msginfo.msgtql, 
-			M_SHM, M_WAITOK);
+	msghdrs = kalloc_type(struct msg, msginfo.msgtql, Z_WAITOK);
 	if (msghdrs == NULL) {
 		printf("msginit: can't allocate msghdrs");
 		goto bad;
 	}
 
-	MALLOC(msqids, struct msqid_kernel *,
-			sizeof(struct user_msqid_ds) * msginfo.msgmni, 
-			M_SHM, M_WAITOK);
+	msqids = kalloc_type(struct msqid_kernel, msginfo.msgmni, Z_WAITOK);
 	if (msqids == NULL) {
 		printf("msginit: can't allocate msqids");
 		goto bad;
@@ -278,9 +261,10 @@ msginit(__unused void *dummy)
 
 	/* init msgmaps */
 	for (i = 0; i < msginfo.msgseg; i++) {
-		if (i > 0)
-			msgmaps[i-1].next = i;
-		msgmaps[i].next = -1;	/* implies entry is available */
+		if (i > 0) {
+			msgmaps[i - 1].next = i;
+		}
+		msgmaps[i].next = -1;   /* implies entry is available */
 	}
 	free_msgmaps = 0;
 	nfree_msgmaps = msginfo.msgseg;
@@ -289,19 +273,20 @@ msginit(__unused void *dummy)
 	/* init msghdrs */
 	for (i = 0; i < msginfo.msgtql; i++) {
 		msghdrs[i].msg_type = 0;
-		if (i > 0)
-			msghdrs[i-1].msg_next = &msghdrs[i];
+		if (i > 0) {
+			msghdrs[i - 1].msg_next = &msghdrs[i];
+		}
 		msghdrs[i].msg_next = NULL;
 #if CONFIG_MACF
 		mac_sysvmsg_label_init(&msghdrs[i]);
 #endif
-    	}
+	}
 	free_msghdrs = &msghdrs[0];
 
 	/* init msqids */
 	for (i = 0; i < msginfo.msgmni; i++) {
-		msqids[i].u.msg_qbytes = 0;	/* implies entry is available */
-		msqids[i].u.msg_perm._seq = 0;	/* reset to a known value */
+		msqids[i].u.msg_qbytes = 0;     /* implies entry is available */
+		msqids[i].u.msg_perm._seq = 0;  /* reset to a known value */
 		msqids[i].u.msg_perm.mode = 0;
 #if CONFIG_MACF
 		mac_sysvmsq_label_init(&msqids[i]);
@@ -311,16 +296,12 @@ msginit(__unused void *dummy)
 	initted = 1;
 bad:
 	if (!initted) {
-		if (msgpool != NULL)
-			_FREE(msgpool, M_SHM);
-		if (msgmaps != NULL)
-			FREE(msgmaps, M_SHM);
-		if (msghdrs != NULL)
-			FREE(msghdrs, M_SHM);
-		if (msqids != NULL)
-			FREE(msqids, M_SHM);
+		kfree_data(msgpool, sizeof(struct msgmap) * msginfo.msgseg);
+		kfree_data(msgmaps, sizeof(struct msgmap) * msginfo.msgseg);
+		kfree_type(struct msg, msginfo.msgtql, msghdrs);
+		kfree_type(struct msqid_kernel, msginfo.msgmni, msqids);
 	}
-	return (initted);
+	return initted;
 }
 
 /*
@@ -329,28 +310,29 @@ bad:
  * Entry point for all MSG calls: msgctl, msgget, msgsnd, msgrcv
  *
  * Parameters:	p	Process requesting the call
- * 		uap	User argument descriptor (see below)
- * 		retval	Return value of the selected msg call
+ *              uap	User argument descriptor (see below)
+ *              retval	Return value of the selected msg call
  *
  * Indirect parameters:	uap->which	msg call to invoke (index in array of msg calls)
- * 			uap->a2		User argument descriptor
- *                  
+ *                      uap->a2		User argument descriptor
+ *
  * Returns:	0	Success
- * 		!0	Not success
+ *              !0	Not success
  *
  * Implicit returns: retval	Return value of the selected msg call
  *
  * DEPRECATED:  This interface should not be used to call the other MSG
- * 		functions (msgctl, msgget, msgsnd, msgrcv). The correct
- * 		usage is to call the other MSG functions directly.
+ *              functions (msgctl, msgget, msgsnd, msgrcv). The correct
+ *              usage is to call the other MSG functions directly.
  *
  */
 int
 msgsys(struct proc *p, struct msgsys_args *uap, int32_t *retval)
 {
-	if (uap->which >= sizeof(msgcalls)/sizeof(msgcalls[0]))
-		return (EINVAL);
-	return ((*msgcalls[uap->which])(p, &uap->a2, retval));
+	if (uap->which >= sizeof(msgcalls) / sizeof(msgcalls[0])) {
+		return EINVAL;
+	}
+	return (*msgcalls[uap->which])(p, &uap->a2, retval);
 }
 
 static void
@@ -358,20 +340,23 @@ msg_freehdr(struct msg *msghdr)
 {
 	while (msghdr->msg_ts > 0) {
 		short next;
-		if (msghdr->msg_spot < 0 || msghdr->msg_spot >= msginfo.msgseg)
+		if (msghdr->msg_spot < 0 || msghdr->msg_spot >= msginfo.msgseg) {
 			panic("msghdr->msg_spot out of range");
+		}
 		next = msgmaps[msghdr->msg_spot].next;
 		msgmaps[msghdr->msg_spot].next = free_msgmaps;
 		free_msgmaps = msghdr->msg_spot;
 		nfree_msgmaps++;
 		msghdr->msg_spot = next;
-		if (msghdr->msg_ts >= msginfo.msgssz)
+		if (msghdr->msg_ts >= msginfo.msgssz) {
 			msghdr->msg_ts -= msginfo.msgssz;
-		else
+		} else {
 			msghdr->msg_ts = 0;
+		}
 	}
-	if (msghdr->msg_spot != -1)
+	if (msghdr->msg_spot != -1) {
 		panic("msghdr->msg_spot != -1");
+	}
 	msghdr->msg_next = free_msghdrs;
 	free_msghdrs = msghdr;
 #if CONFIG_MACF
@@ -436,20 +421,21 @@ msgctl(struct proc *p, struct msgctl_args *uap, int32_t *retval)
 	}
 #if CONFIG_MACF
 	eval = mac_sysvmsq_check_msqctl(kauth_cred_get(), msqptr, cmd);
-	if (eval) 
+	if (eval) {
 		goto msgctlout;
+	}
 #endif
 
 	eval = 0;
 	rval = 0;
 
 	switch (cmd) {
-
 	case IPC_RMID:
 	{
 		struct msg *msghdr;
-		if ((eval = ipcperm(cred, &msqptr->u.msg_perm, IPC_M)))
+		if ((eval = ipcperm(cred, &msqptr->u.msg_perm, IPC_M))) {
 			goto msgctlout;
+		}
 #if CONFIG_MACF
 		/*
 		 * Check that the thread has MAC access permissions to
@@ -463,8 +449,9 @@ msgctl(struct proc *p, struct msgctl_args *uap, int32_t *retval)
 		for (msghdr = msqptr->u.msg_first; msghdr != NULL;
 		    msghdr = msghdr->msg_next) {
 			eval = mac_sysvmsq_check_msgrmid(kauth_cred_get(), msghdr);
-			if (eval) 
+			if (eval) {
 				goto msgctlout;
+			}
 		}
 #endif
 		/* Free the message headers */
@@ -480,12 +467,14 @@ msgctl(struct proc *p, struct msgctl_args *uap, int32_t *retval)
 			msg_freehdr(msghdr_tmp);
 		}
 
-		if (msqptr->u.msg_cbytes != 0)
+		if (msqptr->u.msg_cbytes != 0) {
 			panic("msg_cbytes is messed up");
-		if (msqptr->u.msg_qnum != 0)
+		}
+		if (msqptr->u.msg_qnum != 0) {
 			panic("msg_qnum is messed up");
+		}
 
-		msqptr->u.msg_qbytes = 0;	/* Mark it as free */
+		msqptr->u.msg_qbytes = 0;       /* Mark it as free */
 #if CONFIG_MACF
 		mac_sysvmsq_label_recycle(msqptr);
 #endif
@@ -493,11 +482,12 @@ msgctl(struct proc *p, struct msgctl_args *uap, int32_t *retval)
 		wakeup((caddr_t)msqptr);
 	}
 
-		break;
+	break;
 
 	case IPC_SET:
-		if ((eval = ipcperm(cred, &msqptr->u.msg_perm, IPC_M)))
+		if ((eval = ipcperm(cred, &msqptr->u.msg_perm, IPC_M))) {
 			goto msgctlout;
+		}
 
 		SYSV_MSG_SUBSYS_UNLOCK();
 
@@ -513,15 +503,17 @@ msgctl(struct proc *p, struct msgctl_args *uap, int32_t *retval)
 
 			msqid_ds_user32tokernel(&tmpds, &msqbuf);
 		}
-		if (eval)
-			return(eval);
+		if (eval) {
+			return eval;
+		}
 
 		SYSV_MSG_SUBSYS_LOCK();
 
 		if (msqbuf.msg_qbytes > msqptr->u.msg_qbytes) {
 			eval = suser(cred, &p->p_acflag);
-			if (eval)
+			if (eval) {
 				goto msgctlout;
+			}
 		}
 
 
@@ -531,7 +523,7 @@ msgctl(struct proc *p, struct msgctl_args *uap, int32_t *retval)
 			printf("can't increase msg_qbytes beyond %d (truncating)\n",
 			    msginfo.msgmnb);
 #endif
-			msqbuf.msg_qbytes = msginfo.msgmnb;	/* silently restrict qbytes to system limit */
+			msqbuf.msg_qbytes = msginfo.msgmnb;     /* silently restrict qbytes to system limit */
 		}
 		if (msqbuf.msg_qbytes == 0) {
 #ifdef MSG_DEBUG_OK
@@ -540,8 +532,8 @@ msgctl(struct proc *p, struct msgctl_args *uap, int32_t *retval)
 			eval = EINVAL;
 			goto msgctlout;
 		}
-		msqptr->u.msg_perm.uid = msqbuf.msg_perm.uid;	/* change the owner */
-		msqptr->u.msg_perm.gid = msqbuf.msg_perm.gid;	/* change the owner */
+		msqptr->u.msg_perm.uid = msqbuf.msg_perm.uid;   /* change the owner */
+		msqptr->u.msg_perm.gid = msqbuf.msg_perm.gid;   /* change the owner */
 		msqptr->u.msg_perm.mode = (msqptr->u.msg_perm.mode & ~0777) |
 		    (msqbuf.msg_perm.mode & 0777);
 		msqptr->u.msg_qbytes = msqbuf.msg_qbytes;
@@ -558,11 +550,11 @@ msgctl(struct proc *p, struct msgctl_args *uap, int32_t *retval)
 
 		SYSV_MSG_SUBSYS_UNLOCK();
 		if (IS_64BIT_PROCESS(p)) {
-			struct user64_msqid_ds msqid_ds64;
+			struct user64_msqid_ds msqid_ds64 = {};
 			msqid_ds_kerneltouser64(&msqptr->u, &msqid_ds64);
 			eval = copyout(&msqid_ds64, uap->buf, sizeof(msqid_ds64));
 		} else {
-			struct user32_msqid_ds msqid_ds32;
+			struct user32_msqid_ds msqid_ds32 = {};
 			msqid_ds_kerneltouser32(&msqptr->u, &msqid_ds32);
 			eval = copyout(&msqid_ds32, uap->buf, sizeof(msqid_ds32));
 		}
@@ -577,11 +569,12 @@ msgctl(struct proc *p, struct msgctl_args *uap, int32_t *retval)
 		goto msgctlout;
 	}
 
-	if (eval == 0)
+	if (eval == 0) {
 		*retval = rval;
+	}
 msgctlout:
 	SYSV_MSG_SUBSYS_UNLOCK();
-	return(eval);
+	return eval;
 }
 
 int
@@ -608,8 +601,9 @@ msgget(__unused struct proc *p, struct msgget_args *uap, int32_t *retval)
 		for (msqid = 0; msqid < msginfo.msgmni; msqid++) {
 			msqptr = &msqids[msqid];
 			if (msqptr->u.msg_qbytes != 0 &&
-			    msqptr->u.msg_perm._key == key)
+			    msqptr->u.msg_perm._key == key) {
 				break;
+			}
 		}
 		if (msqid < msginfo.msgmni) {
 #ifdef MSG_DEBUG_OK
@@ -631,8 +625,9 @@ msgget(__unused struct proc *p, struct msgget_args *uap, int32_t *retval)
 			}
 #if CONFIG_MACF
 			eval = mac_sysvmsq_check_msqget(cred, msqptr);
-			if (eval) 
+			if (eval) {
 				goto msggetout;
+			}
 #endif
 			goto found;
 		}
@@ -651,8 +646,9 @@ msgget(__unused struct proc *p, struct msgget_args *uap, int32_t *retval)
 			 */
 			msqptr = &msqids[msqid];
 			if (msqptr->u.msg_qbytes == 0 &&
-			    (msqptr->u.msg_perm.mode & MSG_LOCKED) == 0)
+			    (msqptr->u.msg_perm.mode & MSG_LOCKED) == 0) {
 				break;
+			}
 		}
 		if (msqid == msginfo.msgmni) {
 #ifdef MSG_DEBUG_OK
@@ -700,7 +696,7 @@ found:
 	eval = 0;
 msggetout:
 	SYSV_MSG_SUBSYS_UNLOCK();
-	return(eval);
+	return eval;
 }
 
 
@@ -708,7 +704,7 @@ int
 msgsnd(struct proc *p, struct msgsnd_args *uap, int32_t *retval)
 {
 	__pthread_testcancel(1);
-	return(msgsnd_nocancel(p, (struct msgsnd_nocancel_args *)uap, retval));
+	return msgsnd_nocancel(p, (struct msgsnd_nocancel_args *)uap, retval);
 }
 
 int
@@ -716,7 +712,7 @@ msgsnd_nocancel(struct proc *p, struct msgsnd_nocancel_args *uap, int32_t *retva
 {
 	int msqid = uap->msqid;
 	user_addr_t user_msgp = uap->msgp;
-	size_t msgsz = (size_t)uap->msgsz;	/* limit to 4G */
+	size_t msgsz = (size_t)uap->msgsz;      /* limit to 4G */
 	int msgflg = uap->msgflg;
 	int segs_needed, eval;
 	struct msqid_kernel *msqptr;
@@ -774,8 +770,9 @@ msgsnd_nocancel(struct proc *p, struct msgsnd_nocancel_args *uap, int32_t *retva
 
 #if CONFIG_MACF
 	eval = mac_sysvmsq_check_msqsnd(kauth_cred_get(), msqptr);
-	if (eval) 
+	if (eval) {
 		goto msgsndout;
+	}
 #endif
 	segs_needed = (msgsz + msginfo.msgssz - 1) / msginfo.msgssz;
 #ifdef MSG_DEBUG_OK
@@ -865,7 +862,7 @@ msgsnd_nocancel(struct proc *p, struct msgsnd_nocancel_args *uap, int32_t *retva
 				we_own_it = 0;
 			} else {
 				/* Force later arrivals to wait for our
-				   request */
+				 *  request */
 #ifdef MSG_DEBUG_OK
 				printf("we own the user_msqid_ds\n");
 #endif
@@ -880,8 +877,9 @@ msgsnd_nocancel(struct proc *p, struct msgsnd_nocancel_args *uap, int32_t *retva
 #ifdef MSG_DEBUG_OK
 			printf("good morning, eval=%d\n", eval);
 #endif
-			if (we_own_it)
+			if (we_own_it) {
 				msqptr->u.msg_perm.mode &= ~MSG_LOCKED;
+			}
 			if (eval != 0) {
 #ifdef MSG_DEBUG_OK
 				printf("msgsnd:  interrupted system call\n");
@@ -900,9 +898,7 @@ msgsnd_nocancel(struct proc *p, struct msgsnd_nocancel_args *uap, int32_t *retva
 #endif
 				eval = EIDRM;
 				goto msgsndout;
-			
 			}
-
 		} else {
 #ifdef MSG_DEBUG_OK
 			printf("got all the resources that we need\n");
@@ -916,21 +912,26 @@ msgsnd_nocancel(struct proc *p, struct msgsnd_nocancel_args *uap, int32_t *retva
 	 * Make sure!
 	 */
 
-	if (msqptr->u.msg_perm.mode & MSG_LOCKED)
+	if (msqptr->u.msg_perm.mode & MSG_LOCKED) {
 		panic("msg_perm.mode & MSG_LOCKED");
-	if (segs_needed > nfree_msgmaps)
+	}
+	if (segs_needed > nfree_msgmaps) {
 		panic("segs_needed > nfree_msgmaps");
-	if (msgsz + msqptr->u.msg_cbytes > msqptr->u.msg_qbytes)
+	}
+	if (msgsz + msqptr->u.msg_cbytes > msqptr->u.msg_qbytes) {
 		panic("msgsz + msg_cbytes > msg_qbytes");
-	if (free_msghdrs == NULL)
+	}
+	if (free_msghdrs == NULL) {
 		panic("no more msghdrs");
+	}
 
 	/*
 	 * Re-lock the user_msqid_ds in case we page-fault when copying in
 	 * the message
 	 */
-	if ((msqptr->u.msg_perm.mode & MSG_LOCKED) != 0)
+	if ((msqptr->u.msg_perm.mode & MSG_LOCKED) != 0) {
 		panic("user_msqid_ds is already locked");
+	}
 	msqptr->u.msg_perm.mode |= MSG_LOCKED;
 
 	/*
@@ -949,15 +950,19 @@ msgsnd_nocancel(struct proc *p, struct msgsnd_nocancel_args *uap, int32_t *retva
 	 */
 
 	while (segs_needed > 0) {
-		if (nfree_msgmaps <= 0)
+		if (nfree_msgmaps <= 0) {
 			panic("not enough msgmaps");
-		if (free_msgmaps == -1)
+		}
+		if (free_msgmaps == -1) {
 			panic("nil free_msgmaps");
+		}
 		next = free_msgmaps;
-		if (next <= -1)
+		if (next <= -1) {
 			panic("next too low #1");
-		if (next >= msginfo.msgseg)
+		}
+		if (next >= msginfo.msgseg) {
 			panic("next out of range #1");
+		}
 #ifdef MSG_DEBUG_OK
 		printf("allocating segment %d to message\n", next);
 #endif
@@ -976,15 +981,15 @@ msgsnd_nocancel(struct proc *p, struct msgsnd_nocancel_args *uap, int32_t *retva
 		SYSV_MSG_SUBSYS_UNLOCK();
 		eval = copyin(user_msgp, &msgtype, sizeof(msgtype));
 		SYSV_MSG_SUBSYS_LOCK();
-		msghdr->msg_type = CAST_DOWN(long,msgtype);
-		user_msgp = user_msgp + sizeof(msgtype);	/* ptr math */
+		msghdr->msg_type = CAST_DOWN(long, msgtype);
+		user_msgp = user_msgp + sizeof(msgtype);        /* ptr math */
 	} else {
 		SYSV_MSG_SUBSYS_UNLOCK();
 		int32_t msg_type32;
 		eval = copyin(user_msgp, &msg_type32, sizeof(msg_type32));
 		msghdr->msg_type = msg_type32;
 		SYSV_MSG_SUBSYS_LOCK();
-		user_msgp = user_msgp + sizeof(msg_type32);		/* ptr math */
+		user_msgp = user_msgp + sizeof(msg_type32);             /* ptr math */
 	}
 
 	if (eval != 0) {
@@ -1019,14 +1024,17 @@ msgsnd_nocancel(struct proc *p, struct msgsnd_nocancel_args *uap, int32_t *retva
 	while (msgsz > 0) {
 		size_t tlen;
 		/* compare input (size_t) value against restrict (int) value */
-		if (msgsz > (size_t)msginfo.msgssz)
+		if (msgsz > (size_t)msginfo.msgssz) {
 			tlen = msginfo.msgssz;
-		else
+		} else {
 			tlen = msgsz;
-		if (next <= -1)
+		}
+		if (next <= -1) {
 			panic("next too low #2");
-		if (next >= msginfo.msgseg)
+		}
+		if (next >= msginfo.msgseg) {
 			panic("next out of range #2");
+		}
 
 		SYSV_MSG_SUBSYS_UNLOCK();
 		eval = copyin(user_msgp, &msgpool[next * msginfo.msgssz], tlen);
@@ -1043,11 +1051,12 @@ msgsnd_nocancel(struct proc *p, struct msgsnd_nocancel_args *uap, int32_t *retva
 			goto msgsndout;
 		}
 		msgsz -= tlen;
-		user_msgp = user_msgp + tlen;	/* ptr math */
+		user_msgp = user_msgp + tlen;   /* ptr math */
 		next = msgmaps[next].next;
 	}
-	if (next != -1)
+	if (next != -1) {
 		panic("didn't use all the msg segments");
+	}
 
 	/*
 	 * We've got the message.  Unlock the user_msqid_ds.
@@ -1106,7 +1115,7 @@ msgsnd_nocancel(struct proc *p, struct msgsnd_nocancel_args *uap, int32_t *retva
 
 	msqptr->u.msg_cbytes += msghdr->msg_ts;
 	msqptr->u.msg_qnum++;
-	msqptr->u.msg_lspid = p->p_pid;
+	msqptr->u.msg_lspid = proc_getpid(p);
 	msqptr->u.msg_stime = sysv_msgtime();
 
 	wakeup((caddr_t)msqptr);
@@ -1115,7 +1124,7 @@ msgsnd_nocancel(struct proc *p, struct msgsnd_nocancel_args *uap, int32_t *retva
 
 msgsndout:
 	SYSV_MSG_SUBSYS_UNLOCK();
-	return(eval);
+	return eval;
 }
 
 
@@ -1123,7 +1132,7 @@ int
 msgrcv(struct proc *p, struct msgrcv_args *uap, user_ssize_t *retval)
 {
 	__pthread_testcancel(1);
-	return(msgrcv_nocancel(p, (struct msgrcv_nocancel_args *)uap, retval));
+	return msgrcv_nocancel(p, (struct msgrcv_nocancel_args *)uap, retval);
 }
 
 int
@@ -1131,8 +1140,8 @@ msgrcv_nocancel(struct proc *p, struct msgrcv_nocancel_args *uap, user_ssize_t *
 {
 	int msqid = uap->msqid;
 	user_addr_t user_msgp = uap->msgp;
-	size_t msgsz = (size_t)uap->msgsz;	/* limit to 4G */
-	long msgtyp = (long)uap->msgtyp;	/* limit to 32 bits */
+	size_t msgsz = (size_t)uap->msgsz;      /* limit to 4G */
+	long msgtyp = (long)uap->msgtyp;        /* limit to 32 bits */
 	int msgflg = uap->msgflg;
 	size_t len;
 	struct msqid_kernel *msqptr;
@@ -1191,8 +1200,9 @@ msgrcv_nocancel(struct proc *p, struct msgrcv_nocancel_args *uap, user_ssize_t *
 
 #if CONFIG_MACF
 	eval = mac_sysvmsq_check_msqrcv(kauth_cred_get(), msqptr);
-	if (eval) 
+	if (eval) {
 		goto msgrcvout;
+	}
 #endif
 	msghdr = NULL;
 	while (msghdr == NULL) {
@@ -1211,16 +1221,18 @@ msgrcv_nocancel(struct proc *p, struct msgrcv_nocancel_args *uap, user_ssize_t *
 #if CONFIG_MACF
 				eval = mac_sysvmsq_check_msgrcv(kauth_cred_get(),
 				    msghdr);
-				if (eval) 
+				if (eval) {
 					goto msgrcvout;
+				}
 #endif
 				if (msqptr->u.msg_first == msqptr->u.msg_last) {
 					msqptr->u.msg_first = NULL;
 					msqptr->u.msg_last = NULL;
 				} else {
 					msqptr->u.msg_first = msghdr->msg_next;
-					if (msqptr->u.msg_first == NULL)
+					if (msqptr->u.msg_first == NULL) {
 						panic("msg_first/last messed up #1");
+					}
 				}
 			}
 		} else {
@@ -1256,24 +1268,27 @@ msgrcv_nocancel(struct proc *p, struct msgrcv_nocancel_args *uap, user_ssize_t *
 					}
 #if CONFIG_MACF
 					eval = mac_sysvmsq_check_msgrcv(
-					    kauth_cred_get(), msghdr);
-					if (eval) 
+						kauth_cred_get(), msghdr);
+					if (eval) {
 						goto msgrcvout;
+					}
 #endif
 					*prev = msghdr->msg_next;
 					if (msghdr == msqptr->u.msg_last) {
 						if (previous == NULL) {
 							if (prev !=
-							    &msqptr->u.msg_first)
+							    &msqptr->u.msg_first) {
 								panic("msg_first/last messed up #2");
+							}
 							msqptr->u.msg_first =
 							    NULL;
 							msqptr->u.msg_last =
 							    NULL;
 						} else {
 							if (prev ==
-							    &msqptr->u.msg_first)
+							    &msqptr->u.msg_first) {
 								panic("msg_first/last messed up #3");
+							}
 							msqptr->u.msg_last =
 							    previous;
 						}
@@ -1291,8 +1306,9 @@ msgrcv_nocancel(struct proc *p, struct msgrcv_nocancel_args *uap, user_ssize_t *
 		 * If there is one then bail out of this loop.
 		 */
 
-		if (msghdr != NULL)
+		if (msghdr != NULL) {
 			break;
+		}
 
 		/*
 		 * Hmph!  No message found.  Does the user want to wait?
@@ -1362,7 +1378,7 @@ msgrcv_nocancel(struct proc *p, struct msgrcv_nocancel_args *uap, user_ssize_t *
 
 	msqptr->u.msg_cbytes -= msghdr->msg_ts;
 	msqptr->u.msg_qnum--;
-	msqptr->u.msg_lrpid = p->p_pid;
+	msqptr->u.msg_lrpid = proc_getpid(p);
 	msqptr->u.msg_rtime = sysv_msgtime();
 
 	/*
@@ -1375,8 +1391,9 @@ msgrcv_nocancel(struct proc *p, struct msgrcv_nocancel_args *uap, user_ssize_t *
 	printf("found a message, msgsz=%ld, msg_ts=%d\n", msgsz,
 	    msghdr->msg_ts);
 #endif
-	if (msgsz > msghdr->msg_ts)
+	if (msgsz > msghdr->msg_ts) {
 		msgsz = msghdr->msg_ts;
+	}
 
 	/*
 	 * Return the type to the user.
@@ -1391,13 +1408,13 @@ msgrcv_nocancel(struct proc *p, struct msgrcv_nocancel_args *uap, user_ssize_t *
 		SYSV_MSG_SUBSYS_UNLOCK();
 		eval = copyout(&msgtype, user_msgp, sizeof(msgtype));
 		SYSV_MSG_SUBSYS_LOCK();
-		user_msgp = user_msgp + sizeof(msgtype);	/* ptr math */
+		user_msgp = user_msgp + sizeof(msgtype);        /* ptr math */
 	} else {
 		msg_type32 = msghdr->msg_type;
 		SYSV_MSG_SUBSYS_UNLOCK();
 		eval = copyout(&msg_type32, user_msgp, sizeof(msg_type32));
 		SYSV_MSG_SUBSYS_LOCK();
-		user_msgp = user_msgp + sizeof(msg_type32);		/* ptr math */
+		user_msgp = user_msgp + sizeof(msg_type32);             /* ptr math */
 	}
 
 	if (eval != 0) {
@@ -1419,15 +1436,17 @@ msgrcv_nocancel(struct proc *p, struct msgrcv_nocancel_args *uap, user_ssize_t *
 	for (len = 0; len < msgsz; len += msginfo.msgssz) {
 		size_t tlen;
 
-		/* compare input (size_t) value against restrict (int) value */
-		if (msgsz > (size_t)msginfo.msgssz)
-			tlen = msginfo.msgssz;
-		else
-			tlen = msgsz;
-		if (next <= -1)
+		/*
+		 * copy the full segment, or less if we're at the end
+		 * of the message
+		 */
+		tlen = MIN(msgsz - len, (size_t)msginfo.msgssz);
+		if (next <= -1) {
 			panic("next too low #3");
-		if (next >= msginfo.msgseg)
+		}
+		if (next >= msginfo.msgseg) {
 			panic("next out of range #3");
+		}
 		SYSV_MSG_SUBSYS_UNLOCK();
 		eval = copyout(&msgpool[next * msginfo.msgssz],
 		    user_msgp, tlen);
@@ -1441,7 +1460,7 @@ msgrcv_nocancel(struct proc *p, struct msgrcv_nocancel_args *uap, user_ssize_t *
 			wakeup((caddr_t)msqptr);
 			goto msgrcvout;
 		}
-		user_msgp = user_msgp + tlen;	/* ptr math */
+		user_msgp = user_msgp + tlen;   /* ptr math */
 		next = msgmaps[next].next;
 	}
 
@@ -1455,21 +1474,21 @@ msgrcv_nocancel(struct proc *p, struct msgrcv_nocancel_args *uap, user_ssize_t *
 	eval = 0;
 msgrcvout:
 	SYSV_MSG_SUBSYS_UNLOCK();
-	return(eval);
+	return eval;
 }
 
 static int
 IPCS_msg_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1,
-	__unused int arg2, struct sysctl_req *req)
+    __unused int arg2, struct sysctl_req *req)
 {
 	int error;
 	int cursor;
 	union {
 		struct user32_IPCS_command u32;
 		struct user_IPCS_command u64;
-	} ipcs;
-	struct user32_msqid_ds msqid_ds32;	/* post conversion, 32 bit version */
-	struct user64_msqid_ds msqid_ds64;	/* post conversion, 64 bit version */
+	} ipcs = { };
+	struct user32_msqid_ds msqid_ds32 = {}; /* post conversion, 32 bit version */
+	struct user64_msqid_ds msqid_ds64 = {}; /* post conversion, 64 bit version */
 	void *msqid_dsp;
 	size_t ipcs_sz;
 	size_t msqid_ds_sz;
@@ -1485,26 +1504,27 @@ IPCS_msg_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1,
 
 	/* Copy in the command structure */
 	if ((error = SYSCTL_IN(req, &ipcs, ipcs_sz)) != 0) {
-		return(error);
+		return error;
 	}
 
-	if (!IS_64BIT_PROCESS(p))	/* convert in place */
+	if (!IS_64BIT_PROCESS(p)) {     /* convert in place */
 		ipcs.u64.ipcs_data = CAST_USER_ADDR_T(ipcs.u32.ipcs_data);
+	}
 
 	/* Let us version this interface... */
 	if (ipcs.u64.ipcs_magic != IPCS_MAGIC) {
-		return(EINVAL);
+		return EINVAL;
 	}
 
 	SYSV_MSG_SUBSYS_LOCK();
 
-	switch(ipcs.u64.ipcs_op) {
-	case IPCS_MSG_CONF:	/* Obtain global configuration data */
+	switch (ipcs.u64.ipcs_op) {
+	case IPCS_MSG_CONF:     /* Obtain global configuration data */
 		if (ipcs.u64.ipcs_datalen != sizeof(struct msginfo)) {
 			error = ERANGE;
 			break;
 		}
-		if (ipcs.u64.ipcs_cursor != 0) {	/* fwd. compat. */
+		if (ipcs.u64.ipcs_cursor != 0) {        /* fwd. compat. */
 			error = EINVAL;
 			break;
 		}
@@ -1513,7 +1533,7 @@ IPCS_msg_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1,
 		SYSV_MSG_SUBSYS_LOCK();
 		break;
 
-	case IPCS_MSG_ITER:	/* Iterate over existing segments */
+	case IPCS_MSG_ITER:     /* Iterate over existing segments */
 		/* Not done up top so we can set limits via sysctl (later) */
 		if (!msginit(0)) {
 			error =  ENOMEM;
@@ -1529,9 +1549,10 @@ IPCS_msg_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1,
 			error = EINVAL;
 			break;
 		}
-		for( ; cursor < msginfo.msgmni; cursor++) {
-			if (msqids[cursor].u.msg_qbytes != 0)	/* allocated */
+		for (; cursor < msginfo.msgmni; cursor++) {
+			if (msqids[cursor].u.msg_qbytes != 0) { /* allocated */
 				break;
+			}
 			continue;
 		}
 		if (cursor == msginfo.msgmni) {
@@ -1539,7 +1560,7 @@ IPCS_msg_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1,
 			break;
 		}
 
-		msqid_dsp = &msqids[cursor];	/* default: 64 bit */
+		msqid_dsp = &msqids[cursor];    /* default: 64 bit */
 
 		/*
 		 * If necessary, convert the 64 bit kernel segment
@@ -1559,8 +1580,9 @@ IPCS_msg_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1,
 			/* update cursor */
 			ipcs.u64.ipcs_cursor = cursor + 1;
 
-			if (!IS_64BIT_PROCESS(p))	/* convert in place */
-				ipcs.u32.ipcs_data = CAST_DOWN_EXPLICIT(user32_addr_t,ipcs.u64.ipcs_data);
+			if (!IS_64BIT_PROCESS(p)) {     /* convert in place */
+				ipcs.u32.ipcs_data = CAST_DOWN_EXPLICIT(user32_addr_t, ipcs.u64.ipcs_data);
+			}
 			error = SYSCTL_OUT(req, &ipcs, ipcs_sz);
 		}
 		SYSV_MSG_SUBSYS_LOCK();
@@ -1572,13 +1594,13 @@ IPCS_msg_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1,
 	}
 
 	SYSV_MSG_SUBSYS_UNLOCK();
-	return(error);
+	return error;
 }
 
 SYSCTL_DECL(_kern_sysv_ipcs);
 SYSCTL_PROC(_kern_sysv_ipcs, OID_AUTO, msg, CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
-	0, 0, IPCS_msg_sysctl,
-	"S,IPCS_msg_command",
-	"ipcs msg command interface");
+    0, 0, IPCS_msg_sysctl,
+    "S,IPCS_msg_command",
+    "ipcs msg command interface");
 
 #endif /* SYSV_MSG */

@@ -2,7 +2,7 @@
  * Copyright (c) 1997-2013 Apple Computer, Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
- * 
+ *
  * This file contains Original Code and/or Modifications of Original Code
  * as defined in and that are subject to the Apple Public Source License
  * Version 2.0 (the 'License'). You may not use this file except in
@@ -11,10 +11,10 @@
  * unlawful or unlicensed copies of an Apple operating system, or to
  * circumvent, violate, or enable the circumvention or violation of, any
  * terms of an Apple operating system software license agreement.
- * 
+ *
  * Please obtain a copy of the License at
  * http://www.opensource.apple.com/apsl/ and read it before using this file.
- * 
+ *
  * The Original Code and all software distributed under the License are
  * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
@@ -22,7 +22,7 @@
  * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
  * Please see the License for the specific language governing rights and
  * limitations under the License.
- * 
+ *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
 /*-
@@ -90,55 +90,53 @@ cttyopen(dev_t dev, int flag, __unused int mode, proc_t p)
 	int error = 0;
 	int cttyflag, doclose = 0;
 	struct session *sessp;
+	struct pgrp *pg;
 
-	if (ttyvp == NULL)
-		return (ENXIO);
+	if (ttyvp == NULL) {
+		return ENXIO;
+	}
 
 	context.vc_thread = current_thread();
 	context.vc_ucred = kauth_cred_proc_ref(p);
 
-	sessp = proc_session(p);
-	session_lock(sessp);
-	cttyflag = sessp->s_flags & S_CTTYREF;	
-	session_unlock(sessp);
+	pg = proc_pgrp(p, &sessp);
+	cttyflag = os_ref_get_raw_mask(&sessp->s_refcount) & S_CTTYREF;
 
 	/*
 	 * A little hack--this device, used by many processes,
-	 * happens to do an open on another device, which can 
-	 * cause unhappiness if the second-level open blocks indefinitely 
+	 * happens to do an open on another device, which can
+	 * cause unhappiness if the second-level open blocks indefinitely
 	 * (as could be the case if the master side has hung up).  Since
 	 * we know that this driver doesn't care about the serializing
 	 * opens and closes, we can drop the lock. To avoid opencount leak,
-	 * open the vnode only for the first time. 
+	 * open the vnode only for the first time.
 	 */
 	if (cttyflag == 0) {
 		devsw_unlock(dev, S_IFCHR);
 		error = VNOP_OPEN(ttyvp, flag, &context);
 		devsw_lock(dev, S_IFCHR);
 
-		if (error) 
+		if (error) {
 			goto out;
-	
+		}
+
 		/*
 		 * If S_CTTYREF is set, some other thread did an open
 		 * and was able to set the flag, now perform a close, else
 		 * set the flag.
 		 */
-		session_lock(sessp);
-		if (cttyflag == (sessp->s_flags & S_CTTYREF))
-			sessp->s_flags |= S_CTTYREF;
-		else
+		if (os_atomic_or_orig(&sessp->s_refcount, S_CTTYREF, relaxed) & S_CTTYREF) {
 			doclose = 1;
-		session_unlock(sessp);
+		}
 
 		/*
 		 * We have to take a reference here to make sure a close
-		 * gets called during revoke. Note that once a controlling 
+		 * gets called during revoke. Note that once a controlling
 		 * tty gets opened by this driver, the only way close will
 		 * get called is when the session leader , whose controlling
-		 * tty is ttyvp, exits and vnode is revoked. We cannot 
+		 * tty is ttyvp, exits and vnode is revoked. We cannot
 		 * redirect close from this driver because underlying controlling
-		 * terminal might change and close may get redirected to a 
+		 * terminal might change and close may get redirected to a
 		 * wrong vnode causing panic.
 		 */
 		if (doclose) {
@@ -149,13 +147,13 @@ cttyopen(dev_t dev, int flag, __unused int mode, proc_t p)
 			error = vnode_ref(ttyvp);
 		}
 	}
-out:
-	session_rele(sessp);
 
+out:
+	pgrp_rele(pg);
 	vnode_put(ttyvp);
 	kauth_cred_unref(&context.vc_ucred);
 
-	return (error);
+	return error;
 }
 
 int
@@ -165,8 +163,9 @@ cttyread(__unused dev_t dev, struct uio *uio, int flag)
 	struct vfs_context context;
 	int error;
 
-	if (ttyvp == NULL)
-		return (EIO);
+	if (ttyvp == NULL) {
+		return EIO;
+	}
 
 	context.vc_thread = current_thread();
 	context.vc_ucred = NOCRED;
@@ -174,7 +173,7 @@ cttyread(__unused dev_t dev, struct uio *uio, int flag)
 	error = VNOP_READ(ttyvp, uio, flag, &context);
 	vnode_put(ttyvp);
 
-	return (error);
+	return error;
 }
 
 int
@@ -184,8 +183,9 @@ cttywrite(__unused dev_t dev, struct uio *uio, int flag)
 	struct vfs_context context;
 	int error;
 
-	if (ttyvp == NULL)
-		return (EIO);
+	if (ttyvp == NULL) {
+		return EIO;
+	}
 
 	context.vc_thread = current_thread();
 	context.vc_ucred = NOCRED;
@@ -193,7 +193,7 @@ cttywrite(__unused dev_t dev, struct uio *uio, int flag)
 	error = VNOP_WRITE(ttyvp, uio, flag, &context);
 	vnode_put(ttyvp);
 
-	return (error);
+	return error;
 }
 
 int
@@ -201,29 +201,26 @@ cttyioctl(__unused dev_t dev, u_long cmd, caddr_t addr, int flag, proc_t p)
 {
 	vnode_t ttyvp = cttyvp(current_proc());
 	struct vfs_context context;
-	struct session *sessp;
 	int error = 0;
 
-	if (ttyvp == NULL)
-		return (EIO);
-	if (cmd == TIOCSCTTY)  { /* don't allow controlling tty to be set    */
+	if (ttyvp == NULL) {
+		return EIO;
+	}
+	if (cmd == TIOCSCTTY) {  /* don't allow controlling tty to be set    */
 		error = EINVAL; /* to controlling tty -- infinite recursion */
 		goto out;
 	}
 	if (cmd == TIOCNOTTY) {
-		sessp = proc_session(p);
-		if (!SESS_LEADER(p, sessp)) {
-			OSBitAndAtomic(~((uint32_t)P_CONTROLT), &p->p_flag);
-			if (sessp != SESSION_NULL)
-				session_rele(sessp);
+		struct pgrp *pg = proc_pgrp(p, NULL);
+
+		if (!SESS_LEADER(p, pg->pg_session)) {
+			os_atomic_andnot(&p->p_flag, P_CONTROLT, relaxed);
 			error = 0;
-			goto out;
 		} else {
-			if (sessp != SESSION_NULL)
-				session_rele(sessp);
 			error = EINVAL;
-			goto out;
 		}
+		pgrp_rele(pg);
+		goto out;
 	}
 	context.vc_thread = current_thread();
 	context.vc_ucred = NOCRED;
@@ -231,7 +228,7 @@ cttyioctl(__unused dev_t dev, u_long cmd, caddr_t addr, int flag, proc_t p)
 	error = VNOP_IOCTL(ttyvp, cmd, addr, flag, &context);
 out:
 	vnode_put(ttyvp);
-	return (error);
+	return error;
 }
 
 int
@@ -244,35 +241,43 @@ cttyselect(__unused dev_t dev, int flag, void* wql, __unused proc_t p)
 	context.vc_thread = current_thread();
 	context.vc_ucred = NOCRED;
 
-	if (ttyvp == NULL)
-		return (1);	/* try operation to get EOF/failure */
-	error = VNOP_SELECT(ttyvp, flag, FREAD|FWRITE, wql, &context);
+	if (ttyvp == NULL) {
+		return 1;     /* try operation to get EOF/failure */
+	}
+	error = VNOP_SELECT(ttyvp, flag, FREAD | FWRITE, wql, &context);
 	vnode_put(ttyvp);
-	return (error);
+	return error;
 }
 
 /* This returns vnode with ioref */
 static vnode_t
 cttyvp(proc_t p)
 {
+	struct pgrp *pg;
+	struct session *sessp;
 	vnode_t vp;
 	int vid;
-	struct session *sessp;
 
-	sessp = proc_session(p);
+	pg = proc_pgrp(p, &sessp);
 
 	session_lock(sessp);
 	vp = (p->p_flag & P_CONTROLT ? sessp->s_ttyvp : NULLVP);
-	vid = sessp->s_ttyvid;	
+	vid = sessp->s_ttyvid;
+	if (vp) {
+		vnode_hold(vp);
+	}
 	session_unlock(sessp);
 
-	session_rele(sessp);
+	pgrp_rele(pg);
 
 	if (vp != NULLVP) {
 		/* cannot get an IO reference, return NULLVP */
-		if (vnode_getwithvid(vp, vid) != 0)
+		if (vnode_getwithvid(vp, vid) != 0) {
+			vnode_drop(vp);
 			vp = NULLVP;
+		} else {
+			vnode_drop(vp);
+		}
 	}
-	return(vp);
+	return vp;
 }
-

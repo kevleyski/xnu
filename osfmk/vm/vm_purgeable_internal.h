@@ -1,15 +1,15 @@
 /*
- * Copyright (c) 2007 Apple Inc. All rights reserved.
+ * Copyright (c) 2019 Apple Inc. All rights reserved.
  *
  * @APPLE_LICENSE_HEADER_START@
- * 
+ *
  * This file contains Original Code and/or Modifications of Original Code
  * as defined in and that are subject to the Apple Public Source License
  * Version 2.0 (the 'License'). You may not use this file except in
  * compliance with the License. Please obtain a copy of the License at
  * http://www.opensource.apple.com/apsl/ and read it before using this
  * file.
- * 
+ *
  * The Original Code and all software distributed under the License are
  * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
@@ -17,13 +17,13 @@
  * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
  * Please see the License for the specific language governing rights and
  * limitations under the License.
- * 
+ *
  * @APPLE_LICENSE_HEADER_END@
  */
 
 /*
  * Purgeable spelling rules
- * It is believed that the correct spelling is 
+ * It is believed that the correct spelling is
  * { 'p', 'u', 'r', 'g', 'e', 'a', 'b', 'l', 'e' }.
  * However, there is one published API that likes to spell it without the
  * first 'e', vm_purgable_control(). Since we can't change that API,
@@ -38,6 +38,7 @@
 #define __VM_PURGEABLE_INTERNAL__
 
 #include <kern/queue.h>
+#include <vm/vm_purgeable_xnu.h>
 
 enum purgeable_q_type {
 	PURGEABLE_Q_TYPE_OBSOLETE,
@@ -67,6 +68,8 @@ struct purgeable_q {
 typedef struct purgeable_q * purgeable_q_t;
 
 extern struct purgeable_q purgeable_queues[PURGEABLE_Q_TYPE_MAX];
+extern queue_head_t purgeable_nonvolatile_queue;
+extern int purgeable_nonvolatile_count;
 extern int32_t token_new_pagecount;
 #define TOKEN_NEW_PAGECOUNT_MAX INT32_MAX
 extern int available_for_purge;
@@ -80,7 +83,7 @@ extern int available_for_purge;
  * mostly used on a user context and we don't want any contention with the
  * pageout daemon.
  */
-decl_lck_mtx_data(extern,vm_purgeable_queue_lock)
+decl_lck_mtx_data(extern, vm_purgeable_queue_lock);
 
 /* add a new token to queue. called by vm_object_purgeable_control */
 /* enter with page queue locked */
@@ -96,10 +99,6 @@ void vm_purgeable_token_delete_last(purgeable_q_t queue);
  */
 void vm_purgeable_q_advance_all(void);
 
-/* the object purger. purges the next eligible object from memory. */
-/* returns TRUE if an object was purged, otherwise FALSE. */
-boolean_t vm_purgeable_object_purge_one(int force_purge_below_group);
-
 /* purge all volatile objects now */
 void vm_purgeable_object_purge_all(void);
 
@@ -109,9 +108,13 @@ void vm_purgeable_object_add(vm_object_t object, purgeable_q_t queue, int group)
 /* look for object. If found, remove from purgeable queue. */
 purgeable_q_t vm_purgeable_object_remove(vm_object_t object);
 
-/* statistics for purgable objects in all queues */
-void vm_purgeable_stats(vm_purgeable_info_t info, task_t target_task);
+void vm_purgeable_nonvolatile_enqueue(vm_object_t object, task_t task);
+void vm_purgeable_nonvolatile_dequeue(vm_object_t object);
+void vm_purgeable_accounting(vm_object_t        object,
+    vm_purgable_t      old_state);
+void vm_object_owner_compressed_update(vm_object_t      object,
+    int              delta);
 
-void vm_purgeable_disown(task_t task);
+#define PURGEABLE_LOOP_MAX 64
 
 #endif /* __VM_PURGEABLE_INTERNAL__ */

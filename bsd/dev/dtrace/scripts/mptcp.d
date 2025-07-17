@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013 Apple Computer, Inc.  All Rights Reserved.
+ * Copyright (c) 2013-2017 Apple Computer, Inc.  All Rights Reserved.
  *
  * @APPLE_LICENSE_HEADER_START@
  *
@@ -48,11 +48,8 @@ inline int MPTCPS_FIN_WAIT_2            = 7;
 #pragma D binding "1.0" MPTCPS_FIN_WAIT_2
 inline int MPTCPS_TIME_WAIT             = 8;
 #pragma D binding "1.0" MPTCPS_TIME_WAIT
-inline int MPTCPS_FASTCLOSE_WAIT        = 9;
-#pragma D binding "1.0" MPTCPS_FASTCLOSE_WAIT
-
-typedef uint64_t mptcp_key_t;
-typedef uint32_t mptcp_token_t;
+inline int MPTCPS_TERMINATE		= 10;
+#pragma D binding "1.0" MPTCPS_TERMINATE
 
 typedef struct mptsinfo {
 	string		state;
@@ -74,7 +71,6 @@ typedef struct mptsinfo {
 	uint64_t	local_idsn;
 	uint32_t	sndwnd;
 	uint64_t	rcvnxt;
-	uint64_t	rcvatmark;
 	uint64_t	remote_idsn;
 	uint32_t	rcvwnd;
 	struct mptcb	*mptcb;
@@ -92,13 +88,13 @@ translator mptsinfo_t < struct mptcb *T > {
 		       T->mpt_state == MPTCPS_LAST_ACK ? "state-last-ack" :
 		       T->mpt_state == MPTCPS_FIN_WAIT_2 ? "state-fin-wait-2" :
 		       T->mpt_state == MPTCPS_TIME_WAIT ? "state-time-wait" :
-		       T->mpt_state == MPTCPS_FASTCLOSE_WAIT ?
-		           "state-fastclose-wait" :
+		       T->mpt_state == MPTCPS_TERMINATE ?
+		           "state-terminate" :
 		       "<unknown>";
 	flags        = T->mpt_flags;
 	vers         = T->mpt_version;
 	error        = T->mpt_softerror;
-	localkey     = T->mpt_localkey ? *T->mpt_localkey : 0;
+	localkey     = T->mpt_localkey;
 	remotekey    = T->mpt_remotekey;
 	localtoken   = T->mpt_localtoken;
 	remotetoken  = T->mpt_remotetoken;
@@ -113,7 +109,6 @@ translator mptsinfo_t < struct mptcb *T > {
 	local_idsn   = T->mpt_local_idsn;
 	sndwnd	     = T->mpt_sndwnd;
 	rcvnxt	     = T->mpt_rcvnxt;
-	rcvatmark    = T->mpt_rcvatmark;
 	remote_idsn  = T->mpt_remote_idsn;
 	rcvwnd       = T->mpt_rcvwnd;
 	mptcb	     = T;
@@ -149,7 +144,7 @@ translator mppsinfo_t < struct mppcb *T> {
 typedef struct mptsesinfo {
 	uint16_t	numflows;
 	uint16_t	nummpcapflows;
-	connid_t	connid_last;
+	sae_connid_t	connid_last;
 	uint8_t		flags;
 	struct mptses	*mptses;
 } mptsesinfo_t;
@@ -166,8 +161,6 @@ translator mptsesinfo_t < struct mptses *T > {
 /*
  * MPTCP Subflow.
  */
-inline int MPTSF_ATTACHED       = 0x00001;
-#pragma D binding "1.0" MPTSF_ATTACHED
 inline int MPTSF_CONNECTING     = 0x00002;
 #pragma D binding "1.0" MPTSF_CONNECTING
 inline int MPTSF_CONNECT_PENDING= 0x00004;
@@ -210,11 +203,8 @@ inline int MPTSF_MPCAP_CTRSET   = 0x80000;
 typedef struct mptsubinfo {
 	uint32_t	flags;
 	uint32_t	evctl;
-	uint32_t	family;
-	connid_t	connid;
+	sae_connid_t	connid;
 	uint32_t	rank;
-	int32_t		error;
-	uint64_t	sndnxt;
 	struct mptsub	*mptsub;
 } mptsubinfo_t;
 
@@ -222,10 +212,6 @@ typedef struct mptsubinfo {
 translator mptsubinfo_t < struct mptsub *T > {
 	flags   = T->mpts_flags;
 	evctl   = T->mpts_evctl;
-	family  = T->mpts_family;
 	connid  = T->mpts_connid;
-	rank    = T->mpts_rank;
-	error   = T->mpts_soerror;
-	sndnxt  = T->mpts_sndnxt;
 	mptsub  = T;
 };

@@ -1,40 +1,16 @@
-SDKROOT ?= /
-ifeq "$(RC_TARGET_CONFIG)" "iPhone"
-Embedded?=YES
-else
-Embedded?=$(shell echo $(SDKROOT) | grep -iq iphoneos && echo YES || echo NO)
-endif
-
-OBJROOT?=$(shell /bin/pwd)
-
-CC:=xcrun -sdk "$(SDKROOT)" cc
-
-ifdef RC_ARCHS
-    ARCHS:=$(RC_ARCHS)
-  else
-    ifeq "$(Embedded)" "YES"
-      ARCHS:=armv7 armv7s
-    else
-      ARCHS:=x86_64 i386
-  endif
-endif
-
-
+include ../Makefile.common
 
 DSTROOT?=$(shell /bin/pwd)
+SYMROOT?=$(shell /bin/pwd)
+OBJROOT?=$(shell /bin/pwd)
 
-CFLAGS:=$(patsubst %, -arch %,$(ARCHS)) -g -Wall -Os $(ISYSROOT)
+CFLAGS:=$(ARCH_FLAGS) -g -Wall -Os -isysroot $(SDKROOT) -I$(SDKROOT)/System/Library/Frameworks/System.framework/PrivateHeaders
 
 all: $(DSTROOT)/jitter
 
-$(OBJROOT)/timer_jitter.o: timer_jitter.c
-	$(CC) -c -o $@ $< $(CFLAGS)
-
-$(OBJROOT)/cpu_number.o: cpu_number.s
-	$(CC) -c -o $@ $< $(CFLAGS)
-
-$(DSTROOT)/jitter: $(OBJROOT)/timer_jitter.o $(OBJROOT)/cpu_number.o
+$(DSTROOT)/jitter: timer_jitter.c
 	$(CC) -o $@ $^ $(CFLAGS)
 
 clean:
 	rm -f $(DSTROOT)/jitter $(OBJROOT)/*.o
+	rm -rf $(SYMROOT)/*.dSYM

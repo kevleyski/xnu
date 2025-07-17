@@ -31,34 +31,6 @@
 #include <machine/asm.h>
 #include <assym.s>
 
-/*
- * extern void	commpage_sched_gen_inc(void);
- */
-	.text
-
-	.globl	_commpage_sched_gen_inc
-_commpage_sched_gen_inc:
-	FRAME
-	
-	/* Increment 32-bit commpage field if present */
-	movq	_commPagePtr32(%rip),%rdx
-	testq	%rdx,%rdx
-	je	1f
-	subq	$(ASM_COMM_PAGE32_BASE_ADDRESS),%rdx
-	lock
-	incl	ASM_COMM_PAGE_SCHED_GEN(%rdx)
-
-	/* Increment 64-bit commpage field if present */
-	movq	_commPagePtr64(%rip),%rdx
-	testq	%rdx,%rdx
-	je	1f
-	subq	$(ASM_COMM_PAGE32_START_ADDRESS),%rdx
-	lock
-	incl	ASM_COMM_PAGE_SCHED_GEN(%rdx)
-1:
-	EMARF
-	ret
-
 /* pointers to the 32-bit commpage routine descriptors */
 /* WARNING: these must be sorted by commpage address! */
 	.const_data
@@ -67,6 +39,7 @@ _commpage_sched_gen_inc:
 _commpage_32_routines:
 	COMMPAGE_DESCRIPTOR_REFERENCE(preempt)
 	COMMPAGE_DESCRIPTOR_REFERENCE(backoff)
+	COMMPAGE_DESCRIPTOR_REFERENCE(ret)
 	COMMPAGE_DESCRIPTOR_REFERENCE(pfz_enqueue)
 	COMMPAGE_DESCRIPTOR_REFERENCE(pfz_dequeue)
 	.quad	0
@@ -80,6 +53,7 @@ _commpage_32_routines:
 _commpage_64_routines:
 	COMMPAGE_DESCRIPTOR_REFERENCE(preempt_64)
 	COMMPAGE_DESCRIPTOR_REFERENCE(backoff_64)
+	COMMPAGE_DESCRIPTOR_REFERENCE(ret_64)
 	COMMPAGE_DESCRIPTOR_REFERENCE(pfz_enqueue_64)
 	COMMPAGE_DESCRIPTOR_REFERENCE(pfz_dequeue_64)
 	.quad	0

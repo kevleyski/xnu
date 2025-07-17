@@ -103,6 +103,8 @@ system call, otherwise 0.
 Return 1 if file names longer than KERN_NAME_MAX are truncated.
 .It Li _PC_VDISABLE
 Returns the terminal character disabling value.
+.It Li _PC_FILESIZEBITS
+The minimum number of bits needed to represent, as a signed integer value, the maximum size of a regular file allowed in the specified directory. The max file size is 2^(_PC_FILESIZEBITS - 1).
 .It Li _PC_XATTR_SIZE_BITS
 Returns the number of bits used to store maximum extended 
 attribute size in bytes.  For example, if the maximum 
@@ -113,6 +115,17 @@ that the maximum attribute size can be anywhere from
 fork can have much larger size, and some file system 
 specific extended attributes can have smaller and preset 
 size; for example, Finder Info is always 32 bytes.
+.It Li _PC_MIN_HOLE_SIZE
+If a file system supports the reporting of holes (see
+.Xr lseek 2 ) ,
+.Fn pathconf
+and
+.Fn fpathconf
+return a positive number that represents the minimum hole size returned in
+bytes.
+The offsets of holes returned will be aligned to this same value.
+A special value of 1 is returned if the file system does not specify the minimum
+hole size but still reports holes.
 .El
 .Sh RETURN VALUES
 If the call to
@@ -147,7 +160,7 @@ The implementation does not support an association of the variable
 name with the associated file.
 .El
 .Pp
-.Fn Pathconf
+.Fn pathconf
 will fail if:
 .Bl -tag -width ENAMETOOLONGAA
 .\" ===========
@@ -173,7 +186,7 @@ A component of the path prefix is not a directory.
 .El
 .Pp
 .Bl -tag -width ENAMETOOLONGAA
-.Fn Fpathconf
+.Fn fpathconf
 will fail if:
 .\" ===========
 .It Bq Er EBADF

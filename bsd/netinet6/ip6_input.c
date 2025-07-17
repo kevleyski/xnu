@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2003-2013 Apple Inc. All rights reserved.
+ * Copyright (c) 2003-2024 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
  *
@@ -121,6 +121,9 @@
 #include <net/ntstat.h>
 #include <net/init.h>
 #include <net/net_osdep.h>
+#include <net/net_perf.h>
+#include <net/if_ports_used.h>
+#include <net/droptap.h>
 
 #include <netinet/in.h>
 #include <netinet/in_systm.h>
@@ -130,6 +133,7 @@
 #endif /* INET */
 #include <netinet/kpi_ipfilter_var.h>
 #include <netinet/ip6.h>
+#include <netinet/udp.h>
 #include <netinet6/in6_var.h>
 #include <netinet6/ip6_var.h>
 #include <netinet/in_pcb.h>
@@ -145,12 +149,7 @@
 extern int ipsec_bypass;
 #endif /* IPSEC */
 
-#if IPFW2
-#include <netinet6/ip6_fw.h>
-#endif /* IPFW2 */
-
 #if DUMMYNET
-#include <netinet/ip_fw.h>
 #include <netinet/ip_dummynet.h>
 #endif /* DUMMYNET */
 
@@ -161,54 +160,49 @@ extern int ipsec_bypass;
 #include <net/pfvar.h>
 #endif /* PF */
 
+#include <os/log.h>
+
 struct ip6protosw *ip6_protox[IPPROTO_MAX];
 
-static lck_grp_attr_t	*in6_ifaddr_rwlock_grp_attr;
-static lck_grp_t	*in6_ifaddr_rwlock_grp;
-static lck_attr_t	*in6_ifaddr_rwlock_attr;
-decl_lck_rw_data(, in6_ifaddr_rwlock);
+static LCK_GRP_DECLARE(in6_ifaddr_rwlock_grp, "in6_ifaddr_rwlock");
+LCK_RW_DECLARE(in6_ifaddr_rwlock, &in6_ifaddr_rwlock_grp);
 
 /* Protected by in6_ifaddr_rwlock */
-struct in6_ifaddr *in6_ifaddrs = NULL;
+struct in6_ifaddrhead in6_ifaddrhead;
+uint32_t in6_ifaddrlist_genid = 0;
 
-#define	IN6_IFSTAT_REQUIRE_ALIGNED_64(f)	\
+#define IN6ADDR_NHASH    61
+u_int32_t in6addr_hashp = 0;                  /* next largest prime */
+u_int32_t in6addr_nhash = 0;                  /* hash table size */
+struct in6_ifaddrhashhead *__counted_by(in6addr_nhash) in6_ifaddrhashtbl = 0;
+
+#define IN6_IFSTAT_REQUIRE_ALIGNED_64(f)        \
 	_CASSERT(!(offsetof(struct in6_ifstat, f) % sizeof (uint64_t)))
 
-#define	ICMP6_IFSTAT_REQUIRE_ALIGNED_64(f)	\
+#define ICMP6_IFSTAT_REQUIRE_ALIGNED_64(f)      \
 	_CASSERT(!(offsetof(struct icmp6_ifstat, f) % sizeof (uint64_t)))
-
-#if IPFW2
-/* firewall hooks */
-ip6_fw_chk_t *ip6_fw_chk_ptr;
-ip6_fw_ctl_t *ip6_fw_ctl_ptr;
-int ip6_fw_enable = 1;
-#endif /* IPFW2 */
 
 struct ip6stat ip6stat;
 
-decl_lck_mtx_data(, proxy6_lock);
-decl_lck_mtx_data(static, dad6_mutex_data);
-decl_lck_mtx_data(static, nd6_mutex_data);
-decl_lck_mtx_data(static, prefix6_mutex_data);
-lck_mtx_t		*dad6_mutex = &dad6_mutex_data;
-lck_mtx_t		*nd6_mutex = &nd6_mutex_data;
-lck_mtx_t		*prefix6_mutex = &prefix6_mutex_data;
-#ifdef ENABLE_ADDRSEL
-decl_lck_mtx_data(static, addrsel_mutex_data);
-lck_mtx_t		*addrsel_mutex = &addrsel_mutex_data;
-#endif
-static lck_attr_t	*ip6_mutex_attr;
-static lck_grp_t	*ip6_mutex_grp;
-static lck_grp_attr_t	*ip6_mutex_grp_attr;
+LCK_ATTR_DECLARE(ip6_mutex_attr, 0, 0);
+LCK_GRP_DECLARE(ip6_mutex_grp, "ip6");
+
+LCK_MTX_DECLARE_ATTR(proxy6_lock, &ip6_mutex_grp, &ip6_mutex_attr);
+LCK_MTX_DECLARE_ATTR(nd6_mutex_data, &ip6_mutex_grp, &ip6_mutex_attr);
 
 extern int loopattach_done;
 extern void addrsel_policy_init(void);
 
+static int sysctl_reset_ip6_input_stats SYSCTL_HANDLER_ARGS;
+static int sysctl_ip6_input_measure_bins SYSCTL_HANDLER_ARGS;
+static int sysctl_ip6_input_getperf SYSCTL_HANDLER_ARGS;
 static void ip6_init_delayed(void);
 static int ip6_hopopts_input(u_int32_t *, u_int32_t *, struct mbuf **, int *);
-#if PULLDOWN_TEST
-static struct mbuf *ip6_pullexthdr(struct mbuf *, size_t, int);
-#endif
+
+static void in6_ifaddrhashtbl_init(void);
+
+static struct m_tag *m_tag_kalloc_inet6(u_int32_t id, u_int16_t type, uint16_t len, int wait);
+static void m_tag_kfree_inet6(struct m_tag *tag);
 
 #if NSTF
 extern void stfattach(void);
@@ -216,19 +210,91 @@ extern void stfattach(void);
 
 SYSCTL_DECL(_net_inet6_ip6);
 
-int ip6_doscopedroute = 1;
-SYSCTL_INT(_net_inet6_ip6, OID_AUTO, scopedroute,
-	CTLFLAG_RD | CTLFLAG_LOCKED, &ip6_doscopedroute, 0,
-	"Enable IPv6 scoped routing");
-
 static uint32_t ip6_adj_clear_hwcksum = 0;
 SYSCTL_UINT(_net_inet6_ip6, OID_AUTO, adj_clear_hwcksum,
-	CTLFLAG_RW | CTLFLAG_LOCKED, &ip6_adj_clear_hwcksum, 0,
-	"Invalidate hwcksum info when adjusting length");
+    CTLFLAG_RW | CTLFLAG_LOCKED, &ip6_adj_clear_hwcksum, 0,
+    "Invalidate hwcksum info when adjusting length");
+
+static uint32_t ip6_adj_partial_sum = 1;
+SYSCTL_UINT(_net_inet6_ip6, OID_AUTO, adj_partial_sum,
+    CTLFLAG_RW | CTLFLAG_LOCKED, &ip6_adj_partial_sum, 0,
+    "Perform partial sum adjustment of trailing bytes at IP layer");
+
+static int ip6_input_measure = 0;
+SYSCTL_PROC(_net_inet6_ip6, OID_AUTO, input_perf,
+    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    &ip6_input_measure, 0, sysctl_reset_ip6_input_stats, "I", "Do time measurement");
+
+static uint64_t ip6_input_measure_bins = 0;
+SYSCTL_PROC(_net_inet6_ip6, OID_AUTO, input_perf_bins,
+    CTLTYPE_QUAD | CTLFLAG_RW | CTLFLAG_LOCKED, &ip6_input_measure_bins, 0,
+    sysctl_ip6_input_measure_bins, "I",
+    "bins for chaining performance data histogram");
+
+static net_perf_t net_perf;
+SYSCTL_PROC(_net_inet6_ip6, OID_AUTO, input_perf_data,
+    CTLTYPE_STRUCT | CTLFLAG_RD | CTLFLAG_LOCKED,
+    0, 0, sysctl_ip6_input_getperf, "S,net_perf",
+    "IP6 input performance data (struct net_perf, net/net_perf.h)");
+
+/*
+ * ip6_checkinterface controls the receive side of the models for multihoming
+ * that are discussed in RFC 1122.
+ *
+ * sysctl_ip6_checkinterface values are:
+ *  IP6_CHECKINTERFACE_WEAK_ES:
+ *	This corresponds to the Weak End-System model where incoming packets from
+ *	any interface are accepted provided the destination address of the incoming packet
+ *	is assigned to some interface.
+ *
+ *  IP6_CHECKINTERFACE_HYBRID_ES:
+ *	The Hybrid End-System model use the Strong End-System for tunnel interfaces
+ *	(ipsec and utun) and the weak End-System model for other interfaces families.
+ *	This prevents a rogue middle box to probe for signs of TCP connections
+ *	that use the tunnel interface.
+ *
+ *  IP6_CHECKINTERFACE_STRONG_ES:
+ *	The Strong model model requires the packet arrived on an interface that
+ *	is assigned the destination address of the packet.
+ *
+ * Since the routing table and transmit implementation do not implement the Strong ES model,
+ * setting this to a value different from IP6_CHECKINTERFACE_WEAK_ES may lead to unexpected results.
+ *
+ * When forwarding is enabled, the system reverts to the Weak ES model as a router
+ * is expected by design to receive packets from several interfaces to the same address.
+ */
+#define IP6_CHECKINTERFACE_WEAK_ES       0
+#define IP6_CHECKINTERFACE_HYBRID_ES     1
+#define IP6_CHECKINTERFACE_STRONG_ES     2
+
+static int ip6_checkinterface = IP6_CHECKINTERFACE_HYBRID_ES;
+
+static int sysctl_ip6_checkinterface SYSCTL_HANDLER_ARGS;
+SYSCTL_PROC(_net_inet6_ip6, OID_AUTO, check_interface,
+    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+    0, 0, sysctl_ip6_checkinterface, "I", "Verify packet arrives on correct interface");
+
+#if (DEBUG || DEVELOPMENT)
+#define IP6_CHECK_IFDEBUG 1
+#else
+#define IP6_CHECK_IFDEBUG 0
+#endif /* (DEBUG || DEVELOPMENT) */
+static int ip6_checkinterface_debug = IP6_CHECK_IFDEBUG;
+SYSCTL_INT(_net_inet6_ip6, OID_AUTO, checkinterface_debug, CTLFLAG_RW | CTLFLAG_LOCKED,
+    &ip6_checkinterface_debug, IP6_CHECK_IFDEBUG, "");
+
+typedef enum ip6_check_if_result {
+	IP6_CHECK_IF_NONE = 0,
+	IP6_CHECK_IF_OURS = 1,
+	IP6_CHECK_IF_DROP = 2,
+	IP6_CHECK_IF_FORWARD = 3
+} ip6_check_if_result_t;
+
+static ip6_check_if_result_t ip6_input_check_interface(struct mbuf *, struct ip6_hdr *, struct ifnet *, struct route_in6 *rin6, struct ifnet **);
 
 /*
  * On platforms which require strict alignment (currently for anything but
- * i386 or x86_64), check if the IP header pointer is 32-bit aligned; if not,
+ * i386 or x86_64 or arm64), check if the IP header pointer is 32-bit aligned; if not,
  * copy the contents of the mbuf chain into a new chain, and free the original
  * one.  Create some head room in the first mbuf of the new chain, in case
  * it's needed later on.
@@ -237,36 +303,48 @@ SYSCTL_UINT(_net_inet6_ip6, OID_AUTO, adj_clear_hwcksum,
  * mostly align to 32-bit boundaries.  Care should be taken never to use 64-bit
  * load/store operations on the fields in IPv6 headers.
  */
-#if defined(__i386__) || defined(__x86_64__)
-#define	IP6_HDR_ALIGNMENT_FIXUP(_m, _ifp, _action) do { } while (0)
-#else /* !__i386__ && !__x86_64__ */
-#define	IP6_HDR_ALIGNMENT_FIXUP(_m, _ifp, _action) do {			\
-	if (!IP6_HDR_ALIGNED_P(mtod(_m, caddr_t))) {			\
-		struct mbuf *_n;					\
-		struct ifnet *__ifp = (_ifp);				\
-		atomic_add_64(&(__ifp)->if_alignerrs, 1);		\
-		if (((_m)->m_flags & M_PKTHDR) &&			\
-		    (_m)->m_pkthdr.pkt_hdr != NULL)			\
-			(_m)->m_pkthdr.pkt_hdr = NULL;			\
-		_n = m_defrag_offset(_m, max_linkhdr, M_NOWAIT);	\
-		if (_n == NULL) {					\
-			ip6stat.ip6s_toosmall++;			\
-			m_freem(_m);					\
-			(_m) = NULL;					\
-			_action;					\
-		} else {						\
-			VERIFY(_n != (_m));				\
-			(_m) = _n;					\
-		}							\
-	}								\
+#if defined(__i386__) || defined(__x86_64__) || defined(__arm64__)
+#define IP6_HDR_ALIGNMENT_FIXUP(_m, _ifp, _action) do { } while (0)
+#else /* !__i386__ && !__x86_64__ && !__arm64__ */
+#define IP6_HDR_ALIGNMENT_FIXUP(_m, _ifp, _action) do {             \
+	if (!IP6_HDR_ALIGNED_P(mtod(_m, caddr_t))) {                    \
+	        mbuf_ref_t _n;                                          \
+	        ifnet_ref_t __ifp = (_ifp);                             \
+	        os_atomic_inc(&(__ifp)->if_alignerrs, relaxed);         \
+	        if (((_m)->m_flags & M_PKTHDR) &&                       \
+	            (_m)->m_pkthdr.pkt_hdr != NULL)                     \
+	                (_m)->m_pkthdr.pkt_hdr = NULL;                  \
+	        _n = m_defrag_offset(_m, max_linkhdr, M_NOWAIT);        \
+	        if (_n == NULL) {                                       \
+	                ip6stat.ip6s_toosmall++;                        \
+	                m_drop(_m, DROPTAP_FLAG_DIR_IN | DROPTAP_FLAG_L2_MISSING, DROP_REASON_IP_TOO_SMALL, NULL, 0); \
+	                (_m) = NULL;                                    \
+	                _action;                                        \
+	        } else {                                                \
+	                VERIFY(_n != (_m));                             \
+	                (_m) = _n;                                      \
+	        }                                                       \
+	}                                                               \
 } while (0)
-#endif /* !__i386__ && !__x86_64__ */
+#endif /* !__i386__ && !__x86_64___ && !__arm64__ */
 
 static void
 ip6_proto_input(protocol_family_t protocol, mbuf_t packet)
 {
 #pragma unused(protocol)
+#if INET
+	struct timeval start_tv;
+	if (ip6_input_measure) {
+		net_perf_start_time(&net_perf, &start_tv);
+	}
+#endif /* INET */
 	ip6_input(packet);
+#if INET
+	if (ip6_input_measure) {
+		net_perf_measure_time(&net_perf, &start_tv, 1);
+		net_perf_histogram(&net_perf, 1);
+	}
+#endif /* INET */
 }
 
 /*
@@ -277,34 +355,47 @@ void
 ip6_init(struct ip6protosw *pp, struct domain *dp)
 {
 	static int ip6_initialized = 0;
-	struct protosw *pr;
+	struct protosw *__single pr;
 	struct timeval tv;
 	int i;
-	domain_unguard_t unguard;
+	domain_unguard_t __single unguard;
 
 	domain_proto_mtx_lock_assert_held();
-	VERIFY((pp->pr_flags & (PR_INITIALIZED|PR_ATTACHED)) == PR_ATTACHED);
+	VERIFY((pp->pr_flags & (PR_INITIALIZED | PR_ATTACHED)) == PR_ATTACHED);
 
-	_CASSERT((sizeof (struct ip6_hdr) +
-	    sizeof (struct icmp6_hdr)) <= _MHLEN);
+	_CASSERT((sizeof(struct ip6_hdr) +
+	    sizeof(struct icmp6_hdr)) <= _MHLEN);
 
-	if (ip6_initialized)
+	if (ip6_initialized) {
 		return;
+	}
 	ip6_initialized = 1;
 
-	PE_parse_boot_argn("net.inet6.ip6.scopedroute", &ip6_doscopedroute,
-	    sizeof (ip6_doscopedroute));
+	eventhandler_lists_ctxt_init(&in6_evhdlr_ctxt);
+	(void)EVENTHANDLER_REGISTER(&in6_evhdlr_ctxt, in6_event,
+	    &in6_eventhdlr_callback, eventhandler_entry_dummy_arg,
+	    EVENTHANDLER_PRI_ANY);
+
+	eventhandler_lists_ctxt_init(&in6_clat46_evhdlr_ctxt);
+	(void)EVENTHANDLER_REGISTER(&in6_clat46_evhdlr_ctxt, in6_clat46_event,
+	    &in6_clat46_eventhdlr_callback, eventhandler_entry_dummy_arg,
+	    EVENTHANDLER_PRI_ANY);
+
+	for (i = 0; i < IN6_EVENT_MAX; i++) {
+		VERIFY(in6_event2kev_array[i].in6_event_code == i);
+	}
 
 	pr = pffindproto_locked(PF_INET6, IPPROTO_RAW, SOCK_RAW);
 	if (pr == NULL) {
-		panic("%s: Unable to find [PF_INET6,IPPROTO_RAW,SOCK_RAW]\n",
+		panic("%s: Unable to find [PF_INET6,IPPROTO_RAW,SOCK_RAW]",
 		    __func__);
 		/* NOTREACHED */
 	}
 
 	/* Initialize the entire ip6_protox[] array to IPPROTO_RAW. */
-	for (i = 0; i < IPPROTO_MAX; i++)
+	for (i = 0; i < IPPROTO_MAX; i++) {
 		ip6_protox[i] = (struct ip6protosw *)pr;
+	}
 	/*
 	 * Cycle through IP protocols and put them into the appropriate place
 	 * in ip6_protox[], skipping protocols IPPROTO_{IP,RAW}.
@@ -314,34 +405,15 @@ ip6_init(struct ip6protosw *pp, struct domain *dp)
 		VERIFY(pr->pr_domain == dp);
 		if (pr->pr_protocol != 0 && pr->pr_protocol != IPPROTO_RAW) {
 			/* Be careful to only index valid IP protocols. */
-			if (pr->pr_protocol < IPPROTO_MAX)
+			if (pr->pr_protocol < IPPROTO_MAX) {
 				ip6_protox[pr->pr_protocol] =
 				    (struct ip6protosw *)pr;
+			}
 		}
 	}
 
-	ip6_mutex_grp_attr  = lck_grp_attr_alloc_init();
-
-	ip6_mutex_grp = lck_grp_alloc_init("ip6", ip6_mutex_grp_attr);
-	ip6_mutex_attr = lck_attr_alloc_init();
-
-	lck_mtx_init(dad6_mutex, ip6_mutex_grp, ip6_mutex_attr);
-	lck_mtx_init(nd6_mutex, ip6_mutex_grp, ip6_mutex_attr);
-	lck_mtx_init(prefix6_mutex, ip6_mutex_grp, ip6_mutex_attr);
-	scope6_init(ip6_mutex_grp, ip6_mutex_attr);
-
-#ifdef ENABLE_ADDRSEL
-	lck_mtx_init(addrsel_mutex, ip6_mutex_grp, ip6_mutex_attr);
-#endif
-
-	lck_mtx_init(&proxy6_lock, ip6_mutex_grp, ip6_mutex_attr);
-
-	in6_ifaddr_rwlock_grp_attr = lck_grp_attr_alloc_init();
-	in6_ifaddr_rwlock_grp = lck_grp_alloc_init("in6_ifaddr_rwlock",
-	    in6_ifaddr_rwlock_grp_attr);
-	in6_ifaddr_rwlock_attr = lck_attr_alloc_init();
-	lck_rw_init(&in6_ifaddr_rwlock, in6_ifaddr_rwlock_grp,
-	    in6_ifaddr_rwlock_attr);
+	TAILQ_INIT(&in6_ifaddrhead);
+	in6_ifaddrhashtbl_init();
 
 	IN6_IFSTAT_REQUIRE_ALIGNED_64(ifs6_in_receive);
 	IN6_IFSTAT_REQUIRE_ALIGNED_64(ifs6_in_hdrerr);
@@ -404,6 +476,18 @@ ip6_init(struct ip6protosw *pp, struct domain *dp)
 	ip6_desync_factor =
 	    (RandomULong() ^ tv.tv_usec) % MAX_TEMP_DESYNC_FACTOR;
 
+	PE_parse_boot_argn("in6_embedded_scope", &in6_embedded_scope, sizeof(in6_embedded_scope));
+	PE_parse_boot_argn("ip6_checkinterface", &i, sizeof(i));
+	switch (i) {
+	case IP6_CHECKINTERFACE_WEAK_ES:
+	case IP6_CHECKINTERFACE_HYBRID_ES:
+	case IP6_CHECKINTERFACE_STRONG_ES:
+		ip6_checkinterface = i;
+		break;
+	default:
+		break;
+	}
+
 	in6_ifaddr_init();
 	ip6_moptions_init();
 	nd6_init();
@@ -421,7 +505,7 @@ ip6_init(struct ip6protosw *pp, struct domain *dp)
 	unguard = domain_unguard_deploy();
 	i = proto_register_input(PF_INET6, ip6_proto_input, NULL, 0);
 	if (i != 0) {
-		panic("%s: failed to register PF_INET6 protocol: %d\n",
+		panic("%s: failed to register PF_INET6 protocol: %d",
 		    __func__, i);
 		/* NOTREACHED */
 	}
@@ -443,33 +527,270 @@ ip6_init_delayed(void)
 #endif /* NSTF */
 }
 
+static void
+ip6_input_adjust(struct mbuf *m, struct ip6_hdr *ip6, uint32_t plen,
+    struct ifnet *inifp)
+{
+	boolean_t adjust = TRUE;
+	uint32_t tot_len = sizeof(*ip6) + plen;
+
+	ASSERT(m_pktlen(m) > tot_len);
+
+	/*
+	 * Invalidate hardware checksum info if ip6_adj_clear_hwcksum
+	 * is set; useful to handle buggy drivers.  Note that this
+	 * should not be enabled by default, as we may get here due
+	 * to link-layer padding.
+	 */
+	if (ip6_adj_clear_hwcksum &&
+	    (m->m_pkthdr.csum_flags & CSUM_DATA_VALID) &&
+	    !(inifp->if_flags & IFF_LOOPBACK) &&
+	    !(m->m_pkthdr.pkt_flags & PKTF_LOOP)) {
+		m->m_pkthdr.csum_flags &= ~CSUM_DATA_VALID;
+		m->m_pkthdr.csum_data = 0;
+		ip6stat.ip6s_adj_hwcsum_clr++;
+	}
+
+	/*
+	 * If partial checksum information is available, subtract
+	 * out the partial sum of postpended extraneous bytes, and
+	 * update the checksum metadata accordingly.  By doing it
+	 * here, the upper layer transport only needs to adjust any
+	 * prepended extraneous bytes (else it will do both.)
+	 */
+	if (ip6_adj_partial_sum &&
+	    (m->m_pkthdr.csum_flags & (CSUM_DATA_VALID | CSUM_PARTIAL)) ==
+	    (CSUM_DATA_VALID | CSUM_PARTIAL)) {
+		m->m_pkthdr.csum_rx_val = m_adj_sum16(m,
+		    m->m_pkthdr.csum_rx_start, m->m_pkthdr.csum_rx_start,
+		    (tot_len - m->m_pkthdr.csum_rx_start),
+		    m->m_pkthdr.csum_rx_val);
+	} else if ((m->m_pkthdr.csum_flags &
+	    (CSUM_DATA_VALID | CSUM_PARTIAL)) ==
+	    (CSUM_DATA_VALID | CSUM_PARTIAL)) {
+		/*
+		 * If packet has partial checksum info and we decided not
+		 * to subtract the partial sum of postpended extraneous
+		 * bytes here (not the default case), leave that work to
+		 * be handled by the other layers.  For now, only TCP, UDP
+		 * layers are capable of dealing with this.  For all other
+		 * protocols (including fragments), trim and ditch the
+		 * partial sum as those layers might not implement partial
+		 * checksumming (or adjustment) at all.
+		 */
+		if (ip6->ip6_nxt == IPPROTO_TCP ||
+		    ip6->ip6_nxt == IPPROTO_UDP) {
+			adjust = FALSE;
+		} else {
+			m->m_pkthdr.csum_flags &= ~CSUM_DATA_VALID;
+			m->m_pkthdr.csum_data = 0;
+			ip6stat.ip6s_adj_hwcsum_clr++;
+		}
+	}
+
+	if (adjust) {
+		ip6stat.ip6s_adj++;
+		if (m->m_len == m->m_pkthdr.len) {
+			m->m_len = tot_len;
+			m->m_pkthdr.len = tot_len;
+		} else {
+			m_adj(m, tot_len - m->m_pkthdr.len);
+		}
+	}
+}
+static ip6_check_if_result_t
+ip6_input_check_interface(struct mbuf *m, struct ip6_hdr *ip6, struct ifnet *inifp, struct route_in6 *rin6, struct ifnet **deliverifp)
+{
+	struct in6_ifaddr *__single ia6 = NULL;
+	struct in6_addr tmp_dst = ip6->ip6_dst; /* copy to avoid unaligned access */
+	struct in6_ifaddr *__single best_ia6 = NULL;
+	uint32_t dst_ifscope = IFSCOPE_NONE;
+	ip6_check_if_result_t result = IP6_CHECK_IF_NONE;
+
+	*deliverifp = NULL;
+
+	if (m->m_pkthdr.pkt_flags & PKTF_IFAINFO) {
+		dst_ifscope = m->m_pkthdr.dst_ifindex;
+	} else {
+		dst_ifscope = inifp->if_index;
+	}
+	/*
+	 * Check for exact addresses in the hash bucket.
+	 */
+	lck_rw_lock_shared(&in6_ifaddr_rwlock);
+	TAILQ_FOREACH(ia6, IN6ADDR_HASH(&tmp_dst), ia6_hash) {
+		/*
+		 * TODO: should we accept loopback
+		 */
+		if (in6_are_addr_equal_scoped(&ia6->ia_addr.sin6_addr, &tmp_dst, ia6->ia_ifp->if_index, dst_ifscope)) {
+			if ((ia6->ia6_flags & (IN6_IFF_NOTREADY | IN6_IFF_CLAT46))) {
+				continue;
+			}
+			best_ia6 = ia6;
+			if (ia6->ia_ifp == inifp) {
+				/*
+				 * TODO: should we also accept locally originated packets
+				 * or from loopback ???
+				 */
+				break;
+			}
+			/*
+			 * Continue the loop in case there's a exact match with another
+			 * interface
+			 */
+		}
+	}
+	if (best_ia6 != NULL) {
+		if (best_ia6->ia_ifp != inifp && ip6_forwarding == 0 &&
+		    ((ip6_checkinterface == IP6_CHECKINTERFACE_HYBRID_ES &&
+		    (best_ia6->ia_ifp->if_family == IFNET_FAMILY_IPSEC ||
+		    best_ia6->ia_ifp->if_family == IFNET_FAMILY_UTUN)) ||
+		    ip6_checkinterface == IP6_CHECKINTERFACE_STRONG_ES)) {
+			/*
+			 * Drop when interface address check is strict and forwarding
+			 * is disabled
+			 */
+			result = IP6_CHECK_IF_DROP;
+		} else {
+			result = IP6_CHECK_IF_OURS;
+			*deliverifp = best_ia6->ia_ifp;
+			ip6_setdstifaddr_info(m, 0, best_ia6);
+			ip6_setsrcifaddr_info(m, best_ia6->ia_ifp->if_index, NULL);
+		}
+	}
+	lck_rw_done(&in6_ifaddr_rwlock);
+
+	if (result == IP6_CHECK_IF_NONE) {
+		/*
+		 * Slow path: route lookup.
+		 */
+		struct sockaddr_in6 *__single dst6;
+
+		dst6 = SIN6(&rin6->ro_dst);
+		dst6->sin6_len = sizeof(struct sockaddr_in6);
+		dst6->sin6_family = AF_INET6;
+		dst6->sin6_addr = ip6->ip6_dst;
+		if (!in6_embedded_scope && IN6_IS_SCOPE_EMBED(&ip6->ip6_dst)) {
+			dst6->sin6_scope_id = dst_ifscope;
+		}
+		rtalloc_scoped_ign((struct route *)rin6,
+		    RTF_PRCLONING, IFSCOPE_NONE);
+		if (rin6->ro_rt != NULL) {
+			RT_LOCK_SPIN(rin6->ro_rt);
+		}
+
+#define rt6_key(r) (SIN6(rn_get_key((r)->rt_nodes)))
+
+		/*
+		 * Accept the packet if the forwarding interface to the destination
+		 * according to the routing table is the loopback interface,
+		 * unless the associated route has a gateway.
+		 * Note that this approach causes to accept a packet if there is a
+		 * route to the loopback interface for the destination of the packet.
+		 * But we think it's even useful in some situations, e.g. when using
+		 * a special daemon which wants to intercept the packet.
+		 *
+		 * XXX: some OSes automatically make a cloned route for the destination
+		 * of an outgoing packet.  If the outgoing interface of the packet
+		 * is a loopback one, the kernel would consider the packet to be
+		 * accepted, even if we have no such address assinged on the interface.
+		 * We check the cloned flag of the route entry to reject such cases,
+		 * assuming that route entries for our own addresses are not made by
+		 * cloning (it should be true because in6_addloop explicitly installs
+		 * the host route).  However, we might have to do an explicit check
+		 * while it would be less efficient.  Or, should we rather install a
+		 * reject route for such a case?
+		 */
+		if (rin6->ro_rt != NULL &&
+		    (rin6->ro_rt->rt_flags & (RTF_HOST | RTF_GATEWAY)) == RTF_HOST &&
+#if RTF_WASCLONED
+		    !(rin6->ro_rt->rt_flags & RTF_WASCLONED) &&
+#endif
+		    rin6->ro_rt->rt_ifp->if_type == IFT_LOOP) {
+			ia6 = ifatoia6(rin6->ro_rt->rt_ifa);
+			/*
+			 * Packets to a tentative, duplicated, or somehow invalid
+			 * address must not be accepted.
+			 *
+			 * For performance, test without acquiring the address lock;
+			 * a lot of things in the address are set once and never
+			 * changed (e.g. ia_ifp.)
+			 */
+			if (!(ia6->ia6_flags & IN6_IFF_NOTREADY)) {
+				/* this address is ready */
+				result = IP6_CHECK_IF_OURS;
+				*deliverifp = ia6->ia_ifp;       /* correct? */
+				/*
+				 * record dst address information into mbuf.
+				 */
+				(void) ip6_setdstifaddr_info(m, 0, ia6);
+				(void) ip6_setsrcifaddr_info(m, ia6->ia_ifp->if_index, NULL);
+			}
+		}
+
+		if (rin6->ro_rt != NULL) {
+			RT_UNLOCK(rin6->ro_rt);
+		}
+	}
+
+	if (result == IP6_CHECK_IF_NONE) {
+		if (ip6_forwarding == 0) {
+			result = IP6_CHECK_IF_DROP;
+		} else {
+			result = IP6_CHECK_IF_FORWARD;
+			ip6_setdstifaddr_info(m, inifp->if_index, NULL);
+			ip6_setsrcifaddr_info(m, inifp->if_index, NULL);
+		}
+	}
+
+	if (result == IP6_CHECK_IF_OURS && *deliverifp != inifp) {
+		ASSERT(*deliverifp != NULL);
+		ip6stat.ip6s_rcv_if_weak_match++;
+
+		/*  Logging is too noisy when forwarding is enabled */
+		if (ip6_checkinterface_debug != IP6_CHECKINTERFACE_WEAK_ES && ip6_forwarding != 0) {
+			char src_str[MAX_IPv6_STR_LEN];
+			char dst_str[MAX_IPv6_STR_LEN];
+
+			inet_ntop(AF_INET6, &ip6->ip6_src, src_str, sizeof(src_str));
+			inet_ntop(AF_INET6, &ip6->ip6_dst, dst_str, sizeof(dst_str));
+			os_log_info(OS_LOG_DEFAULT,
+			    "%s: weak ES interface match to %s for packet from %s to %s proto %u received via %s",
+			    __func__, (*deliverifp)->if_xname, src_str, dst_str, ip6->ip6_nxt, inifp->if_xname);
+		}
+	} else if (result == IP6_CHECK_IF_DROP) {
+		ip6stat.ip6s_rcv_if_no_match++;
+		if (ip6_checkinterface_debug > 0) {
+			char src_str[MAX_IPv6_STR_LEN];
+			char dst_str[MAX_IPv6_STR_LEN];
+
+			inet_ntop(AF_INET6, &ip6->ip6_src, src_str, sizeof(src_str));
+			inet_ntop(AF_INET6, &ip6->ip6_dst, dst_str, sizeof(dst_str));
+			os_log(OS_LOG_DEFAULT,
+			    "%s: no interface match for packet from %s to %s proto %u received via %s",
+			    __func__, src_str, dst_str, ip6->ip6_nxt, inifp->if_xname);
+		}
+	}
+
+	return result;
+}
+
 void
 ip6_input(struct mbuf *m)
 {
 	struct ip6_hdr *ip6;
-	int off = sizeof (struct ip6_hdr), nest;
+	int off = sizeof(struct ip6_hdr), nest;
 	u_int32_t plen;
 	u_int32_t rtalert = ~0;
 	int nxt = 0, ours = 0;
-	struct ifnet *inifp, *deliverifp = NULL;
-	ipfilter_t inject_ipfref = NULL;
-	int seen;
-	struct in6_ifaddr *ia6 = NULL;
-	struct sockaddr_in6 *dst6;
+	ifnet_ref_t inifp, deliverifp = NULL;
+	ipfilter_t __single inject_ipfref = NULL;
+	int seen = 1;
 #if DUMMYNET
-	struct m_tag *tag;
+	struct m_tag *__single tag;
+	struct ip_fw_args args = {};
 #endif /* DUMMYNET */
-	struct {
-		struct route_in6 rin6;
-#if DUMMYNET
-		struct ip_fw_args args;
-#endif /* DUMMYNET */
-	} ip6ibz;
-#define	rin6	ip6ibz.rin6
-#define	args	ip6ibz.args
-
-	/* zero out {rin6, args} */
-	bzero(&ip6ibz, sizeof (ip6ibz));
+	struct route_in6 rin6 = {};
 
 	/*
 	 * Check if the packet we received is valid after interface filter
@@ -480,7 +801,7 @@ ip6_input(struct mbuf *m)
 	VERIFY(inifp != NULL);
 
 	/* Perform IP header alignment fixup, if needed */
-	IP6_HDR_ALIGNMENT_FIXUP(m, inifp, return);
+	IP6_HDR_ALIGNMENT_FIXUP(m, inifp, return );
 
 	m->m_pkthdr.pkt_flags &= ~PKTF_FORWARDED;
 #if IPSEC
@@ -499,10 +820,10 @@ ip6_input(struct mbuf *m)
 
 #if DUMMYNET
 	if ((tag = m_tag_locate(m, KERNEL_MODULE_TAG_ID,
-	    KERNEL_TAG_TYPE_DUMMYNET, NULL)) != NULL) {
-		struct dn_pkt_tag	*dn_tag;
+	    KERNEL_TAG_TYPE_DUMMYNET)) != NULL) {
+		struct dn_pkt_tag *__single dn_tag;
 
-		dn_tag = (struct dn_pkt_tag *)(tag+1);
+		dn_tag = (struct dn_pkt_tag *)(tag->m_tag_data);
 
 		args.fwa_pf_rule = dn_tag->dn_pf_rule;
 
@@ -517,7 +838,7 @@ ip6_input(struct mbuf *m)
 #endif /* DUMMYNET */
 
 	/*
-	 * No need to proccess packet twice if we've already seen it.
+	 * No need to process packet twice if we've already seen it.
 	 */
 	inject_ipfref = ipf_get_inject_filter(m);
 	if (inject_ipfref != NULL) {
@@ -529,16 +850,21 @@ ip6_input(struct mbuf *m)
 		seen = 1;
 	}
 
+	if (__improbable(m->m_pkthdr.pkt_flags & PKTF_WAKE_PKT)) {
+		if_ports_used_match_mbuf(inifp, PF_INET6, m);
+	}
+
 	/*
 	 * mbuf statistics
 	 */
 	if (m->m_flags & M_EXT) {
-		if (m->m_next != NULL)
+		if (m->m_next != NULL) {
 			ip6stat.ip6s_mext2m++;
-		else
+		} else {
 			ip6stat.ip6s_mext1++;
+		}
 	} else {
-#define	M2MMAX	(sizeof (ip6stat.ip6s_m2m) / sizeof (ip6stat.ip6s_m2m[0]))
+#define M2MMAX  (sizeof (ip6stat.ip6s_m2m) / sizeof (ip6stat.ip6s_m2m[0]))
 		if (m->m_next != NULL) {
 			if (m->m_pkthdr.pkt_flags & PKTF_LOOP) {
 				/* XXX */
@@ -557,44 +883,46 @@ ip6_input(struct mbuf *m)
 	/*
 	 * Drop the packet if IPv6 operation is disabled on the interface.
 	 */
-	if (inifp->if_eflags & IFEF_IPV6_DISABLED)
+	if (inifp->if_eflags & IFEF_IPV6_DISABLED) {
+		m_drop(m, DROPTAP_FLAG_DIR_IN | DROPTAP_FLAG_L2_MISSING, DROP_REASON_IP6_IF_IPV6_DISABLED, NULL, 0);
 		goto bad;
+	}
 
 	in6_ifstat_inc_na(inifp, ifs6_in_receive);
 	ip6stat.ip6s_total++;
 
-#ifndef PULLDOWN_TEST
 	/*
 	 * L2 bridge code and some other code can return mbuf chain
 	 * that does not conform to KAME requirement.  too bad.
 	 * XXX: fails to join if interface MTU > MCLBYTES.  jumbogram?
 	 */
 	if (m->m_next != NULL && m->m_pkthdr.len < MCLBYTES) {
-		struct mbuf *n;
+		mbuf_ref_t n;
 
-		MGETHDR(n, M_DONTWAIT, MT_HEADER);	/* MAC-OK */
-		if (n)
+		MGETHDR(n, M_DONTWAIT, MT_HEADER);      /* MAC-OK */
+		if (n) {
 			M_COPY_PKTHDR(n, m);
+		}
 		if (n && m->m_pkthdr.len > MHLEN) {
 			MCLGET(n, M_DONTWAIT);
 			if ((n->m_flags & M_EXT) == 0) {
-				m_freem(n);
+				m_drop(m, DROPTAP_FLAG_DIR_IN | DROPTAP_FLAG_L2_MISSING, DROP_REASON_IP_TOO_SMALL, NULL, 0);
 				n = NULL;
 			}
 		}
-		if (n == NULL)
+		if (n == NULL) {
 			goto bad;
+		}
 
 		m_copydata(m, 0, m->m_pkthdr.len, mtod(n, caddr_t));
 		n->m_len = m->m_pkthdr.len;
 		m_freem(m);
 		m = n;
 	}
-	IP6_EXTHDR_CHECK(m, 0, sizeof (struct ip6_hdr), { goto done; });
-#endif
+	IP6_EXTHDR_CHECK(m, 0, sizeof(struct ip6_hdr), { goto done; });
 
-	if (m->m_len < sizeof (struct ip6_hdr)) {
-		if ((m = m_pullup(m, sizeof (struct ip6_hdr))) == 0) {
+	if (m->m_len < sizeof(struct ip6_hdr)) {
+		if ((m = m_pullup(m, sizeof(struct ip6_hdr))) == 0) {
 			ip6stat.ip6s_toosmall++;
 			in6_ifstat_inc(inifp, ifs6_in_hdrerr);
 			goto done;
@@ -606,31 +934,22 @@ ip6_input(struct mbuf *m)
 	if ((ip6->ip6_vfc & IPV6_VERSION_MASK) != IPV6_VERSION) {
 		ip6stat.ip6s_badvers++;
 		in6_ifstat_inc(inifp, ifs6_in_hdrerr);
+		m_drop(m, DROPTAP_FLAG_DIR_IN | DROPTAP_FLAG_L2_MISSING, DROP_REASON_IP_BAD_VERSION, NULL, 0);
 		goto bad;
 	}
 
 	ip6stat.ip6s_nxthist[ip6->ip6_nxt]++;
 
-#if IPFW2
-	/*
-	 * Check with the firewall...
-	 */
-	if (ip6_fw_enable && ip6_fw_chk_ptr) {
-		u_short port = 0;
-		/* If ipfw says divert, we have to just drop packet */
-		/* use port as a dummy argument */
-		if ((*ip6_fw_chk_ptr)(&ip6, NULL, &port, &m)) {
-			m_freem(m);
-			m = NULL;
-		}
-		if (!m)
-			goto done;
-	}
-#endif /* IPFW2 */
-
 	/*
 	 * Check against address spoofing/corruption.
 	 */
+	if (!(m->m_pkthdr.pkt_flags & PKTF_LOOP) &&
+	    IN6_IS_ADDR_LOOPBACK(&ip6->ip6_src)) {
+		ip6stat.ip6s_badscope++;
+		in6_ifstat_inc(inifp, ifs6_in_addrerr);
+		m_drop(m, DROPTAP_FLAG_DIR_IN | DROPTAP_FLAG_L2_MISSING, DROP_REASON_IP6_BAD_SCOPE, NULL, 0);
+		goto bad;
+	}
 	if (IN6_IS_ADDR_MULTICAST(&ip6->ip6_src) ||
 	    IN6_IS_ADDR_UNSPECIFIED(&ip6->ip6_dst)) {
 		/*
@@ -638,6 +957,7 @@ ip6_input(struct mbuf *m)
 		 */
 		ip6stat.ip6s_badscope++;
 		in6_ifstat_inc(inifp, ifs6_in_addrerr);
+		m_drop(m, DROPTAP_FLAG_DIR_IN | DROPTAP_FLAG_L2_MISSING, DROP_REASON_IP6_BAD_SCOPE, NULL, 0);
 		goto bad;
 	}
 	if (IN6_IS_ADDR_MC_INTFACELOCAL(&ip6->ip6_dst) &&
@@ -650,6 +970,7 @@ ip6_input(struct mbuf *m)
 		 */
 		ip6stat.ip6s_badscope++;
 		in6_ifstat_inc(inifp, ifs6_in_addrerr);
+		m_drop(m, DROPTAP_FLAG_DIR_IN | DROPTAP_FLAG_L2_MISSING, DROP_REASON_IP6_BAD_SCOPE, NULL, 0);
 		goto bad;
 	}
 
@@ -669,8 +990,14 @@ ip6_input(struct mbuf *m)
 	    IN6_IS_ADDR_V4MAPPED(&ip6->ip6_dst)) {
 		ip6stat.ip6s_badscope++;
 		in6_ifstat_inc(inifp, ifs6_in_addrerr);
+		m_drop(m, DROPTAP_FLAG_DIR_IN | DROPTAP_FLAG_L2_MISSING, DROP_REASON_IP6_BAD_SCOPE, NULL, 0);
 		goto bad;
 	}
+
+	if (((ntohl(ip6->ip6_flow & IPV6_FLOW_ECN_MASK) >> 20) & IPTOS_ECN_ECT1) == IPTOS_ECN_ECT1) {
+		m->m_pkthdr.pkt_ext_flags |= PKTF_EXT_L4S;
+	}
+
 #if 0
 	/*
 	 * Reject packets with IPv4 compatible addresses (auto tunnel).
@@ -683,6 +1010,7 @@ ip6_input(struct mbuf *m)
 	    IN6_IS_ADDR_V4COMPAT(&ip6->ip6_dst)) {
 		ip6stat.ip6s_badscope++;
 		in6_ifstat_inc(inifp, ifs6_in_addrerr);
+		m_drop(m, DROPTAP_FLAG_DIR_IN | DROPTAP_FLAG_L2_MISSING, DROP_REASON_IP6_BAD_SCOPE, NULL, 0);
 		goto bad;
 	}
 #endif
@@ -699,16 +1027,13 @@ ip6_input(struct mbuf *m)
 	 * account for forwarded tcp traffic.
 	 */
 	if (nstat_collect) {
-		struct rtentry *rte =
+		rtentry_ref_t rte =
 		    ifnet_cached_rtlookup_inet6(inifp, &ip6->ip6_src);
 		if (rte != NULL) {
 			nstat_route_rx(rte, 1, m->m_pkthdr.len, 0);
 			rtfree(rte);
 		}
 	}
-
-	/* for consistency */
-	m->m_pkthdr.pkt_proto = ip6->ip6_nxt;
 
 #if DUMMYNET
 check_with_pf:
@@ -724,7 +1049,7 @@ check_with_pf:
 #endif /* !DUMMYNET */
 		if (error != 0 || m == NULL) {
 			if (m != NULL) {
-				panic("%s: unexpected packet %p\n",
+				panic("%s: unexpected packet %p",
 				    __func__, m);
 				/* NOTREACHED */
 			}
@@ -741,34 +1066,40 @@ check_with_pf:
 		if (IN6_IS_SCOPE_LINKLOCAL(&ip6->ip6_src) &&
 		    ip6->ip6_src.s6_addr16[1]) {
 			ip6stat.ip6s_badscope++;
+			m_drop(m, DROPTAP_FLAG_DIR_IN | DROPTAP_FLAG_L2_MISSING, DROP_REASON_IP6_BAD_SCOPE, NULL, 0);
 			goto bad;
 		}
-		if (IN6_IS_SCOPE_LINKLOCAL(&ip6->ip6_dst) &&
+		if (IN6_IS_SCOPE_EMBED(&ip6->ip6_dst) &&
 		    ip6->ip6_dst.s6_addr16[1]) {
 			ip6stat.ip6s_badscope++;
+			m_drop(m, DROPTAP_FLAG_DIR_IN | DROPTAP_FLAG_L2_MISSING, DROP_REASON_IP6_BAD_SCOPE, NULL, 0);
 			goto bad;
 		}
 	}
 
-	if (m->m_pkthdr.pkt_flags & PKTF_IFAINFO) {
-		if (IN6_IS_SCOPE_LINKLOCAL(&ip6->ip6_src))
+	if ((m->m_pkthdr.pkt_flags & PKTF_IFAINFO) != 0 && in6_embedded_scope) {
+		if (IN6_IS_SCOPE_LINKLOCAL(&ip6->ip6_src)) {
 			ip6->ip6_src.s6_addr16[1] =
 			    htons(m->m_pkthdr.src_ifindex);
-		if (IN6_IS_SCOPE_LINKLOCAL(&ip6->ip6_dst))
+		}
+		if (IN6_IS_SCOPE_EMBED(&ip6->ip6_dst)) {
 			ip6->ip6_dst.s6_addr16[1] =
 			    htons(m->m_pkthdr.dst_ifindex);
-	} else {
-		if (IN6_IS_SCOPE_LINKLOCAL(&ip6->ip6_src))
+		}
+	} else if (in6_embedded_scope) {
+		if (IN6_IS_SCOPE_LINKLOCAL(&ip6->ip6_src)) {
 			ip6->ip6_src.s6_addr16[1] = htons(inifp->if_index);
-		if (IN6_IS_SCOPE_LINKLOCAL(&ip6->ip6_dst))
+		}
+		if (IN6_IS_SCOPE_EMBED(&ip6->ip6_dst)) {
 			ip6->ip6_dst.s6_addr16[1] = htons(inifp->if_index);
+		}
 	}
 
 	/*
 	 * Multicast check
 	 */
 	if (IN6_IS_ADDR_MULTICAST(&ip6->ip6_dst)) {
-		struct	in6_multi *in6m = NULL;
+		struct in6_multi *__single in6m = NULL;
 
 		in6_ifstat_inc_na(inifp, ifs6_in_mcast);
 		/*
@@ -781,135 +1112,48 @@ check_with_pf:
 		if (in6m != NULL) {
 			IN6M_REMREF(in6m);
 			ours = 1;
-		} else if (!nd6_prproxy
-#if MROUTING
-		    && !ip6_mrouter
-#endif /* MROUTING */
-		    ) {
+		} else if (!nd6_prproxy) {
 			ip6stat.ip6s_notmember++;
 			ip6stat.ip6s_cantforward++;
 			in6_ifstat_inc(inifp, ifs6_in_discard);
+			m_drop(m, DROPTAP_FLAG_DIR_IN | DROPTAP_FLAG_L2_MISSING, DROP_REASON_IP_UNKNOWN_MULTICAST_GROUP, NULL, 0);
 			goto bad;
 		}
 		deliverifp = inifp;
-		VERIFY(ia6 == NULL);
+		/*
+		 * record dst address information into mbuf, if we don't have one yet.
+		 * note that we are unable to record it, if the address is not listed
+		 * as our interface address (e.g. multicast addresses, etc.)
+		 */
+		if (deliverifp != NULL) {
+			struct in6_ifaddr *__single ia6 = NULL;
+
+			ia6 = in6_ifawithifp(deliverifp, &ip6->ip6_dst);
+			if (ia6 != NULL) {
+				(void) ip6_setdstifaddr_info(m, 0, ia6);
+				(void) ip6_setsrcifaddr_info(m, ia6->ia_ifp->if_index, NULL);
+				ifa_remref(&ia6->ia_ifa);
+			} else {
+				(void) ip6_setdstifaddr_info(m, inifp->if_index, NULL);
+				(void) ip6_setsrcifaddr_info(m, inifp->if_index, NULL);
+			}
+		}
 		goto hbhcheck;
-	}
-
-	/*
-	 * Unicast check
-	 *
-	 * Fast path: see if the target is ourselves.
-	 */
-	lck_rw_lock_shared(&in6_ifaddr_rwlock);
-	for (ia6 = in6_ifaddrs; ia6 != NULL; ia6 = ia6->ia_next) {
+	} else {
 		/*
-		 * No reference is held on the address, as we just need
-		 * to test for a few things while holding the RW lock.
+		 * Unicast check
 		 */
-		if (IN6_ARE_ADDR_EQUAL(&ia6->ia_addr.sin6_addr, &ip6->ip6_dst))
-			break;
-	}
-
-	if (ia6 != NULL) {
-		/*
-		 * For performance, test without acquiring the address lock;
-		 * a lot of things in the address are set once and never
-		 * changed (e.g. ia_ifp.)
-		 */
-		if (!(ia6->ia6_flags & IN6_IFF_NOTREADY)) {
-			/* this address is ready */
+		ip6_check_if_result_t check_if_result = IP6_CHECK_IF_NONE;
+		check_if_result = ip6_input_check_interface(m, ip6, inifp, &rin6, &deliverifp);
+		ASSERT(check_if_result != IP6_CHECK_IF_NONE);
+		if (check_if_result == IP6_CHECK_IF_OURS) {
 			ours = 1;
-			deliverifp = ia6->ia_ifp;
-			/*
-			 * record dst address information into mbuf.
-			 */
-			(void) ip6_setdstifaddr_info(m, 0, ia6);
-			lck_rw_done(&in6_ifaddr_rwlock);
 			goto hbhcheck;
+		} else if (check_if_result == IP6_CHECK_IF_DROP) {
+			m_drop(m, DROPTAP_FLAG_DIR_IN | DROPTAP_FLAG_L2_MISSING, DROP_REASON_IP_RCV_IF_NO_MATCH, NULL, 0);
+			goto bad;
 		}
-		lck_rw_done(&in6_ifaddr_rwlock);
-		ia6 = NULL;
-		/* address is not ready, so discard the packet. */
-		nd6log((LOG_INFO, "%s: packet to an unready address %s->%s\n",
-		    __func__, ip6_sprintf(&ip6->ip6_src),
-		    ip6_sprintf(&ip6->ip6_dst)));
-		goto bad;
 	}
-	lck_rw_done(&in6_ifaddr_rwlock);
-
-	/*
-	 * Slow path: route lookup.
-	 */
-	dst6 = SIN6(&rin6.ro_dst);
-	dst6->sin6_len = sizeof (struct sockaddr_in6);
-	dst6->sin6_family = AF_INET6;
-	dst6->sin6_addr = ip6->ip6_dst;
-
-	rtalloc_scoped_ign((struct route *)&rin6,
-	    RTF_PRCLONING, IFSCOPE_NONE);
-	if (rin6.ro_rt != NULL)
-		RT_LOCK_SPIN(rin6.ro_rt);
-
-#define	rt6_key(r) (SIN6((r)->rt_nodes->rn_key))
-
-	/*
-	 * Accept the packet if the forwarding interface to the destination
-	 * according to the routing table is the loopback interface,
-	 * unless the associated route has a gateway.
-	 * Note that this approach causes to accept a packet if there is a
-	 * route to the loopback interface for the destination of the packet.
-	 * But we think it's even useful in some situations, e.g. when using
-	 * a special daemon which wants to intercept the packet.
-	 *
-	 * XXX: some OSes automatically make a cloned route for the destination
-	 * of an outgoing packet.  If the outgoing interface of the packet
-	 * is a loopback one, the kernel would consider the packet to be
-	 * accepted, even if we have no such address assinged on the interface.
-	 * We check the cloned flag of the route entry to reject such cases,
-	 * assuming that route entries for our own addresses are not made by
-	 * cloning (it should be true because in6_addloop explicitly installs
-	 * the host route).  However, we might have to do an explicit check
-	 * while it would be less efficient.  Or, should we rather install a
-	 * reject route for such a case?
-	 */
-	if (rin6.ro_rt != NULL &&
-	    (rin6.ro_rt->rt_flags & (RTF_HOST|RTF_GATEWAY)) == RTF_HOST &&
-#if RTF_WASCLONED
-	    !(rin6.ro_rt->rt_flags & RTF_WASCLONED) &&
-#endif
-	    rin6.ro_rt->rt_ifp->if_type == IFT_LOOP) {
-		ia6 = (struct in6_ifaddr *)rin6.ro_rt->rt_ifa;
-		/*
-		 * Packets to a tentative, duplicated, or somehow invalid
-		 * address must not be accepted.
-		 *
-		 * For performance, test without acquiring the address lock;
-		 * a lot of things in the address are set once and never
-		 * changed (e.g. ia_ifp.)
-		 */
-		if (!(ia6->ia6_flags & IN6_IFF_NOTREADY)) {
-			/* this address is ready */
-			ours = 1;
-			deliverifp = ia6->ia_ifp;	/* correct? */
-			/*
-			 * record dst address information into mbuf.
-			 */
-			(void) ip6_setdstifaddr_info(m, 0, ia6);
-			RT_UNLOCK(rin6.ro_rt);
-			goto hbhcheck;
-		}
-		RT_UNLOCK(rin6.ro_rt);
-		ia6 = NULL;
-		/* address is not ready, so discard the packet. */
-		nd6log((LOG_INFO, "%s: packet to an unready address %s->%s\n",
-		    __func__, ip6_sprintf(&ip6->ip6_src),
-		    ip6_sprintf(&ip6->ip6_dst)));
-		goto bad;
-	}
-
-	if (rin6.ro_rt != NULL)
-		RT_UNLOCK(rin6.ro_rt);
 
 	/*
 	 * Now there is no reason to process the packet if it's not our own
@@ -918,23 +1162,20 @@ check_with_pf:
 	if (!ip6_forwarding) {
 		ip6stat.ip6s_cantforward++;
 		in6_ifstat_inc(inifp, ifs6_in_discard);
+		/*
+		 * Raise a kernel event if the packet received on cellular
+		 * interface is not intended for local host.
+		 * For now limit it to ICMPv6 packets.
+		 */
+		if (inifp->if_type == IFT_CELLULAR &&
+		    ip6->ip6_nxt == IPPROTO_ICMPV6) {
+			in6_ifstat_inc(inifp, ifs6_cantfoward_icmp6);
+		}
+		m_drop(m, DROPTAP_FLAG_DIR_IN | DROPTAP_FLAG_L2_MISSING, DROP_REASON_IP_CANNOT_FORWARD, NULL, 0);
 		goto bad;
 	}
 
 hbhcheck:
-	/*
-	 * record dst address information into mbuf, if we don't have one yet.
-	 * note that we are unable to record it, if the address is not listed
-	 * as our interface address (e.g. multicast addresses, etc.)
-	 */
-	if (deliverifp != NULL && ia6 == NULL) {
-		ia6 = in6_ifawithifp(deliverifp, &ip6->ip6_dst);
-		if (ia6 != NULL) {
-			(void) ip6_setdstifaddr_info(m, 0, ia6);
-			IFA_REMREF(&ia6->ia_ifa);
-		}
-	}
-
 	/*
 	 * Process Hop-by-Hop options header if it's contained.
 	 * m may be modified in ip6_hopopts_input().
@@ -942,13 +1183,19 @@ hbhcheck:
 	 */
 	plen = (u_int32_t)ntohs(ip6->ip6_plen);
 	if (ip6->ip6_nxt == IPPROTO_HOPOPTS) {
-		struct ip6_hbh *hbh;
+		struct ip6_hbh *__single hbh;
 
+		/*
+		 * Mark the packet to imply that HBH option has been checked.
+		 * This can only be true is the packet came in unfragmented
+		 * or if the option is in the first fragment
+		 */
+		m->m_pkthdr.pkt_flags |= PKTF_HBH_CHKED;
 		if (ip6_hopopts_input(&plen, &rtalert, &m, &off)) {
-#if 0	/* touches NULL pointer */
+#if 0   /* touches NULL pointer */
 			in6_ifstat_inc(inifp, ifs6_in_discard);
 #endif
-			goto done;	/* m have already been freed */
+			goto done;      /* m have already been freed */
 		}
 
 		/* adjust pointer */
@@ -969,20 +1216,11 @@ hbhcheck:
 			in6_ifstat_inc(inifp, ifs6_in_discard);
 			in6_ifstat_inc(inifp, ifs6_in_hdrerr);
 			icmp6_error(m, ICMP6_PARAM_PROB, ICMP6_PARAMPROB_HEADER,
-			    (caddr_t)&ip6->ip6_plen - (caddr_t)ip6);
+			    (int)((caddr_t)&ip6->ip6_plen - (caddr_t)ip6));
 			goto done;
 		}
-#ifndef PULLDOWN_TEST
 		/* ip6_hopopts_input() ensures that mbuf is contiguous */
 		hbh = (struct ip6_hbh *)(ip6 + 1);
-#else
-		IP6_EXTHDR_GET(hbh, struct ip6_hbh *, m,
-		    sizeof (struct ip6_hdr), sizeof (struct ip6_hbh));
-		if (hbh == NULL) {
-			ip6stat.ip6s_tooshort++;
-			goto done;
-		}
-#endif
 		nxt = hbh->ip6h_nxt;
 
 		/*
@@ -1005,8 +1243,9 @@ hbhcheck:
 				break;
 			}
 		}
-	} else
+	} else {
 		nxt = ip6->ip6_nxt;
+	}
 
 	/*
 	 * Check that the amount of data in the buffers
@@ -1014,55 +1253,21 @@ hbhcheck:
 	 * Trim mbufs if longer than we expect.
 	 * Drop packet if shorter than we expect.
 	 */
-	if (m->m_pkthdr.len - sizeof (struct ip6_hdr) < plen) {
+	if (m->m_pkthdr.len - sizeof(struct ip6_hdr) < plen) {
 		ip6stat.ip6s_tooshort++;
 		in6_ifstat_inc(inifp, ifs6_in_truncated);
+		m_drop(m, DROPTAP_FLAG_DIR_IN | DROPTAP_FLAG_L2_MISSING, DROP_REASON_IP_TOO_SHORT, NULL, 0);
 		goto bad;
 	}
-	if (m->m_pkthdr.len > sizeof (struct ip6_hdr) + plen) {
-		/*
-		 * Invalidate hardware checksum info if ip6_adj_clear_hwcksum
-		 * is set; useful to handle buggy drivers.  Note that this
-		 * should not be enabled by default, as we may get here due
-		 * to link-layer padding.
-		 */
-		if (ip6_adj_clear_hwcksum &&
-		    (m->m_pkthdr.csum_flags & CSUM_DATA_VALID) &&
-		    !(inifp->if_flags & IFF_LOOPBACK) &&
-		    !(m->m_pkthdr.pkt_flags & PKTF_LOOP)) {
-			m->m_pkthdr.csum_flags &= ~CSUM_DATA_VALID;
-			m->m_pkthdr.csum_data = 0;
-			ip6stat.ip6s_adj_hwcsum_clr++;
-		}
 
-		ip6stat.ip6s_adj++;
-		if (m->m_len == m->m_pkthdr.len) {
-			m->m_len = sizeof (struct ip6_hdr) + plen;
-			m->m_pkthdr.len = sizeof (struct ip6_hdr) + plen;
-		} else {
-			m_adj(m, sizeof (struct ip6_hdr) + plen -
-			    m->m_pkthdr.len);
-		}
+	if (m->m_pkthdr.len > sizeof(struct ip6_hdr) + plen) {
+		ip6_input_adjust(m, ip6, plen, inifp);
 	}
 
 	/*
 	 * Forward if desirable.
 	 */
 	if (IN6_IS_ADDR_MULTICAST(&ip6->ip6_dst)) {
-		/*
-		 * If we are acting as a multicast router, all
-		 * incoming multicast packets are passed to the
-		 * kernel-level multicast forwarding function.
-		 * The packet is returned (relatively) intact; if
-		 * ip6_mforward() returns a non-zero value, the packet
-		 * must be discarded, else it may be accepted below.
-		 */
-#if MROUTING
-		if (ip6_mrouter && ip6_mforward(ip6, inifp, m)) {
-			ip6stat.ip6s_cantforward++;
-			goto bad;
-		}
-#endif /* MROUTING */
 		if (!ours && nd6_prproxy) {
 			/*
 			 * If this isn't for us, this might be a Neighbor
@@ -1075,8 +1280,10 @@ hbhcheck:
 			VERIFY(!ours ||
 			    (m->m_pkthdr.pkt_flags & PKTF_PROXY_DST));
 		}
-		if (!ours)
+		if (!ours) {
+			m_drop(m, DROPTAP_FLAG_DIR_IN | DROPTAP_FLAG_L2_MISSING, DROP_REASON_IP6_UNPROXIED_NS, NULL, 0);
 			goto bad;
+		}
 	} else if (!ours) {
 		/*
 		 * The unicast forwarding function might return the packet
@@ -1090,8 +1297,9 @@ hbhcheck:
 		 * proxied nodes on different links (src is link-local, dst
 		 * is target address.)
 		 */
-		if ((m = ip6_forward(m, &rin6, 0)) == NULL)
+		if ((m = ip6_forward(m, &rin6, 0)) == NULL) {
 			goto done;
+		}
 		VERIFY(rin6.ro_rt != NULL);
 		VERIFY(m->m_pkthdr.pkt_flags & PKTF_PROXY_DST);
 		deliverifp = rin6.ro_rt->rt_ifp;
@@ -1113,6 +1321,7 @@ hbhcheck:
 	    IN6_IS_ADDR_V4MAPPED(&ip6->ip6_dst)) {
 		ip6stat.ip6s_badscope++;
 		in6_ifstat_inc(inifp, ifs6_in_addrerr);
+		m_drop(m, DROPTAP_FLAG_DIR_IN | DROPTAP_FLAG_L2_MISSING, DROP_REASON_IP6_BAD_SCOPE, NULL, 0);
 		goto bad;
 	}
 
@@ -1130,14 +1339,30 @@ injectit:
 	 * we do it once for the outermost protocol, and we assume each
 	 * protocol handler wouldn't mess with the alignment afterwards.
 	 */
-	IP6_HDR_ALIGNMENT_FIXUP(m, inifp, return);
+	IP6_HDR_ALIGNMENT_FIXUP(m, inifp, return );
 
 	while (nxt != IPPROTO_DONE) {
-		struct ipfilter *filter;
+		struct ipfilter *__single filter;
 		int (*pr_input)(struct mbuf **, int *, int);
+
+		/*
+		 * This would imply either IPPROTO_HOPOPTS was not the first
+		 * option or it did not come in the first fragment.
+		 */
+		if (nxt == IPPROTO_HOPOPTS &&
+		    (m->m_pkthdr.pkt_flags & PKTF_HBH_CHKED) == 0) {
+			/*
+			 * This implies that HBH option was not contained
+			 * in the first fragment
+			 */
+			ip6stat.ip6s_badoptions++;
+			m_drop(m, DROPTAP_FLAG_DIR_IN | DROPTAP_FLAG_L2_MISSING, DROP_REASON_IP6_BAD_OPTION, NULL, 0);
+			goto bad;
+		}
 
 		if (ip6_hdrnestlimit && (++nest > ip6_hdrnestlimit)) {
 			ip6stat.ip6s_toomanyhdr++;
+			m_drop(m, DROPTAP_FLAG_DIR_IN | DROPTAP_FLAG_L2_MISSING, DROP_REASON_IP6_TOO_MANY_OPTIONS, NULL, 0);
 			goto bad;
 		}
 
@@ -1148,9 +1373,9 @@ injectit:
 		if (m->m_pkthdr.len < off) {
 			ip6stat.ip6s_tooshort++;
 			in6_ifstat_inc(inifp, ifs6_in_truncated);
+			m_drop(m, DROPTAP_FLAG_DIR_IN | DROPTAP_FLAG_L2_MISSING, DROP_REASON_IP_TOO_SHORT, NULL, 0);
 			goto bad;
 		}
-
 
 #if IPSEC
 		/*
@@ -1162,6 +1387,7 @@ injectit:
 		    (ip6_protox[nxt]->pr_flags & PR_LASTHDR) != 0) {
 			if (ipsec6_in_reject(m, NULL)) {
 				IPSEC_STAT_INCREMENT(ipsec6stat.in_polvio);
+				m_drop(m, DROPTAP_FLAG_DIR_IN | DROPTAP_FLAG_L2_MISSING, DROP_REASON_IPSEC_REJECT, NULL, 0);
 				goto bad;
 			}
 		}
@@ -1170,25 +1396,27 @@ injectit:
 		/*
 		 * Call IP filter
 		 */
-		if (!TAILQ_EMPTY(&ipv6_filters)) {
+		if (!TAILQ_EMPTY(&ipv6_filters) && !IFNET_IS_INTCOPROC(inifp)) {
 			ipf_ref();
 			TAILQ_FOREACH(filter, &ipv6_filters, ipf_link) {
 				if (seen == 0) {
 					if ((struct ipfilter *)inject_ipfref ==
-					    filter)
+					    filter) {
 						seen = 1;
+					}
 				} else if (filter->ipf_filter.ipf_input) {
 					errno_t result;
 
 					result = filter->ipf_filter.ipf_input(
-					    filter->ipf_filter.cookie,
-					    (mbuf_t *)&m, off, nxt);
+						filter->ipf_filter.cookie,
+						(mbuf_t *)&m, off, (uint8_t)nxt);
 					if (result == EJUSTRETURN) {
 						ipf_unref();
 						goto done;
 					}
 					if (result != 0) {
 						ipf_unref();
+						m_drop(m, DROPTAP_FLAG_DIR_IN | DROPTAP_FLAG_L2_MISSING, DROP_REASON_IP_FILTER_DROP, NULL, 0);
 						goto bad;
 					}
 				}
@@ -1201,7 +1429,7 @@ injectit:
 		    struct ip *, NULL, struct ip6_hdr *, ip6);
 
 		if ((pr_input = ip6_protox[nxt]->pr_input) == NULL) {
-			m_freem(m);
+			m_drop(m, DROPTAP_FLAG_DIR_IN | DROPTAP_FLAG_L2_MISSING, DROP_REASON_IP_NO_PROTO, NULL, 0);
 			m = NULL;
 			nxt = IPPROTO_DONE;
 		} else if (!(ip6_protox[nxt]->pr_flags & PR_PROTOLOCK)) {
@@ -1216,7 +1444,6 @@ done:
 	ROUTE_RELEASE(&rin6);
 	return;
 bad:
-	m_freem(m);
 	goto done;
 }
 
@@ -1224,7 +1451,7 @@ void
 ip6_setsrcifaddr_info(struct mbuf *m, uint32_t src_idx, struct in6_ifaddr *ia6)
 {
 	VERIFY(m->m_flags & M_PKTHDR);
-
+	m->m_pkthdr.pkt_ext_flags &= ~PKTF_EXT_OUTPUT_SCOPE;
 	/*
 	 * If the source ifaddr is specified, pick up the information
 	 * from there; otherwise just grab the passed-in ifindex as the
@@ -1238,9 +1465,10 @@ ip6_setsrcifaddr_info(struct mbuf *m, uint32_t src_idx, struct in6_ifaddr *ia6)
 		m->m_pkthdr.src_iff = (ia6->ia6_flags & 0xffff);
 	} else {
 		m->m_pkthdr.src_iff = 0;
-		m->m_pkthdr.src_ifindex = src_idx;
-		if (src_idx != 0)
+		m->m_pkthdr.src_ifindex = (uint16_t)src_idx;
+		if (src_idx != 0) {
 			m->m_pkthdr.pkt_flags |= PKTF_IFAINFO;
+		}
 	}
 }
 
@@ -1248,6 +1476,7 @@ void
 ip6_setdstifaddr_info(struct mbuf *m, uint32_t dst_idx, struct in6_ifaddr *ia6)
 {
 	VERIFY(m->m_flags & M_PKTHDR);
+	m->m_pkthdr.pkt_ext_flags &= ~PKTF_EXT_OUTPUT_SCOPE;
 
 	/*
 	 * If the destination ifaddr is specified, pick up the information
@@ -1262,9 +1491,10 @@ ip6_setdstifaddr_info(struct mbuf *m, uint32_t dst_idx, struct in6_ifaddr *ia6)
 		m->m_pkthdr.dst_iff = (ia6->ia6_flags & 0xffff);
 	} else {
 		m->m_pkthdr.dst_iff = 0;
-		m->m_pkthdr.dst_ifindex = dst_idx;
-		if (dst_idx != 0)
+		m->m_pkthdr.dst_ifindex = (uint16_t)dst_idx;
+		if (dst_idx != 0) {
 			m->m_pkthdr.pkt_flags |= PKTF_IFAINFO;
+		}
 	}
 }
 
@@ -1273,16 +1503,19 @@ ip6_getsrcifaddr_info(struct mbuf *m, uint32_t *src_idx, uint32_t *ia6f)
 {
 	VERIFY(m->m_flags & M_PKTHDR);
 
-	if (!(m->m_pkthdr.pkt_flags & PKTF_IFAINFO))
-		return (-1);
+	if (!(m->m_pkthdr.pkt_flags & PKTF_IFAINFO)) {
+		return -1;
+	}
 
-	if (src_idx != NULL)
+	if (src_idx != NULL) {
 		*src_idx = m->m_pkthdr.src_ifindex;
+	}
 
-	if (ia6f != NULL)
+	if (ia6f != NULL) {
 		*ia6f = m->m_pkthdr.src_iff;
+	}
 
-	return (0);
+	return 0;
 }
 
 int
@@ -1290,16 +1523,47 @@ ip6_getdstifaddr_info(struct mbuf *m, uint32_t *dst_idx, uint32_t *ia6f)
 {
 	VERIFY(m->m_flags & M_PKTHDR);
 
-	if (!(m->m_pkthdr.pkt_flags & PKTF_IFAINFO))
-		return (-1);
+	if (!(m->m_pkthdr.pkt_flags & PKTF_IFAINFO)) {
+		return -1;
+	}
 
-	if (dst_idx != NULL)
+	if (dst_idx != NULL) {
 		*dst_idx = m->m_pkthdr.dst_ifindex;
+	}
 
-	if (ia6f != NULL)
+	if (ia6f != NULL) {
 		*ia6f = m->m_pkthdr.dst_iff;
+	}
 
-	return (0);
+	return 0;
+}
+
+uint32_t
+ip6_input_getsrcifscope(struct mbuf *m)
+{
+	VERIFY(m->m_flags & M_PKTHDR);
+
+	if (m->m_pkthdr.rcvif != NULL) {
+		return m->m_pkthdr.rcvif->if_index;
+	}
+
+	uint32_t src_ifscope = IFSCOPE_NONE;
+	ip6_getsrcifaddr_info(m, &src_ifscope, NULL);
+	return src_ifscope;
+}
+
+uint32_t
+ip6_input_getdstifscope(struct mbuf *m)
+{
+	VERIFY(m->m_flags & M_PKTHDR);
+
+	if (m->m_pkthdr.rcvif != NULL) {
+		return m->m_pkthdr.rcvif->if_index;
+	}
+
+	uint32_t dst_ifscope = IFSCOPE_NONE;
+	ip6_getdstifaddr_info(m, &dst_ifscope, NULL);
+	return dst_ifscope;
 }
 
 /*
@@ -1310,45 +1574,30 @@ static int
 ip6_hopopts_input(uint32_t *plenp, uint32_t *rtalertp, struct mbuf **mp,
     int *offp)
 {
-	struct mbuf *m = *mp;
+	mbuf_ref_t m = *mp;
 	int off = *offp, hbhlen;
 	struct ip6_hbh *hbh;
 	u_int8_t *opt;
 
 	/* validation of the length of the header */
-#ifndef PULLDOWN_TEST
-	IP6_EXTHDR_CHECK(m, off, sizeof (*hbh), return (-1));
+	IP6_EXTHDR_CHECK(m, off, sizeof(*hbh), return (-1));
 	hbh = (struct ip6_hbh *)(mtod(m, caddr_t) + off);
 	hbhlen = (hbh->ip6h_len + 1) << 3;
 
 	IP6_EXTHDR_CHECK(m, off, hbhlen, return (-1));
 	hbh = (struct ip6_hbh *)(mtod(m, caddr_t) + off);
-#else
-	IP6_EXTHDR_GET(hbh, struct ip6_hbh *, m, sizeof (struct ip6_hdr),
-	    sizeof (struct ip6_hbh));
-	if (hbh == NULL) {
-		ip6stat.ip6s_tooshort++;
-		return (-1);
-	}
-	hbhlen = (hbh->ip6h_len + 1) << 3;
-	IP6_EXTHDR_GET(hbh, struct ip6_hbh *, m, sizeof (struct ip6_hdr),
-	    hbhlen);
-	if (hbh == NULL) {
-		ip6stat.ip6s_tooshort++;
-		return (-1);
-	}
-#endif
 	off += hbhlen;
-	hbhlen -= sizeof (struct ip6_hbh);
-	opt = (u_int8_t *)hbh + sizeof (struct ip6_hbh);
+	hbhlen -= sizeof(struct ip6_hbh);
+	opt = (u_int8_t *)hbh + sizeof(struct ip6_hbh);
 
-	if (ip6_process_hopopts(m, (u_int8_t *)hbh + sizeof (struct ip6_hbh),
-	    hbhlen, rtalertp, plenp) < 0)
-		return (-1);
+	if (ip6_process_hopopts(m, (u_int8_t *)hbh + sizeof(struct ip6_hbh),
+	    hbhlen, rtalertp, plenp) < 0) {
+		return -1;
+	}
 
 	*offp = off;
 	*mp = m;
-	return (0);
+	return 0;
 }
 
 /*
@@ -1362,19 +1611,16 @@ ip6_hopopts_input(uint32_t *plenp, uint32_t *rtalertp, struct mbuf **mp,
  * opthead + hbhlen is located in continuous memory region.
  */
 int
-ip6_process_hopopts(m, opthead, hbhlen, rtalertp, plenp)
-	struct mbuf *m;
-	u_int8_t *opthead;
-	int hbhlen;
-	u_int32_t *rtalertp;
-	u_int32_t *plenp;
+ip6_process_hopopts(struct mbuf *m, u_int8_t *__sized_by(inhbhlen)opthead, int inhbhlen,
+    u_int32_t *rtalertp, u_int32_t *plenp)
 {
-	struct ip6_hdr *ip6;
+	struct ip6_hdr *__single ip6;
 	int optlen = 0;
+	int hbhlen = inhbhlen;
 	u_int8_t *opt = opthead;
 	u_int16_t rtalert_val;
 	u_int32_t jumboplen;
-	const int erroff = sizeof (struct ip6_hdr) + sizeof (struct ip6_hbh);
+	const int erroff = sizeof(struct ip6_hdr) + sizeof(struct ip6_hbh);
 
 	for (; hbhlen > 0; hbhlen -= optlen, opt += optlen) {
 		switch (*opt) {
@@ -1384,6 +1630,7 @@ ip6_process_hopopts(m, opthead, hbhlen, rtalertp, plenp)
 		case IP6OPT_PADN:
 			if (hbhlen < IP6OPT_MINLEN) {
 				ip6stat.ip6s_toosmall++;
+				m_drop(m, DROPTAP_FLAG_DIR_IN | DROPTAP_FLAG_L2_MISSING, DROP_REASON_IP_TOO_SMALL, NULL, 0);
 				goto bad;
 			}
 			optlen = *(opt + 1) + 2;
@@ -1397,9 +1644,9 @@ ip6_process_hopopts(m, opthead, hbhlen, rtalertp, plenp)
 			if (*(opt + 1) != IP6OPT_RTALERT_LEN - 2) {
 				/* XXX stat */
 				icmp6_error(m, ICMP6_PARAM_PROB,
-					    ICMP6_PARAMPROB_HEADER,
-					    erroff + opt + 1 - opthead);
-				return (-1);
+				    ICMP6_PARAMPROB_HEADER,
+				    (int)(erroff + opt + 1 - opthead));
+				return -1;
 			}
 			optlen = IP6OPT_RTALERT_LEN;
 			bcopy((caddr_t)(opt + 2), (caddr_t)&rtalert_val, 2);
@@ -1409,14 +1656,15 @@ ip6_process_hopopts(m, opthead, hbhlen, rtalertp, plenp)
 			/* XXX may need check for alignment */
 			if (hbhlen < IP6OPT_JUMBO_LEN) {
 				ip6stat.ip6s_toosmall++;
+				m_drop(m, DROPTAP_FLAG_DIR_IN | DROPTAP_FLAG_L2_MISSING, DROP_REASON_IP_TOO_SMALL, NULL, 0);
 				goto bad;
 			}
 			if (*(opt + 1) != IP6OPT_JUMBO_LEN - 2) {
 				/* XXX stat */
 				icmp6_error(m, ICMP6_PARAM_PROB,
-					    ICMP6_PARAMPROB_HEADER,
-					    erroff + opt + 1 - opthead);
-				return (-1);
+				    ICMP6_PARAMPROB_HEADER,
+				    (int)(erroff + opt + 1 - opthead));
+				return -1;
 			}
 			optlen = IP6OPT_JUMBO_LEN;
 
@@ -1428,16 +1676,16 @@ ip6_process_hopopts(m, opthead, hbhlen, rtalertp, plenp)
 			if (ip6->ip6_plen) {
 				ip6stat.ip6s_badoptions++;
 				icmp6_error(m, ICMP6_PARAM_PROB,
-					    ICMP6_PARAMPROB_HEADER,
-					    erroff + opt - opthead);
-				return (-1);
+				    ICMP6_PARAMPROB_HEADER,
+				    (int)(erroff + opt - opthead));
+				return -1;
 			}
 
 			/*
 			 * We may see jumbolen in unaligned location, so
 			 * we'd need to perform bcopy().
 			 */
-			bcopy(opt + 2, &jumboplen, sizeof (jumboplen));
+			bcopy(opt + 2, &jumboplen, sizeof(jumboplen));
 			jumboplen = (u_int32_t)htonl(jumboplen);
 
 #if 1
@@ -1452,9 +1700,9 @@ ip6_process_hopopts(m, opthead, hbhlen, rtalertp, plenp)
 			if (*plenp != 0) {
 				ip6stat.ip6s_badoptions++;
 				icmp6_error(m, ICMP6_PARAM_PROB,
-					    ICMP6_PARAMPROB_HEADER,
-					    erroff + opt + 2 - opthead);
-				return (-1);
+				    ICMP6_PARAMPROB_HEADER,
+				    (int)(erroff + opt + 2 - opthead));
+				return -1;
 			}
 #endif
 
@@ -1464,74 +1712,76 @@ ip6_process_hopopts(m, opthead, hbhlen, rtalertp, plenp)
 			if (jumboplen <= IPV6_MAXPACKET) {
 				ip6stat.ip6s_badoptions++;
 				icmp6_error(m, ICMP6_PARAM_PROB,
-					    ICMP6_PARAMPROB_HEADER,
-					    erroff + opt + 2 - opthead);
-				return (-1);
+				    ICMP6_PARAMPROB_HEADER,
+				    (int)(erroff + opt + 2 - opthead));
+				return -1;
 			}
 			*plenp = jumboplen;
 
 			break;
-		default:		/* unknown option */
+		default:                /* unknown option */
 			if (hbhlen < IP6OPT_MINLEN) {
 				ip6stat.ip6s_toosmall++;
+				m_drop(m, DROPTAP_FLAG_DIR_IN | DROPTAP_FLAG_L2_MISSING, DROP_REASON_IP_TOO_SMALL, NULL, 0);
 				goto bad;
 			}
-			optlen = ip6_unknown_opt(opt, m,
+			optlen = ip6_unknown_opt(opt, hbhlen, m,
 			    erroff + opt - opthead);
 			if (optlen == -1) {
-				return (-1);
+				return -1;
 			}
 			optlen += 2;
 			break;
 		}
 	}
 
-	return (0);
+	return 0;
 
 bad:
-	m_freem(m);
-	return (-1);
+	return -1;
 }
 
 /*
  * Unknown option processing.
- * The third argument `off' is the offset from the IPv6 header to the option,
+ * The fourth argument `off' is the offset from the IPv6 header to the option,
  * which is necessary if the IPv6 header the and option header and IPv6 header
  * is not continuous in order to return an ICMPv6 error.
  */
 int
-ip6_unknown_opt(uint8_t *optp, struct mbuf *m, int off)
+ip6_unknown_opt(uint8_t *__counted_by(optplen) optp, size_t optplen, struct mbuf *m, size_t off)
 {
-	struct ip6_hdr *ip6;
+#pragma unused(optplen)
+
+	struct ip6_hdr *__single ip6;
 
 	switch (IP6OPT_TYPE(*optp)) {
 	case IP6OPT_TYPE_SKIP: /* ignore the option */
-		return ((int)*(optp + 1));
+		return (int)*(optp + 1);
 
-	case IP6OPT_TYPE_DISCARD:	/* silently discard */
-		m_freem(m);
-		return (-1);
+	case IP6OPT_TYPE_DISCARD:       /* silently discard */
+		m_drop(m, DROPTAP_FLAG_DIR_IN | DROPTAP_FLAG_L2_MISSING, DROP_REASON_IP6_OPT_DISCARD, NULL, 0);
+		return -1;
 
 	case IP6OPT_TYPE_FORCEICMP: /* send ICMP even if multicasted */
 		ip6stat.ip6s_badoptions++;
-		icmp6_error(m, ICMP6_PARAM_PROB, ICMP6_PARAMPROB_OPTION, off);
-		return (-1);
+		icmp6_error(m, ICMP6_PARAM_PROB, ICMP6_PARAMPROB_OPTION, (int)off);
+		return -1;
 
 	case IP6OPT_TYPE_ICMP: /* send ICMP if not multicasted */
 		ip6stat.ip6s_badoptions++;
 		ip6 = mtod(m, struct ip6_hdr *);
 		if (IN6_IS_ADDR_MULTICAST(&ip6->ip6_dst) ||
-		    (m->m_flags & (M_BCAST|M_MCAST))) {
-			m_freem(m);
+		    (m->m_flags & (M_BCAST | M_MCAST))) {
+			m_drop(m, DROPTAP_FLAG_DIR_IN | DROPTAP_FLAG_L2_MISSING, DROP_REASON_IP6_BAD_OPTION, NULL, 0);
 		} else {
 			icmp6_error(m, ICMP6_PARAM_PROB,
-			    ICMP6_PARAMPROB_OPTION, off);
+			    ICMP6_PARAMPROB_OPTION, (int)off);
 		}
-		return (-1);
+		return -1;
 	}
 
-	m_freem(m);		/* XXX: NOTREACHED */
-	return (-1);
+	m_drop(m, DROPTAP_FLAG_DIR_IN | DROPTAP_FLAG_L2_MISSING, DROP_REASON_UNSPECIFIED, NULL, 0); /* XXX: NOTREACHED */
+	return -1;
 }
 
 /*
@@ -1553,72 +1803,131 @@ struct mbuf **
 ip6_savecontrol_v4(struct inpcb *inp, struct mbuf *m, struct mbuf **mp,
     int *v4only)
 {
-	struct ip6_hdr *ip6 = mtod(m, struct ip6_hdr *);
+	struct ip6_hdr *__single ip6 = mtod(m, struct ip6_hdr *);
 
 	if ((inp->inp_socket->so_options & SO_TIMESTAMP) != 0) {
 		struct timeval tv;
 
 		getmicrotime(&tv);
-		mp = sbcreatecontrol_mbuf((caddr_t)&tv, sizeof (tv),
+		mp = sbcreatecontrol_mbuf((caddr_t)&tv, sizeof(tv),
 		    SCM_TIMESTAMP, SOL_SOCKET, mp);
-		if (*mp == NULL)
-			return (NULL);
+		if (*mp == NULL) {
+			return NULL;
+		}
 	}
 	if ((inp->inp_socket->so_options & SO_TIMESTAMP_MONOTONIC) != 0) {
 		uint64_t time;
 
 		time = mach_absolute_time();
-		mp = sbcreatecontrol_mbuf((caddr_t)&time, sizeof (time),
+		mp = sbcreatecontrol_mbuf((caddr_t)&time, sizeof(time),
 		    SCM_TIMESTAMP_MONOTONIC, SOL_SOCKET, mp);
-		if (*mp == NULL)
-			return (NULL);
+		if (*mp == NULL) {
+			return NULL;
+		}
+	}
+	if ((inp->inp_socket->so_options & SO_TIMESTAMP_CONTINUOUS) != 0) {
+		uint64_t time;
+
+		time = mach_continuous_time();
+		mp = sbcreatecontrol_mbuf((caddr_t)&time, sizeof(time),
+		    SCM_TIMESTAMP_CONTINUOUS, SOL_SOCKET, mp);
+		if (*mp == NULL) {
+			return NULL;
+		}
 	}
 	if ((inp->inp_socket->so_flags & SOF_RECV_TRAFFIC_CLASS) != 0) {
 		int tc = m_get_traffic_class(m);
 
-		mp = sbcreatecontrol_mbuf((caddr_t)&tc, sizeof (tc),
+		mp = sbcreatecontrol_mbuf((caddr_t)&tc, sizeof(tc),
 		    SO_TRAFFIC_CLASS, SOL_SOCKET, mp);
-		if (*mp == NULL)
-			return (NULL);
+		if (*mp == NULL) {
+			return NULL;
+		}
 	}
 
+	if ((inp->inp_socket->so_flags & SOF_RECV_WAKE_PKT) &&
+	    (m->m_pkthdr.pkt_flags & PKTF_WAKE_PKT)) {
+		int flag = 1;
+
+		mp = sbcreatecontrol_mbuf((caddr_t)&flag, sizeof(flag),
+		    SO_RECV_WAKE_PKT, SOL_SOCKET, mp);
+		if (*mp == NULL) {
+			return NULL;
+		}
+	}
+
+#define IS2292(inp, x, y)       (((inp)->inp_flags & IN6P_RFC2292) ? (x) : (y))
 	if ((ip6->ip6_vfc & IPV6_VERSION_MASK) != IPV6_VERSION) {
-		if (v4only != NULL)
+		if (v4only != NULL) {
 			*v4only = 1;
-		return (mp);
+		}
+
+		// Send ECN flags for v4-mapped addresses
+		if ((inp->inp_flags & IN6P_TCLASS) != 0) {
+			struct ip *__single ip_header = mtod(m, struct ip *);
+
+			int tclass = (int)(ip_header->ip_tos);
+			mp = sbcreatecontrol_mbuf((caddr_t)&tclass, sizeof(tclass),
+			    IPV6_TCLASS, IPPROTO_IPV6, mp);
+			if (*mp == NULL) {
+				return NULL;
+			}
+		}
+
+		// Send IN6P_PKTINFO for v4-mapped address
+		if ((inp->inp_flags & IN6P_PKTINFO) != 0 || SOFLOW_ENABLED(inp->inp_socket)) {
+			struct in6_pktinfo pi6 = {
+				.ipi6_addr = IN6ADDR_V4MAPPED_INIT,
+				.ipi6_ifindex = (m && m->m_pkthdr.rcvif) ? m->m_pkthdr.rcvif->if_index : 0,
+			};
+
+			struct ip *__single ip_header = mtod(m, struct ip *);
+			bcopy(&ip_header->ip_dst, &pi6.ipi6_addr.s6_addr32[3], sizeof(struct in_addr));
+
+			mp = sbcreatecontrol_mbuf((caddr_t)&pi6,
+			    sizeof(struct in6_pktinfo),
+			    IS2292(inp, IPV6_2292PKTINFO, IPV6_PKTINFO),
+			    IPPROTO_IPV6, mp);
+			if (*mp == NULL) {
+				return NULL;
+			}
+		}
+		return mp;
 	}
 
-#define	IS2292(inp, x, y)	(((inp)->inp_flags & IN6P_RFC2292) ? (x) : (y))
 	/* RFC 2292 sec. 5 */
-	if ((inp->inp_flags & IN6P_PKTINFO) != 0) {
+	if ((inp->inp_flags & IN6P_PKTINFO) != 0 || SOFLOW_ENABLED(inp->inp_socket)) {
 		struct in6_pktinfo pi6;
 
-		bcopy(&ip6->ip6_dst, &pi6.ipi6_addr, sizeof (struct in6_addr));
-		in6_clearscope(&pi6.ipi6_addr);	/* XXX */
+		bcopy(&ip6->ip6_dst, &pi6.ipi6_addr, sizeof(struct in6_addr));
+		in6_clearscope(&pi6.ipi6_addr); /* XXX */
 		pi6.ipi6_ifindex =
 		    (m && m->m_pkthdr.rcvif) ? m->m_pkthdr.rcvif->if_index : 0;
 
 		mp = sbcreatecontrol_mbuf((caddr_t)&pi6,
-		    sizeof (struct in6_pktinfo),
+		    sizeof(struct in6_pktinfo),
 		    IS2292(inp, IPV6_2292PKTINFO, IPV6_PKTINFO),
 		    IPPROTO_IPV6, mp);
-		if (*mp == NULL)
-			return (NULL);
+		if (*mp == NULL) {
+			return NULL;
+		}
 	}
 
 	if ((inp->inp_flags & IN6P_HOPLIMIT) != 0) {
 		int hlim = ip6->ip6_hlim & 0xff;
 
-		mp = sbcreatecontrol_mbuf((caddr_t)&hlim, sizeof (int),
+		mp = sbcreatecontrol_mbuf((caddr_t)&hlim, sizeof(int),
 		    IS2292(inp, IPV6_2292HOPLIMIT, IPV6_HOPLIMIT),
 		    IPPROTO_IPV6, mp);
-		if (*mp == NULL)
-			return (NULL);
+		if (*mp == NULL) {
+			return NULL;
+		}
 	}
 
-	if (v4only != NULL)
+	if (v4only != NULL) {
 		*v4only = 0;
-	return (mp);
+	}
+	return mp;
 }
 
 int
@@ -1630,12 +1939,14 @@ ip6_savecontrol(struct inpcb *in6p, struct mbuf *m, struct mbuf **mp)
 
 	*mp = NULL;
 	np = ip6_savecontrol_v4(in6p, m, mp, &v4only);
-	if (np == NULL)
+	if (np == NULL) {
 		goto no_mbufs;
+	}
 
 	mp = np;
-	if (v4only)
-		return (0);
+	if (v4only) {
+		return 0;
+	}
 
 	if ((in6p->inp_flags & IN6P_TCLASS) != 0) {
 		u_int32_t flowinfo;
@@ -1645,10 +1956,11 @@ ip6_savecontrol(struct inpcb *in6p, struct mbuf *m, struct mbuf **mp)
 		flowinfo >>= 20;
 
 		tclass = flowinfo & 0xff;
-		mp = sbcreatecontrol_mbuf((caddr_t)&tclass, sizeof (tclass),
+		mp = sbcreatecontrol_mbuf((caddr_t)&tclass, sizeof(tclass),
 		    IPV6_TCLASS, IPPROTO_IPV6, mp);
-		if (*mp == NULL)
+		if (*mp == NULL) {
 			goto no_mbufs;
+		}
 	}
 
 	/*
@@ -1670,28 +1982,8 @@ ip6_savecontrol(struct inpcb *in6p, struct mbuf *m, struct mbuf **mp)
 		if (ip6->ip6_nxt == IPPROTO_HOPOPTS) {
 			struct ip6_hbh *hbh;
 			int hbhlen = 0;
-#if PULLDOWN_TEST
-			struct mbuf *ext;
-#endif
-
-#ifndef PULLDOWN_TEST
 			hbh = (struct ip6_hbh *)(ip6 + 1);
 			hbhlen = (hbh->ip6h_len + 1) << 3;
-#else
-			ext = ip6_pullexthdr(m, sizeof (struct ip6_hdr),
-			    ip6->ip6_nxt);
-			if (ext == NULL) {
-				ip6stat.ip6s_tooshort++;
-				return (0);
-			}
-			hbh = mtod(ext, struct ip6_hbh *);
-			hbhlen = (hbh->ip6h_len + 1) << 3;
-			if (hbhlen != ext->m_len) {
-				m_freem(ext);
-				ip6stat.ip6s_tooshort++;
-				return (0);
-			}
-#endif
 
 			/*
 			 * XXX: We copy the whole header even if a
@@ -1704,9 +1996,6 @@ ip6_savecontrol(struct inpcb *in6p, struct mbuf *m, struct mbuf **mp)
 			    IS2292(in6p, IPV6_2292HOPOPTS, IPV6_HOPOPTS),
 			    IPPROTO_IPV6, mp);
 
-#if PULLDOWN_TEST
-			m_freem(ext);
-#endif
 			if (*mp == NULL) {
 				goto no_mbufs;
 			}
@@ -1714,7 +2003,7 @@ ip6_savecontrol(struct inpcb *in6p, struct mbuf *m, struct mbuf **mp)
 	}
 
 	if ((in6p->inp_flags & (IN6P_RTHDR | IN6P_DSTOPTS)) != 0) {
-		int nxt = ip6->ip6_nxt, off = sizeof (struct ip6_hdr);
+		int nxt = ip6->ip6_nxt, off = sizeof(struct ip6_hdr);
 
 		/*
 		 * Search for destination options headers or routing
@@ -1723,12 +2012,9 @@ ip6_savecontrol(struct inpcb *in6p, struct mbuf *m, struct mbuf **mp)
 		 * Note that the order of the headers remains in
 		 * the chain of ancillary data.
 		 */
-		while (1) {	/* is explicit loop prevention necessary? */
+		while (1) {     /* is explicit loop prevention necessary? */
 			struct ip6_ext *ip6e = NULL;
 			int elen;
-#if PULLDOWN_TEST
-			struct mbuf *ext = NULL;
-#endif
 
 			/*
 			 * if it is not an extension header, don't try to
@@ -1744,60 +2030,41 @@ ip6_savecontrol(struct inpcb *in6p, struct mbuf *m, struct mbuf **mp)
 				goto loopend;
 			}
 
-#ifndef PULLDOWN_TEST
-			if (off + sizeof (*ip6e) > m->m_len)
+			if (off + sizeof(*ip6e) > m->m_len) {
 				goto loopend;
+			}
 			ip6e = (struct ip6_ext *)(mtod(m, caddr_t) + off);
-			if (nxt == IPPROTO_AH)
+			if (nxt == IPPROTO_AH) {
 				elen = (ip6e->ip6e_len + 2) << 2;
-			else
+			} else {
 				elen = (ip6e->ip6e_len + 1) << 3;
-			if (off + elen > m->m_len)
+			}
+			if (off + elen > m->m_len) {
 				goto loopend;
-#else
-			ext = ip6_pullexthdr(m, off, nxt);
-			if (ext == NULL) {
-				ip6stat.ip6s_tooshort++;
-				return (0);
 			}
-			ip6e = mtod(ext, struct ip6_ext *);
-			if (nxt == IPPROTO_AH)
-				elen = (ip6e->ip6e_len + 2) << 2;
-			else
-				elen = (ip6e->ip6e_len + 1) << 3;
-			if (elen != ext->m_len) {
-				m_freem(ext);
-				ip6stat.ip6s_tooshort++;
-				return (0);
-			}
-#endif
 
 			switch (nxt) {
 			case IPPROTO_DSTOPTS:
-				if (!(in6p->inp_flags & IN6P_DSTOPTS))
+				if (!(in6p->inp_flags & IN6P_DSTOPTS)) {
 					break;
+				}
 
 				mp = sbcreatecontrol_mbuf((caddr_t)ip6e, elen,
 				    IS2292(in6p, IPV6_2292DSTOPTS,
 				    IPV6_DSTOPTS), IPPROTO_IPV6, mp);
 				if (*mp == NULL) {
-#if PULLDOWN_TEST
-					m_freem(ext);
-#endif
 					goto no_mbufs;
 				}
 				break;
 			case IPPROTO_ROUTING:
-				if (!in6p->inp_flags & IN6P_RTHDR)
+				if (!(in6p->inp_flags & IN6P_RTHDR)) {
 					break;
+				}
 
 				mp = sbcreatecontrol_mbuf((caddr_t)ip6e, elen,
 				    IS2292(in6p, IPV6_2292RTHDR, IPV6_RTHDR),
 				    IPPROTO_IPV6, mp);
 				if (*mp == NULL) {
-#if PULLDOWN_TEST
-					m_freem(ext);
-#endif
 					goto no_mbufs;
 				}
 				break;
@@ -1812,125 +2079,71 @@ ip6_savecontrol(struct inpcb *in6p, struct mbuf *m, struct mbuf **mp)
 				 * the code just in case (nxt overwritten or
 				 * other cases).
 				 */
-#if PULLDOWN_TEST
-				m_freem(ext);
-#endif
 				goto loopend;
-
 			}
 
 			/* proceed with the next header. */
 			off += elen;
 			nxt = ip6e->ip6e_nxt;
 			ip6e = NULL;
-#if PULLDOWN_TEST
-			m_freem(ext);
-			ext = NULL;
-#endif
 		}
 loopend:
 		;
 	}
-	return (0);
+	return 0;
 no_mbufs:
 	ip6stat.ip6s_pktdropcntrl++;
 	/* XXX increment a stat to show the failure */
-	return (ENOBUFS);
+	return ENOBUFS;
 }
 #undef IS2292
 
 void
 ip6_notify_pmtu(struct inpcb *in6p, struct sockaddr_in6 *dst, u_int32_t *mtu)
 {
-	struct socket *so;
-	struct mbuf *m_mtu;
+	struct socket *__single so;
+	mbuf_ref_t m_mtu;
 	struct ip6_mtuinfo mtuctl;
 
 	so =  in6p->inp_socket;
 
-	if (mtu == NULL)
+	if ((in6p->inp_flags & IN6P_MTU) == 0) {
 		return;
-
-#ifdef DIAGNOSTIC
-	if (so == NULL) {		/* I believe this is impossible */
-		panic("ip6_notify_pmtu: socket is NULL");
-		/* NOTREACHED */
 	}
-#endif
 
-	bzero(&mtuctl, sizeof (mtuctl));	/* zero-clear for safety */
+	if (mtu == NULL) {
+		return;
+	}
+
+	if (IN6_IS_ADDR_UNSPECIFIED(&in6p->in6p_faddr) && SOCK_CHECK_PROTO(so, IPPROTO_TCP)) {
+		return;
+	}
+
+	if (!IN6_IS_ADDR_UNSPECIFIED(&in6p->in6p_faddr) &&
+	    !in6_are_addr_equal_scoped(&in6p->in6p_faddr, &dst->sin6_addr, in6p->inp_fifscope, dst->sin6_scope_id)) {
+		return;
+	}
+
+	bzero(&mtuctl, sizeof(mtuctl));         /* zero-clear for safety */
 	mtuctl.ip6m_mtu = *mtu;
 	mtuctl.ip6m_addr = *dst;
-	if (sa6_recoverscope(&mtuctl.ip6m_addr, TRUE))
+	if (!in6_embedded_scope) {
+		mtuctl.ip6m_addr.sin6_scope_id = dst->sin6_scope_id;
+	}
+	if (sa6_recoverscope(&mtuctl.ip6m_addr, TRUE)) {
 		return;
+	}
 
-	if ((m_mtu = sbcreatecontrol((caddr_t)&mtuctl, sizeof (mtuctl),
-	    IPV6_PATHMTU, IPPROTO_IPV6)) == NULL)
+	if ((m_mtu = sbcreatecontrol((caddr_t)&mtuctl, sizeof(mtuctl),
+	    IPV6_PATHMTU, IPPROTO_IPV6)) == NULL) {
 		return;
+	}
 
 	if (sbappendaddr(&so->so_rcv, SA(dst), NULL, m_mtu, NULL) == 0) {
-		m_freem(m_mtu);
-		/* XXX: should count statistics */
-	} else {
-		sorwakeup(so);
+		return;
 	}
+	sorwakeup(so);
 }
-
-#if PULLDOWN_TEST
-/*
- * pull single extension header from mbuf chain.  returns single mbuf that
- * contains the result, or NULL on error.
- */
-static struct mbuf *
-ip6_pullexthdr(m, off, nxt)
-	struct mbuf *m;
-	size_t off;
-	int nxt;
-{
-	struct ip6_ext ip6e;
-	size_t elen;
-	struct mbuf *n;
-
-#if DIAGNOSTIC
-	switch (nxt) {
-	case IPPROTO_DSTOPTS:
-	case IPPROTO_ROUTING:
-	case IPPROTO_HOPOPTS:
-	case IPPROTO_AH: /* is it possible? */
-		break;
-	default:
-		printf("ip6_pullexthdr: invalid nxt=%d\n", nxt);
-	}
-#endif
-
-	m_copydata(m, off, sizeof (ip6e), (caddr_t)&ip6e);
-	if (nxt == IPPROTO_AH)
-		elen = (ip6e.ip6e_len + 2) << 2;
-	else
-		elen = (ip6e.ip6e_len + 1) << 3;
-
-	MGET(n, M_DONTWAIT, MT_DATA);
-	if (n && elen >= MLEN) {
-		MCLGET(n, M_DONTWAIT);
-		if ((n->m_flags & M_EXT) == 0) {
-			m_free(n);
-			n = NULL;
-		}
-	}
-	if (!n)
-		return (NULL);
-
-	n->m_len = 0;
-	if (elen >= M_TRAILINGSPACE(n)) {
-		m_free(n);
-		return (NULL);
-	}
-
-	m_copydata(m, off, elen, mtod(n, caddr_t));
-	n->m_len = elen;
-	return (n);
-}
-#endif
 
 /*
  * Get pointer to the previous header followed by the header
@@ -1945,26 +2158,24 @@ ip6_pullexthdr(m, off, nxt)
  * we develop `neater' mechanism to process extension headers.
  */
 char *
-ip6_get_prevhdr(m, off)
-	struct mbuf *m;
-	int off;
+ip6_get_prevhdr(struct mbuf *m, int off)
 {
 	struct ip6_hdr *ip6 = mtod(m, struct ip6_hdr *);
 
-	if (off == sizeof (struct ip6_hdr)) {
-		return ((char *)&ip6->ip6_nxt);
+	if (off == sizeof(struct ip6_hdr)) {
+		return (char *)&ip6->ip6_nxt;
 	} else {
 		int len, nxt;
 		struct ip6_ext *ip6e = NULL;
 
 		nxt = ip6->ip6_nxt;
-		len = sizeof (struct ip6_hdr);
+		len = sizeof(struct ip6_hdr);
 		while (len < off) {
 			ip6e = (struct ip6_ext *)(mtod(m, caddr_t) + len);
 
 			switch (nxt) {
 			case IPPROTO_FRAGMENT:
-				len += sizeof (struct ip6_frag);
+				len += sizeof(struct ip6_frag);
 				break;
 			case IPPROTO_AH:
 				len += (ip6e->ip6e_len + 2) << 2;
@@ -1975,10 +2186,11 @@ ip6_get_prevhdr(m, off)
 			}
 			nxt = ip6e->ip6e_nxt;
 		}
-		if (ip6e)
-			return ((char *)&ip6e->ip6e_nxt);
-		else
-			return (NULL);
+		if (ip6e) {
+			return (char *)&ip6e->ip6e_nxt;
+		} else {
+			return NULL;
+		}
 	}
 }
 
@@ -1994,66 +2206,74 @@ ip6_nexthdr(struct mbuf *m, int off, int proto, int *nxtp)
 
 	/* just in case */
 	VERIFY(m != NULL);
-	if ((m->m_flags & M_PKTHDR) == 0 || m->m_pkthdr.len < off)
-		return (-1);
+	if ((m->m_flags & M_PKTHDR) == 0 || m->m_pkthdr.len < off) {
+		return -1;
+	}
 
 	switch (proto) {
 	case IPPROTO_IPV6:
-		if (m->m_pkthdr.len < off + sizeof (ip6))
-			return (-1);
-		m_copydata(m, off, sizeof (ip6), (caddr_t)&ip6);
-		if (nxtp)
+		if (m->m_pkthdr.len < off + sizeof(ip6)) {
+			return -1;
+		}
+		m_copydata(m, off, sizeof(ip6), (caddr_t)&ip6);
+		if (nxtp) {
 			*nxtp = ip6.ip6_nxt;
-		off += sizeof (ip6);
-		return (off);
+		}
+		off += sizeof(ip6);
+		return off;
 
 	case IPPROTO_FRAGMENT:
 		/*
 		 * terminate parsing if it is not the first fragment,
 		 * it does not make sense to parse through it.
 		 */
-		if (m->m_pkthdr.len < off + sizeof (fh))
-			return (-1);
-		m_copydata(m, off, sizeof (fh), (caddr_t)&fh);
+		if (m->m_pkthdr.len < off + sizeof(fh)) {
+			return -1;
+		}
+		m_copydata(m, off, sizeof(fh), (caddr_t)&fh);
 		/* IP6F_OFF_MASK = 0xfff8(BigEndian), 0xf8ff(LittleEndian) */
-		if (fh.ip6f_offlg & IP6F_OFF_MASK)
-			return (-1);
-		if (nxtp)
+		if (fh.ip6f_offlg & IP6F_OFF_MASK) {
+			return -1;
+		}
+		if (nxtp) {
 			*nxtp = fh.ip6f_nxt;
-		off += sizeof (struct ip6_frag);
-		return (off);
+		}
+		off += sizeof(struct ip6_frag);
+		return off;
 
 	case IPPROTO_AH:
-		if (m->m_pkthdr.len < off + sizeof (ip6e))
-			return (-1);
-		m_copydata(m, off, sizeof (ip6e), (caddr_t)&ip6e);
-		if (nxtp)
+		if (m->m_pkthdr.len < off + sizeof(ip6e)) {
+			return -1;
+		}
+		m_copydata(m, off, sizeof(ip6e), (caddr_t)&ip6e);
+		if (nxtp) {
 			*nxtp = ip6e.ip6e_nxt;
+		}
 		off += (ip6e.ip6e_len + 2) << 2;
-		return (off);
+		return off;
 
 	case IPPROTO_HOPOPTS:
 	case IPPROTO_ROUTING:
 	case IPPROTO_DSTOPTS:
-		if (m->m_pkthdr.len < off + sizeof (ip6e))
-			return (-1);
-		m_copydata(m, off, sizeof (ip6e), (caddr_t)&ip6e);
-		if (nxtp)
+		if (m->m_pkthdr.len < off + sizeof(ip6e)) {
+			return -1;
+		}
+		m_copydata(m, off, sizeof(ip6e), (caddr_t)&ip6e);
+		if (nxtp) {
 			*nxtp = ip6e.ip6e_nxt;
+		}
 		off += (ip6e.ip6e_len + 1) << 3;
-		return (off);
+		return off;
 
 	case IPPROTO_NONE:
 	case IPPROTO_ESP:
 	case IPPROTO_IPCOMP:
 		/* give up */
-		return (-1);
+		return -1;
 
 	default:
-		return (-1);
+		return -1;
 	}
-
-	return (-1);
 }
 
 /*
@@ -2071,30 +2291,69 @@ ip6_lasthdr(struct mbuf *m, int off, int proto, int *nxtp)
 	}
 	while (1) {
 		newoff = ip6_nexthdr(m, off, proto, nxtp);
-		if (newoff < 0)
-			return (off);
-		else if (newoff < off)
-			return (-1);	/* invalid */
-		else if (newoff == off)
-			return (newoff);
+		if (newoff < 0) {
+			return off;
+		} else if (newoff < off) {
+			return -1;    /* invalid */
+		} else if (newoff == off) {
+			return newoff;
+		}
 
 		off = newoff;
 		proto = *nxtp;
 	}
 }
 
+boolean_t
+ip6_pkt_has_ulp(struct mbuf *m)
+{
+	int off = 0, nxt = IPPROTO_NONE;
+
+	off = ip6_lasthdr(m, 0, IPPROTO_IPV6, &nxt);
+	if (off < 0 || m->m_pkthdr.len < off) {
+		return FALSE;
+	}
+
+	switch (nxt) {
+	case IPPROTO_TCP:
+		if (off + sizeof(struct tcphdr) > m->m_pkthdr.len) {
+			return FALSE;
+		}
+		break;
+	case IPPROTO_UDP:
+		if (off + sizeof(struct udphdr) > m->m_pkthdr.len) {
+			return FALSE;
+		}
+		break;
+	case IPPROTO_ICMPV6:
+		if (off + sizeof(uint32_t) > m->m_pkthdr.len) {
+			return FALSE;
+		}
+		break;
+	case IPPROTO_NONE:
+		return TRUE;
+	case IPPROTO_ESP:
+		return TRUE;
+	case IPPROTO_IPCOMP:
+		return TRUE;
+	default:
+		return FALSE;
+	}
+	return TRUE;
+}
+
 struct ip6aux *
 ip6_addaux(struct mbuf *m)
 {
-	struct m_tag		*tag;
+	struct m_tag *__single tag;
 
 	/* Check if one is already allocated */
 	tag = m_tag_locate(m, KERNEL_MODULE_TAG_ID,
-	    KERNEL_TAG_TYPE_INET6, NULL);
+	    KERNEL_TAG_TYPE_INET6);
 	if (tag == NULL) {
 		/* Allocate a tag */
 		tag = m_tag_create(KERNEL_MODULE_TAG_ID, KERNEL_TAG_TYPE_INET6,
-		    sizeof (struct ip6aux), M_DONTWAIT, m);
+		    sizeof(struct ip6aux), M_DONTWAIT, m);
 
 		/* Attach it to the mbuf */
 		if (tag) {
@@ -2102,30 +2361,82 @@ ip6_addaux(struct mbuf *m)
 		}
 	}
 
-	return (tag ? (struct ip6aux *)(tag + 1) : NULL);
+	return tag ? (struct ip6aux *)(tag->m_tag_data) : NULL;
 }
 
 struct ip6aux *
 ip6_findaux(struct mbuf *m)
 {
-	struct m_tag	*tag;
+	struct m_tag *__single tag;
 
 	tag = m_tag_locate(m, KERNEL_MODULE_TAG_ID,
-	    KERNEL_TAG_TYPE_INET6, NULL);
+	    KERNEL_TAG_TYPE_INET6);
 
-	return (tag ? (struct ip6aux *)(tag + 1) : NULL);
+	return tag != NULL ? (struct ip6aux *)(tag->m_tag_data) : NULL;
 }
 
 void
 ip6_delaux(struct mbuf *m)
 {
-	struct m_tag	*tag;
+	struct m_tag *__single tag;
 
 	tag = m_tag_locate(m, KERNEL_MODULE_TAG_ID,
-	    KERNEL_TAG_TYPE_INET6, NULL);
-	if (tag) {
+	    KERNEL_TAG_TYPE_INET6);
+	if (tag != NULL) {
 		m_tag_delete(m, tag);
 	}
+}
+
+struct inet6_tag_container {
+	struct m_tag    inet6_m_tag;
+	struct ip6aux   inet6_ip6a;
+};
+
+struct m_tag *
+m_tag_kalloc_inet6(u_int32_t id, u_int16_t type, uint16_t len, int wait)
+{
+	struct inet6_tag_container *tag_container;
+	struct m_tag *tag = NULL;
+
+	assert3u(id, ==, KERNEL_MODULE_TAG_ID);
+	assert3u(type, ==, KERNEL_TAG_TYPE_INET6);
+	assert3u(len, ==, sizeof(struct ip6aux));
+
+	if (len != sizeof(struct ip6aux)) {
+		return NULL;
+	}
+
+	tag_container = kalloc_type(struct inet6_tag_container, wait | M_ZERO);
+	if (tag_container != NULL) {
+		tag =  &tag_container->inet6_m_tag;
+
+		assert3p(tag, ==, tag_container);
+
+		M_TAG_INIT(tag, id, type, len, &tag_container->inet6_ip6a, NULL);
+	}
+
+	return tag;
+}
+
+void
+m_tag_kfree_inet6(struct m_tag *tag)
+{
+	struct inet6_tag_container *__single tag_container = (struct inet6_tag_container *)tag;
+
+	assert3u(tag->m_tag_len, ==, sizeof(struct ip6aux));
+
+	kfree_type(struct inet6_tag_container, tag_container);
+}
+
+void
+ip6_register_m_tag(void)
+{
+	int error;
+
+	error = m_register_internal_tag_type(KERNEL_TAG_TYPE_INET6, sizeof(struct ip6aux),
+	    m_tag_kalloc_inet6, m_tag_kfree_inet6);
+
+	assert3u(error, ==, 0);
 }
 
 /*
@@ -2134,20 +2445,153 @@ ip6_delaux(struct mbuf *m)
 void
 ip6_drain(void)
 {
-	frag6_drain();		/* fragments */
-	in6_rtqdrain();		/* protocol cloned routes */
-	nd6_drain(NULL);	/* cloned routes: ND6 */
+	frag6_drain();          /* fragments */
+	in6_rtqdrain();         /* protocol cloned routes */
+	nd6_drain(NULL);        /* cloned routes: ND6 */
 }
 
 /*
  * System control for IP6
  */
 
-u_char	inet6ctlerrmap[PRC_NCMDS] = {
-	0,		0,		0,		0,
-	0,		EMSGSIZE,	EHOSTDOWN,	EHOSTUNREACH,
-	EHOSTUNREACH,	EHOSTUNREACH,	ECONNREFUSED,	ECONNREFUSED,
-	EMSGSIZE,	EHOSTUNREACH,	0,		0,
-	0,		0,		0,		0,
-	ENOPROTOOPT
+u_char  inet6ctlerrmap[PRC_NCMDS] = {
+	0, 0, 0, 0,
+	0, EMSGSIZE, EHOSTDOWN, EHOSTUNREACH,
+	EHOSTUNREACH, EHOSTUNREACH, ECONNREFUSED, ECONNREFUSED,
+	EMSGSIZE, EHOSTUNREACH, 0, 0,
+	0, 0, 0, 0,
+	ENOPROTOOPT, ECONNREFUSED
 };
+
+static int
+sysctl_reset_ip6_input_stats SYSCTL_HANDLER_ARGS
+{
+#pragma unused(arg1, arg2)
+	int error, i;
+
+	i = ip6_input_measure;
+	error = sysctl_handle_int(oidp, &i, 0, req);
+	if (error || req->newptr == USER_ADDR_NULL) {
+		goto done;
+	}
+	/* impose bounds */
+	if (i < 0 || i > 1) {
+		error = EINVAL;
+		goto done;
+	}
+	if (ip6_input_measure != i && i == 1) {
+		net_perf_initialize(&net_perf, ip6_input_measure_bins);
+	}
+	ip6_input_measure = i;
+done:
+	return error;
+}
+
+static int
+sysctl_ip6_input_measure_bins SYSCTL_HANDLER_ARGS
+{
+#pragma unused(arg1, arg2)
+	int error;
+	uint64_t i;
+
+	i = ip6_input_measure_bins;
+	error = sysctl_handle_quad(oidp, &i, 0, req);
+	if (error || req->newptr == USER_ADDR_NULL) {
+		goto done;
+	}
+	/* validate data */
+	if (!net_perf_validate_bins(i)) {
+		error = EINVAL;
+		goto done;
+	}
+	ip6_input_measure_bins = i;
+done:
+	return error;
+}
+
+static int
+sysctl_ip6_input_getperf SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	if (req->oldptr == USER_ADDR_NULL) {
+		req->oldlen = (size_t)sizeof(struct net_perf);
+	}
+
+	return SYSCTL_OUT(req, &net_perf, MIN(sizeof(net_perf), req->oldlen));
+}
+
+
+/*
+ * Initialize IPv6 source address hash table.
+ */
+static void
+in6_ifaddrhashtbl_init(void)
+{
+	int i, k, p;
+	uint32_t nhash = 0;
+	uint32_t hash_size;
+
+	if (in6_ifaddrhashtbl != NULL) {
+		return;
+	}
+
+	PE_parse_boot_argn("ina6ddr_nhash", &nhash,
+	    sizeof(in6addr_nhash));
+	if (nhash == 0) {
+		nhash = IN6ADDR_NHASH;
+	}
+
+	hash_size = nhash * sizeof(*in6_ifaddrhashtbl);
+
+	in6_ifaddrhashtbl = zalloc_permanent(
+		hash_size,
+		ZALIGN_PTR);
+	in6addr_nhash = nhash;
+
+	/*
+	 * Generate the next largest prime greater than in6addr_nhash.
+	 */
+	k = (in6addr_nhash % 2 == 0) ? in6addr_nhash + 1 : in6addr_nhash + 2;
+	for (;;) {
+		p = 1;
+		for (i = 3; i * i <= k; i += 2) {
+			if (k % i == 0) {
+				p = 0;
+			}
+		}
+		if (p == 1) {
+			break;
+		}
+		k += 2;
+	}
+	in6addr_hashp = k;
+}
+
+static int
+sysctl_ip6_checkinterface SYSCTL_HANDLER_ARGS
+{
+#pragma unused(arg1, arg2)
+	int error, i;
+
+	i = ip6_checkinterface;
+	error = sysctl_handle_int(oidp, &i, 0, req);
+	if (error || req->newptr == USER_ADDR_NULL) {
+		return error;
+	}
+
+	switch (i) {
+	case IP6_CHECKINTERFACE_WEAK_ES:
+	case IP6_CHECKINTERFACE_HYBRID_ES:
+	case IP6_CHECKINTERFACE_STRONG_ES:
+		if (ip6_checkinterface != i) {
+			ip6_checkinterface = i;
+			os_log(OS_LOG_DEFAULT, "%s: ip6_checkinterface is now %d\n",
+			    __func__, ip6_checkinterface);
+		}
+		break;
+	default:
+		error = EINVAL;
+		break;
+	}
+	return error;
+}

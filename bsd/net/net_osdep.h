@@ -2,7 +2,7 @@
  * Copyright (c) 2000-2010 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
- * 
+ *
  * This file contains Original Code and/or Modifications of Original Code
  * as defined in and that are subject to the Apple Public Source License
  * Version 2.0 (the 'License'). You may not use this file except in
@@ -11,10 +11,10 @@
  * unlawful or unlicensed copies of an Apple operating system, or to
  * circumvent, violate, or enable the circumvention or violation of, any
  * terms of an Apple operating system software license agreement.
- * 
+ *
  * Please obtain a copy of the License at
  * http://www.opensource.apple.com/apsl/ and read it before using this file.
- * 
+ *
  * The Original Code and all software distributed under the License are
  * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
@@ -22,7 +22,7 @@
  * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
  * Please see the License for the specific language governing rights and
  * limitations under the License.
- * 
+ *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
 /*
@@ -73,7 +73,7 @@
  * - ifa_ifwithaf()
  *   bsdi[34], netbsd, and openbsd define it in sys/net/if.c
  *   freebsd (all versions) does not have it.
- *  
+ *
  * - struct rt_addrinfo
  *   bsdi4, netbsd 1.5R and beyond: rti_addrs, rti_info[], rti_flags, rti_ifa,
  *	rti_ifp, and rti_rtm.
@@ -193,9 +193,6 @@
  *	NetBSD 1.4 or later requires splsoftnet().
  *	other operating systems use splnet().
  *
- * - dtom()
- *	NEVER USE IT!
- *
  * - struct ifnet for loopback interface
  *	BSDI3: struct ifnet loif;
  *	BSDI4: struct ifnet *loifp;
@@ -244,9 +241,9 @@
  *	NetBSD 1.5: always use IFAREF whenever reference gets added.
  *		always use IFAFREE whenever reference gets freed.
  *		IFAFREE frees ifaddr when ifa_refcnt reaches 0.
- *	Darwin: always use IFA_ADDREF whenever reference gets added.
- *		always use IFA_REMREF whenever reference gets freed.
- *		IFA_ADDREF and IFA_REMREF are responsible for determining
+ *	Darwin: always use ifa_addref whenever reference gets added.
+ *		always use ifa_remref whenever reference gets freed.
+ *		ifa_addref and ifa_remref are responsible for determining
  *		when to free.
  *	others: do not increase refcnt for ifp->if_addrlist and in_ifaddr.
  *		use IFAFREE once when ifaddr is disconnected from
@@ -263,13 +260,13 @@ struct ifnet;
 
 #define HAVE_OLD_BPF
 
-#define ifa_list	ifa_link
-#define if_addrlist	if_addrhead
-#define if_list		if_link
+#define ifa_list        ifa_link
+#define if_addrlist     if_addrhead
+#define if_list         if_link
 
 #define WITH_CONVERT_AND_STRIP_IP_LEN
 
-#if 1				/* at this moment, all OSes do this */
+#if 1                           /* at this moment, all OSes do this */
 #define WITH_CONVERT_IP_OFF
 #endif
 

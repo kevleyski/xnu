@@ -2,7 +2,7 @@
  * Copyright (c) 2000-2012 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
- * 
+ *
  * This file contains Original Code and/or Modifications of Original Code
  * as defined in and that are subject to the Apple Public Source License
  * Version 2.0 (the 'License'). You may not use this file except in
@@ -11,10 +11,10 @@
  * unlawful or unlicensed copies of an Apple operating system, or to
  * circumvent, violate, or enable the circumvention or violation of, any
  * terms of an Apple operating system software license agreement.
- * 
+ *
  * Please obtain a copy of the License at
  * http://www.opensource.apple.com/apsl/ and read it before using this file.
- * 
+ *
  * The Original Code and all software distributed under the License are
  * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
@@ -22,7 +22,7 @@
  * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
  * Please see the License for the specific language governing rights and
  * limitations under the License.
- * 
+ *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
 /*
@@ -79,11 +79,11 @@
  *	redo address binding to allow wildcards
  */
 
-struct rawcb_list_head rawcb_list;
+struct rawcb_list_head rawcb_list = LIST_HEAD_INITIALIZER(rawcb_list);
 
-static uint32_t	raw_sendspace = RAWSNDQ;
-static uint32_t	raw_recvspace = RAWRCVQ;
-extern lck_mtx_t 	*raw_mtx;	/*### global raw cb mutex for now */
+static uint32_t raw_sendspace = RAWSNDQ;
+static uint32_t raw_recvspace = RAWRCVQ;
+extern lck_mtx_t        raw_mtx;       /*### global raw cb mutex for now */
 
 /*
  * Allocate a control block and a nominal amount
@@ -100,18 +100,20 @@ raw_attach(struct socket *so, int proto)
 	 * after space has been allocated for the
 	 * rawcb.
 	 */
-	if (rp == 0)
-		return (ENOBUFS);
+	if (rp == 0) {
+		return ENOBUFS;
+	}
 	error = soreserve(so, raw_sendspace, raw_recvspace);
-	if (error)
-		return (error);
+	if (error) {
+		return error;
+	}
 	rp->rcb_socket = so;
-	rp->rcb_proto.sp_family = SOCK_DOM(so);
-	rp->rcb_proto.sp_protocol = proto;
-	lck_mtx_lock(raw_mtx);
+	rp->rcb_proto.sp_family = (uint16_t)SOCK_DOM(so);
+	rp->rcb_proto.sp_protocol = (uint16_t)proto;
+	lck_mtx_lock(&raw_mtx);
 	LIST_INSERT_HEAD(&rawcb_list, rp, list);
-	lck_mtx_unlock(raw_mtx);
-	return (0);
+	lck_mtx_unlock(&raw_mtx);
+	return 0;
 }
 
 /*
@@ -119,27 +121,21 @@ raw_attach(struct socket *so, int proto)
  * socket resources.
  */
 void
-raw_detach(struct rawcb *rp)
+raw_detach_nofree(struct rawcb *rp)
 {
 	struct socket *so = rp->rcb_socket;
 
 	so->so_pcb = 0;
 	so->so_flags |= SOF_PCBCLEARING;
 	sofree(so);
-	if (!lck_mtx_try_lock(raw_mtx)) {
+	if (!lck_mtx_try_lock(&raw_mtx)) {
 		socket_unlock(so, 0);
-		lck_mtx_lock(raw_mtx);
+		lck_mtx_lock(&raw_mtx);
 		socket_lock(so, 0);
 	}
 	LIST_REMOVE(rp, list);
-	lck_mtx_unlock(raw_mtx);
-#ifdef notdef
-	if (rp->rcb_laddr)
-		m_freem(dtom(rp->rcb_laddr));
-	rp->rcb_laddr = 0;
-#endif
+	lck_mtx_unlock(&raw_mtx);
 	rp->rcb_socket = NULL;
-	FREE((caddr_t)(rp), M_PCB);
 }
 
 /*
@@ -150,36 +146,13 @@ raw_disconnect(struct rawcb *rp)
 {
 	struct socket *so = rp->rcb_socket;
 
-#ifdef notdef
-	if (rp->rcb_faddr)
-		m_freem(dtom(rp->rcb_faddr));
-	rp->rcb_faddr = 0;
-#endif
 	/*
 	 * A multipath subflow socket would have its SS_NOFDREF set by default,
 	 * so check for SOF_MP_SUBFLOW socket flag before detaching the PCB;
 	 * when the socket is closed for real, SOF_MP_SUBFLOW would be cleared.
 	 */
-	if (!(so->so_flags & SOF_MP_SUBFLOW) && (so->so_state & SS_NOFDREF))
-		raw_detach(rp);
+	if (!(so->so_flags & SOF_MP_SUBFLOW) && (so->so_state & SS_NOFDREF)) {
+		raw_detach_nofree(rp);
+		kfree_type(struct rawcb, rp);
+	}
 }
-
-#ifdef notdef
-#include <sys/mbuf.h>
-
-int
-raw_bind(struct socket *so, struct mbuf *nam)
-{
-	struct sockaddr *addr = mtod(nam, struct sockaddr *);
-	struct rawcb *rp;
-
-	if (ifnet == 0)
-		return (EADDRNOTAVAIL);
-	rp = sotorawcb(so);
-	nam = m_copym(nam, 0, M_COPYALL, M_WAITOK);
-	if (nam == NULL)
-		return ENOBUFS;
-	rp->rcb_laddr = mtod(nam, struct sockaddr *);
-	return (0);
-}
-#endif

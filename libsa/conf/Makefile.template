@@ -17,11 +17,12 @@ include $(MakeInc_def)
 # CFLAGS
 #
 CFLAGS+= -include meta_features.h -DLIBSA_KERNEL_PRIVATE
+SFLAGS+= -include meta_features.h
 
 #
 # Directories for mig generated files
 #
-COMP_SUBDIRS = 
+COMP_SUBDIRS =
 
 #
 #  Make sure we don't remove this by accident if interrupted at the wrong
@@ -39,33 +40,56 @@ COMP_SUBDIRS =
 
 %OBJS
 
+%LIBOBJS
+
 %CFILES
+
+%CXXFILES
 
 %SFILES
 
 %MACHDEP
 
-#
-#  OBJSDEPS is the set of files (defined in the machine dependent
-#  template if necessary) which all objects depend on (such as an
-#  in-line assembler expansion filter)
-#
-${OBJS}: ${OBJSDEPS}
+# Rebuild if per-file overrides change
+${OBJS}: $(firstword $(MAKEFILE_LIST))
 
-LDOBJS = $(OBJS)
+# Rebuild if global compile flags change
+$(COBJS): .CFLAGS
+.CFLAGS: ALWAYS
+	$(_v)$(REPLACECONTENTS) $@ $(KCC) $(CFLAGS) $(INCFLAGS)
+$(CXXOBJS): .CXXFLAGS
+.CXXFLAGS: ALWAYS
+	$(_v)$(REPLACECONTENTS) $@ $(KC++) $(CXXFLAGS) $(INCFLAGS)
+$(SOBJS): .SFLAGS
+.SFLAGS: ALWAYS
+	$(_v)$(REPLACECONTENTS) $@ $(S_KCC) $(SFLAGS) $(INCFLAGS)
 
-$(COMPONENT).filelist: $(LDOBJS)
-	$(_v)for kld_file in ${LDOBJS}; do      \
-		$(SEG_HACK) -n __KLD -o $${kld_file}__ $${kld_file} ; \
-		mv $${kld_file}__ $${kld_file} ; \
+KLD_FILES = $(OBJS)
+
+$(COMPONENT).filelist: $(OBJS)
+	$(_v)for kld_file in ${KLD_FILES}; do      \
+		$(SEG_HACK) -s __TEXT -n __KLD -o $${kld_file}__ $${kld_file} || exit 1; \
+		mv $${kld_file}__ $${kld_file} || exit 1; \
+		$(SEG_HACK) -i __KLD -n __KLDDATA -o $${kld_file}__ $${kld_file} || exit 1; \
+		mv $${kld_file}__ $${kld_file} || exit 1; \
 	done
-	@echo LDFILELIST $(COMPONENT)
-	$(_v)( for obj in ${LDOBJS}; do	\
-		 echo $(TARGET)/$(CURRENT_KERNEL_CONFIG)/$${obj}; \
-	done; ) > $(COMPONENT).filelist
+	@$(LOG_LDFILELIST) "$(COMPONENT)"
+	$(_v)for obj in ${OBJS}; do	\
+		 $(ECHO) $(TARGET)/$(CURRENT_KERNEL_CONFIG)/$${obj}; \
+	done > $(COMPONENT).filelist
+
+$(COMPONENT).libfilelist: $(LIBOBJS)
+	@$(LOG_LDFILELIST) "lib$(COMPONENT)"
+	$(_v)for obj in ${LIBOBJS}; do	\
+		 $(ECHO) $(TARGET)/$(CURRENT_KERNEL_CONFIG)/$${obj}; \
+	done > $(COMPONENT).libfilelist
 
 
+ifeq ($(RC_ProjectName),xnu_libraries)
+do_all: $(COMPONENT).libfilelist
+else
 do_all: $(COMPONENT).filelist
+endif
 
 do_build_all:: do_all
 
@@ -73,3 +97,12 @@ do_build_all:: do_all
 
 include $(MakeInc_rule)
 include $(MakeInc_dir)
+
+# the KLD segment is mapped read-only on arm, so if we include llvm profiling
+# here it will segfault the kernel.  (see arm_vm_init.c) We don't currently have
+# a way of retrieving these counters from KLD anyway, so there's no harm in just
+# disabling them.
+CXXFLAGS_GEN:=$(filter-out -fprofile-instr-generate,$(CXXFLAGS_GEN))
+CXXFLAGS_GEN:=$(filter-out -fcoverage-mapping,$(CXXFLAGS_GEN))
+CFLAGS_GEN:=$(filter-out -fprofile-instr-generate,$(CFLAGS_GEN))
+CFLAGS_GEN:=$(filter-out -fcoverage-mapping,$(CFLAGS_GEN))

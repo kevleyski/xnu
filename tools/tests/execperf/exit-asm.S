@@ -1,6 +1,7 @@
 .text
-	.globl mystart
-mystart:
+	.align 2
+	.globl _main
+_main:
 #if defined(__x86_64__)
 	pushq $0
 	mov %rsp, %rbp
@@ -36,6 +37,13 @@ _sysenter_trap:
 	pop %edx
 	mov %esp, %ecx
 	sysenter
+	nop
+#elif defined(__arm64__)
+	movz	x0, #42
+	movz	x16, #1
+	svc	#0x80
+	b.cc	1f
+1:	
 	nop
 #else
 #error Unsupported architecture

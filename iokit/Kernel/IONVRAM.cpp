@@ -1,9 +1,9 @@
 /*
  * Copyright (c) 1998-2006 Apple Computer, Inc. All rights reserved.
- * Copyright (c) 2007-2012 Apple Inc. All rights reserved.
+ * Copyright (c) 2007-2021 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
- * 
+ *
  * This file contains Original Code and/or Modifications of Original Code
  * as defined in and that are subject to the Apple Public Source License
  * Version 2.0 (the 'License'). You may not use this file except in
@@ -12,10 +12,10 @@
  * unlawful or unlicensed copies of an Apple operating system, or to
  * circumvent, violate, or enable the circumvention or violation of, any
  * terms of an Apple operating system software license agreement.
- * 
+ *
  * Please obtain a copy of the License at
  * http://www.opensource.apple.com/apsl/ and read it before using this file.
- * 
+ *
  * The Original Code and all software distributed under the License are
  * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
@@ -23,1719 +23,2094 @@
  * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
  * Please see the License for the specific language governing rights and
  * limitations under the License.
- * 
+ *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
 
+#define IOKIT_ENABLE_SHARED_PTR
+
+#include <AssertMacros.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IONVRAM.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOUserClient.h>
 #include <IOKit/IOKitKeys.h>
+#include <IOKit/IOKitKeysPrivate.h>
+#include <IOKit/IOBSD.h>
 #include <kern/debug.h>
-#include <pexpert/pexpert.h>
+#include <os/system_event_log.h>
+#include <pexpert/boot.h>
+#include <sys/csr.h>
 
 #define super IOService
 
-#define kIONVRAMPrivilege	kIOClientPrivilegeAdministrator
-//#define kIONVRAMPrivilege	kIOClientPrivilegeLocalUser
-
 OSDefineMetaClassAndStructors(IODTNVRAM, IOService);
 
-bool IODTNVRAM::init(IORegistryEntry *old, const IORegistryPlane *plane)
+class IONVRAMCHRPHandler;
+class IONVRAMV3Handler;
+
+#define ARRAY_SIZE(x) (sizeof(x)/sizeof(x[0]))
+
+#define MAX_VAR_NAME_SIZE     63
+
+#define kNVRAMBankSizeKey    "nvram-bank-size"
+#define kNVRAMBankCountKey   "nvram-bank-count"
+#define kNVRAMCurrentBankKey "nvram-current-bank"
+
+#define kCurrentGenerationCountKey "Generation"
+#define kCurrentNVRAMVersionKey    "Version"
+
+#define kNVRAMCommonUsedKey    "CommonUsed"
+#define kNVRAMSystemUsedKey    "SystemUsed"
+
+#define kIONVRAMPrivilege       kIOClientPrivilegeAdministrator
+
+#define MIN_SYNC_NOW_INTERVAL 15*60 /* Minimum 15 Minutes interval mandated */
+
+#if defined(DEBUG) || defined(DEVELOPMENT)
+#define DEBUG_IFERROR(err, fmt, args...)                                     \
+({                                                                           \
+	if ((err != kIOReturnSuccess) || gNVRAMLogging)                          \
+	IOLog("%s:%s:%u - " fmt, __FILE_NAME__, __FUNCTION__, __LINE__, ##args); \
+})
+
+#define DEBUG_INFO(fmt, args...)                                             \
+({                                                                           \
+	if (gNVRAMLogging)                                                       \
+	IOLog("%s:%s:%u - " fmt, __FILE_NAME__, __FUNCTION__, __LINE__, ##args); \
+})
+
+#define DEBUG_ALWAYS(fmt, args...)                                           \
+({                                                                           \
+	IOLog("%s:%s:%u - " fmt, __FILE_NAME__, __FUNCTION__, __LINE__, ##args); \
+})
+#else
+#define DEBUG_IFERROR(err, fmt, args...) (void)NULL
+#define DEBUG_INFO(fmt, args...) (void)NULL
+#define DEBUG_ALWAYS(fmt, args...) (void)NULL
+#endif
+
+#define DEBUG_ERROR DEBUG_ALWAYS
+
+#define SAFE_TO_LOCK() (preemption_enabled() && !panic_active())
+
+#define NVRAMLOCK(lock)       \
+({                            \
+	if (SAFE_TO_LOCK())       \
+	        IOLockLock(lock); \
+})
+
+#define NVRAMUNLOCK(lock)       \
+({                              \
+	if (SAFE_TO_LOCK())         \
+	        IOLockUnlock(lock); \
+})
+
+#define NVRAMLOCKASSERTHELD(lock)                   \
+({                                                  \
+	if (SAFE_TO_LOCK())                             \
+	        IOLockAssert(lock, kIOLockAssertOwned); \
+})
+
+#define NVRAMREADLOCK(lock)     \
+({                              \
+	if (SAFE_TO_LOCK())         \
+	        IORWLockRead(lock); \
+})
+
+#define NVRAMWRITELOCK(lock)     \
+({                               \
+	if (SAFE_TO_LOCK())          \
+	        IORWLockWrite(lock); \
+})
+
+#define NVRAMRWUNLOCK(lock)       \
+({                                \
+	if (SAFE_TO_LOCK())           \
+	        IORWLockUnlock(lock); \
+})
+
+#define NVRAMRWUNLOCKANDWRITE(lock) \
+({                                  \
+	NVRAMRWUNLOCK(lock);            \
+	NVRAMWRITELOCK(lock);           \
+})
+
+#define NVRAMRWLOCKASSERTHELD(lock)                    \
+({                                                     \
+	if (SAFE_TO_LOCK())                                \
+	        IORWLockAssert(lock, kIORWLockAssertHeld); \
+})
+
+#define NVRAMRWLOCKASSERTEXCLUSIVE(lock)                \
+({                                                      \
+	if (SAFE_TO_LOCK())                                 \
+	        IORWLockAssert(lock, kIORWLockAssertWrite); \
+})
+
+// MOD = Write, Delete
+// RST = Reset, Obliterate
+// RD  = Read
+// DEL = Delete
+#define ENT_MOD_RST     ((1 << kIONVRAMOperationWrite)      | (1 << kIONVRAMOperationDelete)  | (1 << kIONVRAMOperationObliterate) | (1 << kIONVRAMOperationReset))
+#define ENT_MOD_RD      ((1 << kIONVRAMOperationRead)       | (1 << kIONVRAMOperationWrite)   | (1 << kIONVRAMOperationDelete))
+#define ENT_MOD         ((1 << kIONVRAMOperationWrite)      | (1 << kIONVRAMOperationDelete))
+#define ENT_RST         ((1 << kIONVRAMOperationObliterate) | (1 << kIONVRAMOperationReset))
+#define ENT_RD          ((1 << kIONVRAMOperationRead))
+#define ENT_DEL         ((1 << kIONVRAMOperationDelete))
+
+enum NVRAMVersion {
+	kNVRAMVersionUnknown,
+	kNVRAMVersion1,       // Legacy, banks, 0x800 common partition size
+	kNVRAMVersion2,       // V1 but with (0x2000 - sizeof(struct apple_nvram_header) - sizeof(struct chrp_nvram_header)) common region
+	kNVRAMVersion3,       // New EFI based format
+	kNVRAMVersionMax
+};
+
+// Guid for Apple System Boot variables
+// 40A0DDD2-77F8-4392-B4A3-1E7304206516
+UUID_DEFINE(gAppleSystemVariableGuid, 0x40, 0xA0, 0xDD, 0xD2, 0x77, 0xF8, 0x43, 0x92, 0xB4, 0xA3, 0x1E, 0x73, 0x04, 0x20, 0x65, 0x16);
+
+// Apple NVRAM Variable namespace (APPLE_VENDOR_OS_VARIABLE_GUID)
+// 7C436110-AB2A-4BBB-A880-FE41995C9F82
+UUID_DEFINE(gAppleNVRAMGuid, 0x7C, 0x43, 0x61, 0x10, 0xAB, 0x2A, 0x4B, 0xBB, 0xA8, 0x80, 0xFE, 0x41, 0x99, 0x5C, 0x9F, 0x82);
+
+// Wifi NVRAM namespace
+// 36C28AB5-6566-4C50-9EBD-CBB920F83843
+UUID_DEFINE(gAppleWifiGuid, 0x36, 0xC2, 0x8A, 0xB5, 0x65, 0x66, 0x4C, 0x50, 0x9E, 0xBD, 0xCB, 0xB9, 0x20, 0xF8, 0x38, 0x43);
+
+// Prefix for kernel-only variables
+#define KERNEL_ONLY_VAR_NAME_PREFIX "krn."
+
+static TUNABLE(bool, gNVRAMLogging, "nvram-log", false);
+static bool gInternalBuild = false;
+
+// IONVRAMSystemVariableListInternal:
+// Used for internal builds only
+// "force-lock-bits" used by fwam over ssh nvram to device so they are unable to use entitlements
+// "stress-rack" used in SEG stress-rack restore prdocs
+#define IONVRAMSystemVariableListInternal IONVRAMSystemVariableList, \
+	                                      "force-lock-bits", \
+	                                      "stress-rack"
+
+// allowlist variables from macboot that need to be set/get from system region if present
+static const char * const gNVRAMSystemList[] = { IONVRAMSystemVariableList, nullptr };
+static const char * const gNVRAMSystemListInternal[] = { IONVRAMSystemVariableListInternal, nullptr };
+
+typedef struct {
+	const char *name;
+	IONVRAMVariableType type;
+} VariableTypeEntry;
+
+static const
+VariableTypeEntry gVariableTypes[] = {
+	{"auto-boot?", kOFVariableTypeBoolean},
+	{"boot-args", kOFVariableTypeString},
+	{"boot-command", kOFVariableTypeString},
+	{"boot-device", kOFVariableTypeString},
+	{"boot-file", kOFVariableTypeString},
+	{"boot-screen", kOFVariableTypeString},
+	{"boot-script", kOFVariableTypeString},
+	{"console-screen", kOFVariableTypeString},
+	{"default-client-ip", kOFVariableTypeString},
+	{"default-gateway-ip", kOFVariableTypeString},
+	{"default-mac-address?", kOFVariableTypeBoolean},
+	{"default-router-ip", kOFVariableTypeString},
+	{"default-server-ip", kOFVariableTypeString},
+	{"default-subnet-mask", kOFVariableTypeString},
+	{"diag-device", kOFVariableTypeString},
+	{"diag-file", kOFVariableTypeString},
+	{"diag-switch?", kOFVariableTypeBoolean},
+	{"fcode-debug?", kOFVariableTypeBoolean},
+	{"input-device", kOFVariableTypeString},
+	{"input-device-1", kOFVariableTypeString},
+	{"little-endian?", kOFVariableTypeBoolean},
+	{"ldm", kOFVariableTypeBoolean},
+	{"load-base", kOFVariableTypeNumber},
+	{"mouse-device", kOFVariableTypeString},
+	{"nvramrc", kOFVariableTypeString},
+	{"oem-banner", kOFVariableTypeString},
+	{"oem-banner?", kOFVariableTypeBoolean},
+	{"oem-logo", kOFVariableTypeString},
+	{"oem-logo?", kOFVariableTypeBoolean},
+	{"output-device", kOFVariableTypeString},
+	{"output-device-1", kOFVariableTypeString},
+	{"pci-probe-list", kOFVariableTypeNumber},
+	{"pci-probe-mask", kOFVariableTypeNumber},
+	{"real-base", kOFVariableTypeNumber},
+	{"real-mode?", kOFVariableTypeBoolean},
+	{"real-size", kOFVariableTypeNumber},
+	{"screen-#columns", kOFVariableTypeNumber},
+	{"screen-#rows", kOFVariableTypeNumber},
+	{"security-mode", kOFVariableTypeString},
+	{"selftest-#megs", kOFVariableTypeNumber},
+	{"use-generic?", kOFVariableTypeBoolean},
+	{"use-nvramrc?", kOFVariableTypeBoolean},
+	{"virt-base", kOFVariableTypeNumber},
+	{"virt-size", kOFVariableTypeNumber},
+	// Variables used for testing
+	{"test-bool", kOFVariableTypeBoolean},
+	{"test-num", kOFVariableTypeNumber},
+	{"test-str", kOFVariableTypeString},
+	{"test-data", kOFVariableTypeData},
+#if !defined(__x86_64__)
+	{"acc-cm-override-charger-count", kOFVariableTypeNumber},
+	{"acc-cm-override-count", kOFVariableTypeNumber},
+	{"acc-mb-ld-lifetime", kOFVariableTypeNumber},
+	{"com.apple.System.boot-nonce", kOFVariableTypeString},
+	{"darkboot", kOFVariableTypeBoolean},
+	{"enter-tdm-mode", kOFVariableTypeBoolean},
+#endif /* !defined(__x86_64__) */
+	{nullptr, kOFVariableTypeData} // Default type to return
+};
+
+union VariablePermission {
+	struct {
+		uint64_t UserWrite            :1;
+		uint64_t RootRequired         :1;
+		uint64_t KernelOnly           :1;
+		uint64_t ResetNVRAMOnlyDelete :1;
+		uint64_t NeverAllowedToDelete :1;
+		uint64_t SystemReadHidden     :1;
+		uint64_t FullAccess           :1;
+		uint64_t InternalOnly         :1;
+		uint64_t Reserved:57;
+	} Bits;
+	uint64_t Uint64;
+};
+
+typedef struct {
+	const char *name;
+	VariablePermission p;
+} VariablePermissionEntry;
+
+static const
+VariablePermissionEntry gVariablePermissions[] = {
+	{"aapl,pci", .p.Bits.RootRequired = 1},
+	{"battery-health", .p.Bits.RootRequired = 1,
+	 .p.Bits.NeverAllowedToDelete = 1},
+	{"boot-image", .p.Bits.UserWrite = 1},
+	{"com.apple.System.fp-state", .p.Bits.KernelOnly = 1},
+	{"fm-account-masked", .p.Bits.RootRequired = 1,
+	 .p.Bits.NeverAllowedToDelete = 1},
+	{"fm-activation-locked", .p.Bits.RootRequired = 1,
+	 .p.Bits.NeverAllowedToDelete = 1},
+	{"fm-spkeys", .p.Bits.RootRequired = 1,
+	 .p.Bits.NeverAllowedToDelete = 1},
+	{"fm-spstatus", .p.Bits.RootRequired = 1,
+	 .p.Bits.NeverAllowedToDelete = 1},
+	{"policy-nonce-digests", .p.Bits.ResetNVRAMOnlyDelete = 1}, // Deleting this via user triggered obliterate leave J273a unable to boot
+	{"recoveryos-passcode-blob", .p.Bits.SystemReadHidden = 1},
+	{"security-password", .p.Bits.RootRequired = 1},
+	{"system-passcode-lock-blob", .p.Bits.SystemReadHidden = 1},
+
+#if !defined(__x86_64__)
+	{"acc-cm-override-charger-count", .p.Bits.KernelOnly = 1},
+	{"acc-cm-override-count", .p.Bits.KernelOnly = 1},
+	{"acc-mb-ld-lifetime", .p.Bits.KernelOnly = 1},
+	{"backlight-level", .p.Bits.UserWrite = 1},
+	{"backlight-nits", .p.Bits.UserWrite = 1},
+	{"ldm", .p.Bits.KernelOnly = 1},
+	{"com.apple.System.boot-nonce", .p.Bits.KernelOnly = 1},
+	{"com.apple.System.sep.art", .p.Bits.KernelOnly = 1},
+	{"darkboot", .p.Bits.UserWrite = 1},
+	{"nonce-seeds", .p.Bits.KernelOnly = 1},
+#endif /* !defined(__x86_64__) */
+	// Variables used for testing permissions
+	{"testSysReadHidden", .p.Bits.SystemReadHidden = 1},
+	{"testKernelOnly", .p.Bits.KernelOnly = 1},
+	{"testResetOnlyDel", .p.Bits.ResetNVRAMOnlyDelete = 1},
+	{"testNeverDel", .p.Bits.NeverAllowedToDelete = 1},
+	{"testUserWrite", .p.Bits.UserWrite = 1},
+	{"testRootReq", .p.Bits.RootRequired = 1},
+	{"reclaim-int", .p.Bits.InternalOnly = 1},
+	{nullptr, {.Bits.FullAccess = 1}} // Default access
+};
+
+typedef struct {
+	const uint8_t checkOp;
+	const uuid_t  *varGuid;
+	const char    *varName;
+	const char    *varEntitlement;
+} VariableEntitlementEntry;
+
+// variable-guid pair entries that require entitlement check to do specified nvram operations
+static const
+VariableEntitlementEntry gVariableEntitlements[] = {
+	{ENT_MOD_RST, &gAppleNVRAMGuid, "ownership-warning", "com.apple.private.iokit.ddl-write"},
+	{ENT_MOD, &gAppleSystemVariableGuid, "BluetoothInfo", "com.apple.private.iokit.nvram-bluetooth"},
+	{ENT_MOD, &gAppleSystemVariableGuid, "BluetoothUHEDevices", "com.apple.private.iokit.nvram-bluetooth"},
+	{ENT_MOD, &gAppleNVRAMGuid, "bluetoothExternalDongleFailed", "com.apple.private.iokit.nvram-bluetooth"},
+	{ENT_MOD, &gAppleNVRAMGuid, "bluetoothInternalControllerInfo", "com.apple.private.iokit.nvram-bluetooth"},
+	{ENT_RD, &gAppleSystemVariableGuid, "current-network", "com.apple.private.security.nvram.wifi-psks"},
+	{ENT_RD, &gAppleWifiGuid, "current-network", "com.apple.private.security.nvram.wifi-psks"},
+	{ENT_RD, &gAppleSystemVariableGuid, "preferred-networks", "com.apple.private.security.nvram.wifi-psks"},
+	{ENT_RD, &gAppleWifiGuid, "preferred-networks", "com.apple.private.security.nvram.wifi-psks"},
+	{ENT_RD, &gAppleSystemVariableGuid, "preferred-count", "com.apple.private.security.nvram.wifi-psks"},
+	{ENT_RD, &gAppleWifiGuid, "preferred-count", "com.apple.private.security.nvram.wifi-psks"},
+	// Variables used for testing entitlement
+	{ENT_MOD_RST, &gAppleNVRAMGuid, "testEntModRst", "com.apple.private.iokit.testEntModRst"},
+	{ENT_MOD_RST, &gAppleSystemVariableGuid, "testEntModRstSys", "com.apple.private.iokit.testEntModRst"},
+	{ENT_RST, &gAppleNVRAMGuid, "testEntRst", "com.apple.private.iokit.testEntRst"},
+	{ENT_RST, &gAppleSystemVariableGuid, "testEntRstSys", "com.apple.private.iokit.testEntRst"},
+	{ENT_RD, &gAppleNVRAMGuid, "testEntRd", "com.apple.private.iokit.testEntRd"},
+	{ENT_RD, &gAppleSystemVariableGuid, "testEntRdSys", "com.apple.private.iokit.testEntRd"},
+	{ENT_DEL, &gAppleNVRAMGuid, "testEntDel", "com.apple.private.iokit.testEntDel"},
+	{ENT_DEL, &gAppleSystemVariableGuid, "testEntDelSys", "com.apple.private.iokit.testEntDel"},
+	{0, &UUID_NULL, nullptr, nullptr}
+};
+
+static NVRAMPartitionType
+getPartitionTypeForGUID(const uuid_t guid)
 {
-  OSDictionary *dict;
-  
-  if (!super::init(old, plane)) return false;
-  
-  dict =  OSDictionary::withCapacity(1);
-  if (dict == 0) return false;
-  setPropertyTable(dict);
-  
-  _nvramImage = IONew(UInt8, kIODTNVRAMImageSize);
-  if (_nvramImage == 0) return false;
-  
-  _nvramPartitionOffsets = OSDictionary::withCapacity(1);
-  if (_nvramPartitionOffsets == 0) return false;
-  
-  _nvramPartitionLengths = OSDictionary::withCapacity(1);
-  if (_nvramPartitionLengths == 0) return false;
-  
-  _registryPropertiesKey = OSSymbol::withCStringNoCopy("aapl,pci");
-  if (_registryPropertiesKey == 0) return false;
-  
-  // <rdar://problem/9529235> race condition possible between
-  // IODTNVRAM and IONVRAMController (restore loses boot-args)
-  initProxyData();
-  
-  return true;
+	if (uuid_compare(guid, gAppleSystemVariableGuid) == 0) {
+		return kIONVRAMPartitionSystem;
+	} else {
+		return kIONVRAMPartitionCommon;
+	}
 }
 
-void IODTNVRAM::initProxyData(void)
+static IONVRAMVariableType
+getVariableType(const char *propName)
 {
-  IORegistryEntry *entry;
-  const char *key = "nvram-proxy-data";
-  OSObject *prop;
-  OSData *data;
-  const void *bytes;
-  
-  entry = IORegistryEntry::fromPath("/chosen", gIODTPlane);
-  if (entry != 0) {
-    prop = entry->getProperty(key);
-    if (prop != 0) {
-      data = OSDynamicCast(OSData, prop);
-      if (data != 0) {
-        bytes = data->getBytesNoCopy();
-        if (bytes != 0) {
-          bcopy(bytes, _nvramImage, data->getLength());
-          initNVRAMImage();
-          _isProxied = true;
-        }
-      }
-    }
-    entry->removeProperty(key);
-    entry->release();
-  }
+	const VariableTypeEntry *entry;
+
+	entry = gVariableTypes;
+	while (entry->name != nullptr) {
+		if (strcmp(entry->name, propName) == 0) {
+			break;
+		}
+		entry++;
+	}
+
+	return entry->type;
 }
 
-void IODTNVRAM::registerNVRAMController(IONVRAMController *nvram)
+static IONVRAMVariableType
+getVariableType(const OSSymbol *propSymbol)
 {
-  if (_nvramController != 0) return;
-  
-  _nvramController = nvram;
-  
-  // <rdar://problem/9529235> race condition possible between
-  // IODTNVRAM and IONVRAMController (restore loses boot-args)
-  if (!_isProxied) {
-    _nvramController->read(0, _nvramImage, kIODTNVRAMImageSize);
-    initNVRAMImage();
-  }
+	return getVariableType(propSymbol->getCStringNoCopy());
 }
 
-void IODTNVRAM::initNVRAMImage(void)
+static VariablePermission
+getVariablePermission(const char *propName)
 {
-  char   partitionID[18];
-  UInt32 partitionOffset, partitionLength;
-  UInt32 freePartitionOffset, freePartitionSize;
-  UInt32 currentLength, currentOffset = 0;
-  OSNumber *partitionOffsetNumber, *partitionLengthNumber;
-  
-  // Find the offsets for the OF, XPRAM, NameRegistry and PanicInfo partitions.
-  _ofPartitionOffset = 0xFFFFFFFF;
-  _xpramPartitionOffset = 0xFFFFFFFF;
-  _nrPartitionOffset = 0xFFFFFFFF;
-  _piPartitionOffset = 0xFFFFFFFF;
-  freePartitionOffset = 0xFFFFFFFF;
-  freePartitionSize = 0;
-  if (getPlatform()->getBootROMType()) {
-    // Look through the partitions to find the OF, MacOS partitions.
-    while (currentOffset < kIODTNVRAMImageSize) {
-      currentLength = ((UInt16 *)(_nvramImage + currentOffset))[1] * 16;
-      
-      partitionOffset = currentOffset + 16;
-      partitionLength = currentLength - 16;
-      
-      if (strncmp((const char *)_nvramImage + currentOffset + 4,
-		  kIODTNVRAMOFPartitionName, 12) == 0) {
-	_ofPartitionOffset = partitionOffset;
-	_ofPartitionSize = partitionLength;
-      } else if (strncmp((const char *)_nvramImage + currentOffset + 4,
-			 kIODTNVRAMXPRAMPartitionName, 12) == 0) {
-	_xpramPartitionOffset = partitionOffset;
-	_xpramPartitionSize = kIODTNVRAMXPRAMSize;
-	_nrPartitionOffset = _xpramPartitionOffset + _xpramPartitionSize;
-	_nrPartitionSize = partitionLength - _xpramPartitionSize;
-      } else if (strncmp((const char *)_nvramImage + currentOffset + 4,
-			 kIODTNVRAMPanicInfoPartitonName, 12) == 0) {
-	_piPartitionOffset = partitionOffset;
-	_piPartitionSize = partitionLength;
-      } else if (strncmp((const char *)_nvramImage + currentOffset + 4,
-			 kIODTNVRAMFreePartitionName, 12) == 0) {
-	freePartitionOffset = currentOffset;
-	freePartitionSize = currentLength;
-      } else {
-	// Construct the partition ID from the signature and name.
-	snprintf(partitionID, sizeof(partitionID), "0x%02x,",
-		*(UInt8 *)(_nvramImage + currentOffset));
-	strncpy(partitionID + 5,
-		(const char *)(_nvramImage + currentOffset + 4), 12);
-	partitionID[17] = '\0';
-	
-	partitionOffsetNumber = OSNumber::withNumber(partitionOffset, 32);
-	partitionLengthNumber = OSNumber::withNumber(partitionLength, 32);
-	
-	// Save the partition offset and length
-	_nvramPartitionOffsets->setObject(partitionID, partitionOffsetNumber);
-	_nvramPartitionLengths->setObject(partitionID, partitionLengthNumber);
-	
-	partitionOffsetNumber->release();
-	partitionLengthNumber->release();
-      }
-      currentOffset += currentLength;
-    }
-  } else {
-    // Use the fixed address for old world machines.
-    _ofPartitionOffset    = 0x1800;
-    _ofPartitionSize      = 0x0800;
-    _xpramPartitionOffset = 0x1300;
-    _xpramPartitionSize   = 0x0100;
-    _nrPartitionOffset    = 0x1400;
-    _nrPartitionSize      = 0x0400;
-  }
-  
-  if (_ofPartitionOffset != 0xFFFFFFFF)
-    _ofImage    = _nvramImage + _ofPartitionOffset;
-  if (_xpramPartitionOffset != 0xFFFFFFFF)
-    _xpramImage = _nvramImage + _xpramPartitionOffset;
-  if (_nrPartitionOffset != 0xFFFFFFFF)
-    _nrImage    = _nvramImage + _nrPartitionOffset;
-  
-  if (_piPartitionOffset == 0xFFFFFFFF) {
-    if (freePartitionSize > 0x20) {
-      // Set the signature to 0xa1.
-      _nvramImage[freePartitionOffset] = 0xa1;
-      // Set the checksum to 0.
-      _nvramImage[freePartitionOffset + 1] = 0;
-      // Set the name for the Panic Info partition.
-      strncpy((char *)(_nvramImage + freePartitionOffset + 4),
-	      kIODTNVRAMPanicInfoPartitonName, 12);
-      
-      // Calculate the partition offset and size.
-      _piPartitionOffset = freePartitionOffset + 0x10;
-      _piPartitionSize = 0x800;
-      if (_piPartitionSize + 0x20 > freePartitionSize)
-	_piPartitionSize = freePartitionSize - 0x20;
-      
-      _piImage = _nvramImage + _piPartitionOffset;
-      
-      // Zero the new partition.
-      bzero(_piImage, _piPartitionSize);
-      
-      // Set the partition size.
-      *(UInt16 *)(_nvramImage + freePartitionOffset + 2) =
-	(_piPartitionSize / 0x10) + 1;
-      
-      // Set the partition checksum.
-      _nvramImage[freePartitionOffset + 1] =
-	calculatePartitionChecksum(_nvramImage + freePartitionOffset);
-      
-      // Calculate the free partition offset and size.
-      freePartitionOffset += _piPartitionSize + 0x10;
-      freePartitionSize -= _piPartitionSize + 0x10;
-      
-      // Set the signature to 0x7f.
-      _nvramImage[freePartitionOffset] = 0x7f;
-      // Set the checksum to 0.
-      _nvramImage[freePartitionOffset + 1] = 0;
-      // Set the name for the free partition.
-      strncpy((char *)(_nvramImage + freePartitionOffset + 4),
-	      kIODTNVRAMFreePartitionName, 12);
-      // Set the partition size.
-      *(UInt16 *)(_nvramImage + freePartitionOffset + 2) =
-	freePartitionSize / 0x10;
-      // Set the partition checksum.
-      _nvramImage[freePartitionOffset + 1] =
-	calculatePartitionChecksum(_nvramImage + freePartitionOffset);
-      
-      // Set the nvram image as dirty.
-      _nvramImageDirty = true;
-    }
-  } else {
-    _piImage = _nvramImage + _piPartitionOffset;
-  }
-  
-  _lastDeviceSync = 0;
-  _freshInterval = TRUE;		// we will allow sync() even before the first 15 minutes have passed.
+	const VariablePermissionEntry *entry;
 
-  initOFVariables();
+	entry = gVariablePermissions;
+	while (entry->name != nullptr) {
+		if (strcmp(entry->name, propName) == 0) {
+			break;
+		}
+		entry++;
+	}
+
+	return entry->p;
 }
 
-void IODTNVRAM::sync(void)
+static bool
+variableInAllowList(const char *varName)
 {
-  if (!_nvramImageDirty && !_ofImageDirty) return;
-  
-  // Don't try to sync OF Variables if the system has already paniced.
-  if (!_systemPaniced) syncOFVariables();
-  
-  // Don't try to perform controller operations if none has been registered.  
-  if (_nvramController == 0) return;
-  
-  _nvramController->write(0, _nvramImage, kIODTNVRAMImageSize);
-  _nvramController->sync();
-  
-  _nvramImageDirty = false;
+	unsigned int i = 0;
+	const char * const *list = gInternalBuild ? gNVRAMSystemListInternal : gNVRAMSystemList;
+
+	while (list[i] != nullptr) {
+		if (strcmp(varName, list[i]) == 0) {
+			return true;
+		}
+		i++;
+	}
+
+	return false;
 }
 
-bool IODTNVRAM::serializeProperties(OSSerialize *s) const
+static bool
+verifyWriteSizeLimit(const uuid_t varGuid, const char *variableName, size_t propDataSize)
 {
-  bool                 result, hasPrivilege;
-  UInt32               variablePerm;
-  const OSSymbol       *key;
-  OSDictionary         *dict;
-  OSCollectionIterator *iter = 0;
-  
-  // Verify permissions.
-  hasPrivilege = (kIOReturnSuccess == IOUserClient::clientHasPrivilege(current_task(), kIONVRAMPrivilege));
+	if (variableInAllowList(variableName)) {
+		return propDataSize <= BOOT_LINE_LENGTH;
+	}
 
-  dict = OSDictionary::withCapacity(1);
-  if (dict == 0) return false;
-
-  if (_ofDict == 0) {
-    /* No nvram. Return an empty dictionary. */
-  } else {
-    /* Copy properties with client privilege. */
-    iter = OSCollectionIterator::withCollection(_ofDict);
-    if (iter == 0) {
-      dict->release();
-      return false;
-    }
-    while (1) {
-      key = OSDynamicCast(OSSymbol, iter->getNextObject());
-      if (key == 0) break;
-      
-      variablePerm = getOFVariablePerm(key);
-      if ((hasPrivilege || (variablePerm != kOFVariablePermRootOnly)) &&
-	  ( ! (variablePerm == kOFVariablePermKernelOnly && current_task() != kernel_task) )) {
-	dict->setObject(key, _ofDict->getObject(key));
-      }
-    }
-  }
-
-  result = dict->serialize(s);
- 
-  dict->release();
-  if (iter != 0) iter->release();
-  
-  return result;
+	return true;
 }
 
-OSObject *IODTNVRAM::getProperty(const OSSymbol *aKey) const
+#if defined(DEBUG) || defined(DEVELOPMENT)
+static const char *
+getNVRAMOpString(IONVRAMOperation op)
 {
-  IOReturn result;
-  UInt32   variablePerm;
-  
-  if (_ofDict == 0) return 0;
-  
-  // Verify permissions.
-  variablePerm = getOFVariablePerm(aKey);
-  result = IOUserClient::clientHasPrivilege(current_task(), kIONVRAMPrivilege);
-  if (result != kIOReturnSuccess) {
-    if (variablePerm == kOFVariablePermRootOnly) return 0;
-  }
-  if (variablePerm == kOFVariablePermKernelOnly && current_task() != kernel_task) return 0;
-  
-  return _ofDict->getObject(aKey);
+	switch (op) {
+	case kIONVRAMOperationRead:
+		return "Read";
+	case kIONVRAMOperationWrite:
+		return "Write";
+	case kIONVRAMOperationDelete:
+		return "Delete";
+	case kIONVRAMOperationObliterate:
+		return "Obliterate";
+	case kIONVRAMOperationReset:
+		return "Reset";
+	case kIONVRAMOperationInit:
+		return "Init";
+	default:
+		return "Unknown";
+	}
+}
+#endif
+
+/*
+ * Parse a variable name of the form "GUID:name".
+ * If the name cannot be parsed, substitute the Apple global variable GUID.
+ * Returns TRUE if a GUID was found in the name, FALSE otherwise.
+ * The guidResult and nameResult arguments may be nullptr if you just want
+ * to check the format of the string.
+ */
+static bool
+parseVariableName(const char *key, uuid_t *guidResult, const char **nameResult)
+{
+	uuid_string_t temp    = {0};
+	size_t        keyLen  = strlen(key);
+	bool          ok      = false;
+	const char    *name   = key;
+	uuid_t        guid;
+
+	if (keyLen > sizeof(temp)) {
+		// check for at least UUID + ":" + more
+		memcpy(temp, key, sizeof(temp) - 1);
+
+		if ((uuid_parse(temp, guid) == 0) &&
+		    (key[sizeof(temp) - 1] == ':')) {
+			name = key + sizeof(temp);
+			ok     = true;
+		}
+	}
+
+	if (guidResult) {
+		ok ? uuid_copy(*guidResult, guid) : uuid_copy(*guidResult, gAppleNVRAMGuid);
+	}
+	if (nameResult) {
+		*nameResult = name;
+	}
+
+	return ok;
 }
 
-OSObject *IODTNVRAM::getProperty(const char *aKey) const
+static bool
+parseVariableName(const OSSymbol *key, uuid_t *guidResult, const char **nameResult)
 {
-  const OSSymbol *keySymbol;
-  OSObject *theObject = 0;
-  
-  keySymbol = OSSymbol::withCStringNoCopy(aKey);
-  if (keySymbol != 0) {
-    theObject = getProperty(keySymbol);
-    keySymbol->release();
-  }
-  
-  return theObject;
+	return parseVariableName(key->getCStringNoCopy(), guidResult, nameResult);
 }
 
-bool IODTNVRAM::setProperty(const OSSymbol *aKey, OSObject *anObject)
+/**
+ * @brief Translates(if needed) varGuid and stores it in destGuid
+ *
+ * @param varGuid       guid to translate
+ * @param variableName  variable name attached to the guid
+ * @param destGuid      translated guid is saved here
+ * @param systemActive  boolean to indicate if it has system partition size > 0
+ */
+static void
+translateGUID(const uuid_t varGuid, const char *variableName, uuid_t destGuid, bool systemActive)
 {
-  bool     result;
-  UInt32   propType, propPerm;
-  OSString *tmpString;
-  OSObject *propObject = 0;
-  
-  if (_ofDict == 0) return false;
-  
-  // Verify permissions.
-  propPerm = getOFVariablePerm(aKey);
-  result = IOUserClient::clientHasPrivilege(current_task(), kIONVRAMPrivilege);
-  if (result != kIOReturnSuccess) {
-    if (propPerm != kOFVariablePermUserWrite) return false;
-  }
-  if (propPerm == kOFVariablePermKernelOnly && current_task() != kernel_task) return 0;
+	if (varGuid == nullptr || variableName == nullptr || destGuid == nullptr) {
+		DEBUG_ERROR("nullptr passed as an argument\n");
+		return;
+	}
 
-  // Don't allow creation of new properties on old world machines.
-  if (getPlatform()->getBootROMType() == 0) {
-    if (_ofDict->getObject(aKey) == 0) return false;
-  }
-  
-  // Don't allow change of 'aapl,panic-info'.
-  if (aKey->isEqualTo(kIODTNVRAMPanicInfoKey)) return false;
-  
-  // Make sure the object is of the correct type.
-  propType = getOFVariableType(aKey);
-  switch (propType) {
-  case kOFVariableTypeBoolean :
-    propObject = OSDynamicCast(OSBoolean, anObject);
-    break;
-    
-  case kOFVariableTypeNumber :
-    propObject = OSDynamicCast(OSNumber, anObject);
-    break;
-    
-  case kOFVariableTypeString :
-    propObject = OSDynamicCast(OSString, anObject);
-    break;
-    
-  case kOFVariableTypeData :
-    propObject = OSDynamicCast(OSData, anObject);
-    if (propObject == 0) {
-      tmpString = OSDynamicCast(OSString, anObject);
-      if (tmpString != 0) {
-	propObject = OSData::withBytes(tmpString->getCStringNoCopy(),
-				       tmpString->getLength());
-      }
-    }
-    break;
-  }
-  
-  if (propObject == 0) return false;
-  
-  result = _ofDict->setObject(aKey, propObject);
-  
-  if (result) {
-    if (getPlatform()->getBootROMType() == 0) {
-      updateOWBootArgs(aKey, propObject);
-    }
-    
-    _ofImageDirty = true;
-  }
-  
-  return result;
-}
+	bool systemGuid = uuid_compare(varGuid, gAppleSystemVariableGuid) == 0;
 
-void IODTNVRAM::removeProperty(const OSSymbol *aKey)
-{
-  bool     result;
-  UInt32   propPerm;
-  
-  if (_ofDict == 0) return;
-  
-  // Verify permissions.
-  propPerm = getOFVariablePerm(aKey);
-  result = IOUserClient::clientHasPrivilege(current_task(), kIOClientPrivilegeAdministrator);
-  if (result != kIOReturnSuccess) {
-    if (propPerm != kOFVariablePermUserWrite) return;
-  }
-  if (propPerm == kOFVariablePermKernelOnly && current_task() != kernel_task) return;
-  
-  // Don't allow removal of properties on old world machines.
-  if (getPlatform()->getBootROMType() == 0) return;
-  
-  // Don't allow change of 'aapl,panic-info'.
-  if (aKey->isEqualTo(kIODTNVRAMPanicInfoKey)) return;
-  
-  // If the object exists, remove it from the dictionary.
-  result = _ofDict->getObject(aKey) != 0;
-  if (result) {
-    _ofDict->removeObject(aKey);
-    
-    _ofImageDirty = true;
-  }
-}
-
-IOReturn IODTNVRAM::setProperties(OSObject *properties)
-{
-  bool                 result = true;
-  OSObject             *object;
-  const OSSymbol       *key;
-  const OSString       *tmpStr;
-  OSDictionary         *dict;
-  OSCollectionIterator *iter;
-  
-  dict = OSDynamicCast(OSDictionary, properties);
-  if (dict == 0) return kIOReturnBadArgument;
-  
-  iter = OSCollectionIterator::withCollection(dict);
-  if (iter == 0) return kIOReturnBadArgument;
-  
-  while (result) {
-    key = OSDynamicCast(OSSymbol, iter->getNextObject());
-    if (key == 0) break;
-    
-    object = dict->getObject(key);
-    if (object == 0) continue;
-    
-    if (key->isEqualTo(kIONVRAMDeletePropertyKey)) {
-		tmpStr = OSDynamicCast(OSString, object);
-		if (tmpStr != 0) {
-			key = OSSymbol::withString(tmpStr);
-			removeProperty(key);
-			key->release();
-			result = true;
+	if (systemActive) {
+		if (variableInAllowList(variableName)) {
+			DEBUG_INFO("Using system GUID due to allow list\n");
+			uuid_copy(destGuid, gAppleSystemVariableGuid);
+		} else if (systemGuid) {
+			DEBUG_INFO("System GUID used\n");
+			uuid_copy(destGuid, gAppleSystemVariableGuid);
 		} else {
-			result = false;
+			DEBUG_INFO("Use given guid\n");
+			uuid_copy(destGuid, varGuid);
 		}
-    } else if(key->isEqualTo(kIONVRAMSyncNowPropertyKey)) {
-		tmpStr = OSDynamicCast(OSString, object);
-		if (tmpStr != 0) {
+	} else if (systemGuid) {
+		DEBUG_INFO("Overriding to Apple guid\n");
+		uuid_copy(destGuid, gAppleNVRAMGuid);
+	} else {
+		DEBUG_INFO("Use given guid\n");
+		uuid_copy(destGuid, varGuid);
+	}
+}
 
-			result = true; // We are not going to gaurantee sync, this is best effort
+/**
+ * @brief Checks if the variable-guid(translated) pair is present in gVariableEntitlements and if so,
+ *        does it have the required entitlement for the NVRAM operation passed in
+ *
+ * @param varGuid       guid for the variable to be checked, this gets translated by translateGUID
+ * @param varName       variable name
+ * @param op            NVRAM operation
+ * @param systemActive  used to pass into translateGUID to get the correct guid to check against
+ * @param veChecked     if variable entitlement is checked, this is set to true
+ * @return true         if variable wasn't present in gVariableEntitlements,
+ *                      entitlement check wasn't required for operation passed in,
+ *                      or if entitlement check returned true
+ * @return false        if varName/varGuid/veChecked was NULL or if entitlement check returned false
+ */
+static bool
+verifyVarEntitlement(const uuid_t varGuid, const char *varName, IONVRAMOperation op, bool systemActive, bool *veChecked)
+{
+	if (varGuid == nullptr || varName == nullptr || veChecked == nullptr) {
+		DEBUG_ERROR("nullptr passed as an argument\n");
+		return false;
+	}
 
-			if(safeToSync())
-				sync();
+	uuid_t translatedGuid;
+	const VariableEntitlementEntry *entry;
+	*veChecked = false;
 
-		} else {
-			result = false;
+	translateGUID(varGuid, varName, translatedGuid, systemActive);
+
+	entry = gVariableEntitlements;
+	while ((entry != nullptr) && (entry->varName != nullptr)) {
+		if ((strcmp(entry->varName, varName) == 0) && (uuid_compare(translatedGuid, *(entry->varGuid)) == 0)) {
+			// check if task entitlement check is required for this operation
+			if (entry->checkOp & (1 << op)) {
+				*veChecked = true;
+				DEBUG_INFO("Checking entitlement %s for %s for operation %s\n", entry->varEntitlement, varName, getNVRAMOpString(op));
+				return IOCurrentTaskHasEntitlement(entry->varEntitlement);
+			}
+			break;
 		}
+		entry++;
 	}
-	else {
-		result = setProperty(key, object);
-    }
 
-  }
-  
-  iter->release();
-  
-  if (result) return kIOReturnSuccess;
-  else return kIOReturnError;
+	return true;
 }
 
-IOReturn IODTNVRAM::readXPRAM(IOByteCount offset, UInt8 *buffer,
-			      IOByteCount length)
+static bool
+kernelOnlyVar(const uuid_t varGuid, const char *varName)
 {
-  if (_xpramImage == 0) return kIOReturnUnsupported;
-  
-  if ((buffer == 0) || (length == 0) ||
-      (offset + length > kIODTNVRAMXPRAMSize))
-    return kIOReturnBadArgument;
-  
-  bcopy(_nvramImage + _xpramPartitionOffset + offset, buffer, length);
-
-  return kIOReturnSuccess;
-}
-
-IOReturn IODTNVRAM::writeXPRAM(IOByteCount offset, UInt8 *buffer,
-			       IOByteCount length)
-{
-  if (_xpramImage == 0) return kIOReturnUnsupported;
-  
-  if ((buffer == 0) || (length == 0) ||
-      (offset + length > kIODTNVRAMXPRAMSize))
-    return kIOReturnBadArgument;
-  
-  bcopy(buffer, _nvramImage + _xpramPartitionOffset + offset, length);
-
-  _nvramImageDirty = true;
-  
-  return kIOReturnSuccess;
-}
-
-IOReturn IODTNVRAM::readNVRAMProperty(IORegistryEntry *entry,
-				      const OSSymbol **name,
-				      OSData **value)
-{
-  IOReturn err;
-
-  if (getPlatform()->getBootROMType())
-    err = readNVRAMPropertyType1(entry, name, value);
-  else
-    err = readNVRAMPropertyType0(entry, name, value);
-  
-  return err;
-}
-
-IOReturn IODTNVRAM::writeNVRAMProperty(IORegistryEntry *entry,
-				       const OSSymbol *name,
-				       OSData *value)
-{
-  IOReturn err;
-  
-  if (getPlatform()->getBootROMType())
-    err = writeNVRAMPropertyType1(entry, name, value);
-  else
-    err = writeNVRAMPropertyType0(entry, name, value);
-  
-  return err;
-}
-
-OSDictionary *IODTNVRAM::getNVRAMPartitions(void)
-{
-  return _nvramPartitionLengths;
-}
-
-IOReturn IODTNVRAM::readNVRAMPartition(const OSSymbol *partitionID,
-				       IOByteCount offset, UInt8 *buffer,
-				       IOByteCount length)
-{
-  OSNumber *partitionOffsetNumber, *partitionLengthNumber;
-  UInt32   partitionOffset, partitionLength;
-  
-  partitionOffsetNumber =
-    (OSNumber *)_nvramPartitionOffsets->getObject(partitionID);
-  partitionLengthNumber =
-    (OSNumber *)_nvramPartitionLengths->getObject(partitionID);
-  
-  if ((partitionOffsetNumber == 0) || (partitionLengthNumber == 0))
-    return kIOReturnNotFound;
-  
-  partitionOffset = partitionOffsetNumber->unsigned32BitValue();
-  partitionLength = partitionLengthNumber->unsigned32BitValue();
-  
-  if ((buffer == 0) || (length == 0) ||
-      (offset + length > partitionLength))
-    return kIOReturnBadArgument;
-  
-  bcopy(_nvramImage + partitionOffset + offset, buffer, length);
-  
-  return kIOReturnSuccess;
-}
-
-IOReturn IODTNVRAM::writeNVRAMPartition(const OSSymbol *partitionID,
-					IOByteCount offset, UInt8 *buffer,
-					IOByteCount length)
-{
-  OSNumber *partitionOffsetNumber, *partitionLengthNumber;
-  UInt32   partitionOffset, partitionLength;
-  
-  partitionOffsetNumber =
-    (OSNumber *)_nvramPartitionOffsets->getObject(partitionID);
-  partitionLengthNumber =
-    (OSNumber *)_nvramPartitionLengths->getObject(partitionID);
-  
-  if ((partitionOffsetNumber == 0) || (partitionLengthNumber == 0))
-    return kIOReturnNotFound;
-  
-  partitionOffset = partitionOffsetNumber->unsigned32BitValue();
-  partitionLength = partitionLengthNumber->unsigned32BitValue();
-  
-  if ((buffer == 0) || (length == 0) ||
-      (offset + length > partitionLength))
-    return kIOReturnBadArgument;
-  
-  bcopy(buffer, _nvramImage + partitionOffset + offset, length);
-  
-  _nvramImageDirty = true;
-  
-  return kIOReturnSuccess;
-}
-
-IOByteCount IODTNVRAM::savePanicInfo(UInt8 *buffer, IOByteCount length)
-{
-  if ((_piImage == 0) || (length <= 0)) return 0;
-  
-  if (length > (_piPartitionSize - 4))
-    length = _piPartitionSize - 4;
-  
-  // Save the Panic Info.
-  bcopy(buffer, _piImage + 4, length);
-  
-  // Save the Panic Info length.
-  *(UInt32 *)_piImage = length;
-  
-  _nvramImageDirty = true;
-  /* 
-   * This prevents OF variables from being committed if the system has panicked
-   */
-  _systemPaniced = true;
-  /* The call to sync() forces the NVRAM controller to write the panic info
-   * partition to NVRAM.
-   */
-  sync();
-
-  return length;
-}
-
-// Private methods
-
-UInt8 IODTNVRAM::calculatePartitionChecksum(UInt8 *partitionHeader)
-{
-  UInt8 cnt, isum, csum = 0;
-  
-  for (cnt = 0; cnt < 0x10; cnt++) {
-    isum = csum + partitionHeader[cnt];
-    if (isum < csum) isum++;
-    csum = isum;
-  }
-  
-  return csum;
-}
-
-struct OWVariablesHeader {
-  UInt16   owMagic;
-  UInt8    owVersion;
-  UInt8    owPages;
-  UInt16   owChecksum;
-  UInt16   owHere;
-  UInt16   owTop;
-  UInt16   owNext;
-  UInt32   owFlags;
-  UInt32   owNumbers[9];
-  struct {
-    UInt16 offset;
-    UInt16 length;
-  }        owStrings[10];
-};
-typedef struct OWVariablesHeader OWVariablesHeader;
-
-IOReturn IODTNVRAM::initOFVariables(void)
-{
-  UInt32            cnt, propOffset, propType;
-  UInt8             *propName, *propData;
-  UInt32            propNameLength, propDataLength;
-  const OSSymbol    *propSymbol;
-  OSObject          *propObject;
-  OWVariablesHeader *owHeader;
-
-  if (_ofImage == 0) return kIOReturnNotReady;
-  
-  _ofDict =  OSDictionary::withCapacity(1);
-  if (_ofDict == 0) return kIOReturnNoMemory;
-  
-  if (getPlatform()->getBootROMType()) {
-    cnt = 0;
-    while (cnt < _ofPartitionSize) {
-      // Break if there is no name.
-      if (_ofImage[cnt] == '\0') break;
-      
-      // Find the length of the name.
-      propName = _ofImage + cnt;
-      for (propNameLength = 0; (cnt + propNameLength) < _ofPartitionSize;
-	   propNameLength++) {
-	if (_ofImage[cnt + propNameLength] == '=') break;
-      }
-      
-      // Break if the name goes past the end of the partition.
-      if ((cnt + propNameLength) >= _ofPartitionSize) break;
-      cnt += propNameLength + 1;
-      
-      propData = _ofImage + cnt;
-      for (propDataLength = 0; (cnt + propDataLength) < _ofPartitionSize;
-	   propDataLength++) {
-	if (_ofImage[cnt + propDataLength] == '\0') break;
-      }
-      
-      // Break if the data goes past the end of the partition.
-      if ((cnt + propDataLength) >= _ofPartitionSize) break;
-      cnt += propDataLength + 1;
-      
-      if (convertPropToObject(propName, propNameLength,
-			      propData, propDataLength,
-			      &propSymbol, &propObject)) {
-	_ofDict->setObject(propSymbol, propObject);
-	propSymbol->release();
-	propObject->release();
-      }
-    }
-    
-    // Create the boot-args property if it is not in the dictionary.
-    if (_ofDict->getObject("boot-args") == 0) {
-      propObject = OSString::withCStringNoCopy("");
-      if (propObject != 0) {
-	_ofDict->setObject("boot-args", propObject);
-	propObject->release();
-      }
-    }
-    
-    // Create the 'aapl,panic-info' property if needed.
-    if (_piImage != 0) {
-      propDataLength = *(UInt32 *)_piImage;
-      if ((propDataLength != 0) && (propDataLength <= (_piPartitionSize - 4))) {
-	propObject = OSData::withBytes(_piImage + 4, propDataLength);
-	_ofDict->setObject(kIODTNVRAMPanicInfoKey, propObject);
-	propObject->release();
-	
-	// Clear the length from _piImage and mark dirty.
-	*(UInt32 *)_piImage = 0;
-	_nvramImageDirty = true;
-      }
-    }
-  } else {
-    owHeader = (OWVariablesHeader *)_ofImage;
-    if (!validateOWChecksum(_ofImage)) {
-      _ofDict->release();
-      _ofDict = 0;
-      return kIOReturnBadMedia;
-    }
-    
-    cnt = 0;
-    while (1) {
-      if (!getOWVariableInfo(cnt++, &propSymbol, &propType, &propOffset))
-	break;
-      
-      switch (propType) {
-      case kOFVariableTypeBoolean :
-	propObject = OSBoolean::withBoolean(owHeader->owFlags & propOffset);
-	break;
-	
-      case kOFVariableTypeNumber :
-	propObject = OSNumber::withNumber(owHeader->owNumbers[propOffset], 32);
-	break;
-	
-      case kOFVariableTypeString :
-	propData = _ofImage + owHeader->owStrings[propOffset].offset -
-	  _ofPartitionOffset;
-	propDataLength = owHeader->owStrings[propOffset].length;
-	propName = IONew(UInt8, propDataLength + 1);
-	if (propName != 0) {
-	  strncpy((char *)propName, (const char *)propData, propDataLength);
-	  propName[propDataLength] = '\0';
-	  propObject = OSString::withCString((const char *)propName);
-	  IODelete(propName, UInt8, propDataLength + 1);
+	if (strncmp(varName, KERNEL_ONLY_VAR_NAME_PREFIX, sizeof(KERNEL_ONLY_VAR_NAME_PREFIX) - 1) == 0) {
+		return true;
 	}
-	break;
-      }
-      
-      if (propObject == 0) break;
-      
-      _ofDict->setObject(propSymbol, propObject);
-      propSymbol->release();
-      propObject->release();
-    }
-    
-    // Create the boot-args property.
-    propSymbol = OSSymbol::withCString("boot-command");
-    if (propSymbol != 0) {
-      propObject = _ofDict->getObject(propSymbol);
-      if (propObject != 0) {
-	updateOWBootArgs(propSymbol, propObject);
-      }
-      propSymbol->release();
-    }
-  }
-  
-  return kIOReturnSuccess;
+
+	return false;
 }
 
-IOReturn IODTNVRAM::syncOFVariables(void)
+static bool
+verifyPermission(IONVRAMOperation op, const uuid_t varGuid, const char *varName, const bool systemActive)
 {
-  bool                 ok;
-  UInt32               cnt, length, maxLength;
-  UInt32               curOffset, tmpOffset, tmpType, tmpDataLength;
-  UInt8                *buffer, *tmpBuffer;
-  const UInt8          *tmpData;
-  const OSSymbol       *tmpSymbol;
-  OSObject             *tmpObject;
-  OSBoolean            *tmpBoolean;
-  OSNumber             *tmpNumber;
-  OSString             *tmpString;
-  OSCollectionIterator *iter;
-  OWVariablesHeader    *owHeader, *owHeaderOld;
-  
-  if ((_ofImage == 0) || (_ofDict == 0)) return kIOReturnNotReady;
-  
-  if (!_ofImageDirty) return kIOReturnSuccess;
-  
-  if (getPlatform()->getBootROMType()) {
-    buffer = tmpBuffer = IONew(UInt8, _ofPartitionSize);
-    if (buffer == 0) return kIOReturnNoMemory;
-    bzero(buffer, _ofPartitionSize);
-    
-    ok = true;
-    maxLength = _ofPartitionSize;
-    
-    iter = OSCollectionIterator::withCollection(_ofDict);
-    if (iter == 0) ok = false;
-    
-    while (ok) {
-      tmpSymbol = OSDynamicCast(OSSymbol, iter->getNextObject());
-      if (tmpSymbol == 0) break;
-      
-      // Don't save 'aapl,panic-info'.
-      if (tmpSymbol->isEqualTo(kIODTNVRAMPanicInfoKey)) continue;
-      
-      tmpObject = _ofDict->getObject(tmpSymbol);
-      
-      length = maxLength;
-      ok = convertObjectToProp(tmpBuffer, &length, tmpSymbol, tmpObject);
-      if (ok) {
-	tmpBuffer += length;
-	maxLength -= length;
-      }
-    }
-    iter->release();
-    
-    if (ok) {
-      bcopy(buffer, _ofImage, _ofPartitionSize);
-    }
-    
-    IODelete(buffer, UInt8, _ofPartitionSize);
-    
-    if (!ok) return kIOReturnBadArgument;
-  } else {
-    buffer = IONew(UInt8, _ofPartitionSize);
-    if (buffer == 0) return kIOReturnNoMemory;
-    bzero(buffer, _ofPartitionSize);
-    
-    owHeader    = (OWVariablesHeader *)buffer;
-    owHeaderOld = (OWVariablesHeader *)_ofImage;
-    
-    owHeader->owMagic = owHeaderOld->owMagic;
-    owHeader->owVersion = owHeaderOld->owVersion;
-    owHeader->owPages = owHeaderOld->owPages;
-    
-    curOffset = _ofPartitionSize;
-    
-    ok = true;
-    cnt = 0;
-    while (ok) {
-      if (!getOWVariableInfo(cnt++, &tmpSymbol, &tmpType, &tmpOffset))
-	break;
-      
-      tmpObject = _ofDict->getObject(tmpSymbol);
-      
-      switch (tmpType) {
-      case kOFVariableTypeBoolean :
-	tmpBoolean = OSDynamicCast(OSBoolean, tmpObject);
-	if (tmpBoolean->getValue()) owHeader->owFlags |= tmpOffset;
-	break;
-	
-      case kOFVariableTypeNumber :
-	tmpNumber = OSDynamicCast(OSNumber, tmpObject);
-	owHeader->owNumbers[tmpOffset] = tmpNumber->unsigned32BitValue();
-        break;
-	
-      case kOFVariableTypeString :
-	tmpString = OSDynamicCast(OSString, tmpObject);
-	tmpData = (const UInt8 *)tmpString->getCStringNoCopy();
-	tmpDataLength = tmpString->getLength();
-	
-	if ((curOffset - tmpDataLength) < sizeof(OWVariablesHeader)) {
-	  ok = false;
-	  break;
+	VariablePermission perm;
+	bool kernel, varEntitled, writeEntitled = false, readEntitled = false, allowList, systemGuid = false, systemEntitled = false, systemInternalEntitled = false, systemAllow, systemReadHiddenAllow = false;
+	bool admin = false;
+	bool ok = false;
+
+	if (verifyVarEntitlement(varGuid, varName, op, systemActive, &varEntitled) == false) {
+		goto exit;
 	}
-	
-	owHeader->owStrings[tmpOffset].length = tmpDataLength;
-	curOffset -= tmpDataLength;
-	owHeader->owStrings[tmpOffset].offset = curOffset + _ofPartitionOffset;
-	if (tmpDataLength != 0)
-	  bcopy(tmpData, buffer + curOffset, tmpDataLength);
-	break;
-      }
-    }
-    
-    if (ok) {
-      owHeader->owHere = _ofPartitionOffset + sizeof(OWVariablesHeader);
-      owHeader->owTop = _ofPartitionOffset + curOffset;
-      owHeader->owNext = 0;
-      
-      owHeader->owChecksum = 0;
-      owHeader->owChecksum = ~generateOWChecksum(buffer);
-      
-      bcopy(buffer, _ofImage, _ofPartitionSize);
-    }
-    
-    IODelete(buffer, UInt8, _ofPartitionSize);
-    
-    if (!ok) return kIOReturnBadArgument;
-  }
-  
-  _ofImageDirty = false;
-  _nvramImageDirty = true;
-  
-  return kIOReturnSuccess;
-}
 
-struct OFVariable {
-  const char *variableName;
-  UInt32     variableType;
-  UInt32     variablePerm;
-  SInt32     variableOffset;
-};
-typedef struct OFVariable OFVariable;
+	perm = getVariablePermission(varName);
 
-enum {
-  kOWVariableOffsetNumber = 8,
-  kOWVariableOffsetString = 17
-};
+	kernel = current_task() == kernel_task;
 
-OFVariable gOFVariables[] = {
-  {"little-endian?", kOFVariableTypeBoolean, kOFVariablePermUserRead, 0},
-  {"real-mode?", kOFVariableTypeBoolean, kOFVariablePermUserRead, 1},
-  {"auto-boot?", kOFVariableTypeBoolean, kOFVariablePermUserRead, 2},
-  {"diag-switch?", kOFVariableTypeBoolean, kOFVariablePermUserRead, 3},
-  {"fcode-debug?", kOFVariableTypeBoolean, kOFVariablePermUserRead, 4},
-  {"oem-banner?", kOFVariableTypeBoolean, kOFVariablePermUserRead, 5},
-  {"oem-logo?", kOFVariableTypeBoolean, kOFVariablePermUserRead, 6},
-  {"use-nvramrc?", kOFVariableTypeBoolean, kOFVariablePermUserRead, 7},
-  {"use-generic?", kOFVariableTypeBoolean, kOFVariablePermUserRead, -1},
-  {"default-mac-address?", kOFVariableTypeBoolean, kOFVariablePermUserRead,-1},
-  {"real-base", kOFVariableTypeNumber, kOFVariablePermUserRead, 8},
-  {"real-size", kOFVariableTypeNumber, kOFVariablePermUserRead, 9},
-  {"virt-base", kOFVariableTypeNumber, kOFVariablePermUserRead, 10},
-  {"virt-size", kOFVariableTypeNumber, kOFVariablePermUserRead, 11},
-  {"load-base", kOFVariableTypeNumber, kOFVariablePermUserRead, 12},
-  {"pci-probe-list", kOFVariableTypeNumber, kOFVariablePermUserRead, 13},
-  {"pci-probe-mask", kOFVariableTypeNumber, kOFVariablePermUserRead, -1},
-  {"screen-#columns", kOFVariableTypeNumber, kOFVariablePermUserRead, 14},
-  {"screen-#rows", kOFVariableTypeNumber, kOFVariablePermUserRead, 15},
-  {"selftest-#megs", kOFVariableTypeNumber, kOFVariablePermUserRead, 16},
-  {"boot-device", kOFVariableTypeString, kOFVariablePermUserRead, 17},
-  {"boot-file", kOFVariableTypeString, kOFVariablePermUserRead, 18},
-  {"boot-screen", kOFVariableTypeString, kOFVariablePermUserRead, -1},
-  {"console-screen", kOFVariableTypeString, kOFVariablePermUserRead, -1},
-  {"diag-device", kOFVariableTypeString, kOFVariablePermUserRead, 19},
-  {"diag-file", kOFVariableTypeString, kOFVariablePermUserRead, 20},
-  {"input-device", kOFVariableTypeString, kOFVariablePermUserRead, 21},
-  {"output-device", kOFVariableTypeString, kOFVariablePermUserRead, 22},
-  {"input-device-1", kOFVariableTypeString, kOFVariablePermUserRead, -1},
-  {"output-device-1", kOFVariableTypeString, kOFVariablePermUserRead, -1},
-  {"mouse-device", kOFVariableTypeString, kOFVariablePermUserRead, -1},
-  {"oem-banner", kOFVariableTypeString, kOFVariablePermUserRead, 23},
-  {"oem-logo", kOFVariableTypeString, kOFVariablePermUserRead, 24},
-  {"nvramrc", kOFVariableTypeString, kOFVariablePermUserRead, 25},
-  {"boot-command", kOFVariableTypeString, kOFVariablePermUserRead, 26},
-  {"default-client-ip", kOFVariableTypeString, kOFVariablePermUserRead, -1},
-  {"default-server-ip", kOFVariableTypeString, kOFVariablePermUserRead, -1},
-  {"default-gateway-ip", kOFVariableTypeString, kOFVariablePermUserRead, -1},
-  {"default-subnet-mask", kOFVariableTypeString, kOFVariablePermUserRead, -1},
-  {"default-router-ip", kOFVariableTypeString, kOFVariablePermUserRead, -1},
-  {"boot-script", kOFVariableTypeString, kOFVariablePermUserRead, -1},
-  {"boot-args", kOFVariableTypeString, kOFVariablePermUserRead, -1},
-  {"aapl,pci", kOFVariableTypeData, kOFVariablePermRootOnly, -1},
-  {"security-mode", kOFVariableTypeString, kOFVariablePermUserRead, -1},
-  {"security-password", kOFVariableTypeData, kOFVariablePermRootOnly, -1},
-  {"boot-image", kOFVariableTypeData, kOFVariablePermUserWrite, -1},
-  {"com.apple.System.fp-state", kOFVariableTypeData, kOFVariablePermKernelOnly, -1},
-  {0, kOFVariableTypeData, kOFVariablePermUserRead, -1}
-};
+	if (perm.Bits.KernelOnly || kernelOnlyVar(varGuid, varName)) {
+		DEBUG_INFO("KernelOnly access for %s, kernel=%d\n", varName, kernel);
+		ok = kernel;
+		goto exit;
+	}
 
-UInt32 IODTNVRAM::getOFVariableType(const OSSymbol *propSymbol) const
-{
-  OFVariable *ofVar;
-  
-  ofVar = gOFVariables;
-  while (1) {
-    if ((ofVar->variableName == 0) ||
-	propSymbol->isEqualTo(ofVar->variableName)) break;
-    ofVar++;
-  }
-  
-  return ofVar->variableType;
-}
+	if (perm.Bits.InternalOnly && !gInternalBuild) {
+		DEBUG_INFO("InternalOnly access for %s, gInternalBuild=%d\n", varName, gInternalBuild);
+		goto exit;
+	}
 
-UInt32 IODTNVRAM::getOFVariablePerm(const OSSymbol *propSymbol) const
-{
-  OFVariable *ofVar;
-  
-  ofVar = gOFVariables;
-  while (1) {
-    if ((ofVar->variableName == 0) ||
-	propSymbol->isEqualTo(ofVar->variableName)) break;
-    ofVar++;
-  }
-  
-  return ofVar->variablePerm;
-}
+	allowList              = variableInAllowList(varName);
+	systemGuid             = uuid_compare(varGuid, gAppleSystemVariableGuid) == 0;
+	admin                  = IOUserClient::clientHasPrivilege(current_task(), kIONVRAMPrivilege) == kIOReturnSuccess;
+	writeEntitled          = IOCurrentTaskHasEntitlement(kIONVRAMWriteAccessKey);
+	readEntitled           = IOCurrentTaskHasEntitlement(kIONVRAMReadAccessKey);
+	systemEntitled         = IOCurrentTaskHasEntitlement(kIONVRAMSystemAllowKey);
+	systemInternalEntitled = IOCurrentTaskHasEntitlement(kIONVRAMSystemInternalAllowKey);
+	systemReadHiddenAllow  = IOCurrentTaskHasEntitlement(kIONVRAMSystemHiddenAllowKey);
 
-bool IODTNVRAM::getOWVariableInfo(UInt32 variableNumber, const OSSymbol **propSymbol,
-				  UInt32 *propType, UInt32 *propOffset)
-{
-  OFVariable *ofVar;
-  
-  ofVar = gOFVariables;
-  while (1) {
-    if (ofVar->variableName == 0) return false;
-    
-    if (ofVar->variableOffset == (SInt32) variableNumber) break;
-    
-    ofVar++;
-  }
-  
-  *propSymbol = OSSymbol::withCStringNoCopy(ofVar->variableName);
-  *propType = ofVar->variableType;
-  
-  switch (*propType) {
-  case kOFVariableTypeBoolean :
-    *propOffset = 1 << (31 - variableNumber);
-    break;
-    
-  case kOFVariableTypeNumber :
-    *propOffset = variableNumber - kOWVariableOffsetNumber;
-    break;
-    
-  case kOFVariableTypeString :
-    *propOffset = variableNumber - kOWVariableOffsetString;
-    break;
-  }
-  
-  return true;
-}
+	systemAllow = systemEntitled || (systemInternalEntitled && gInternalBuild) || kernel;
 
-bool IODTNVRAM::convertPropToObject(UInt8 *propName, UInt32 propNameLength,
-				    UInt8 *propData, UInt32 propDataLength,
-				    const OSSymbol **propSymbol,
-				    OSObject **propObject)
-{
-  UInt32         propType;
-  const OSSymbol *tmpSymbol;
-  OSObject       *tmpObject;
-  OSNumber       *tmpNumber;
-  OSString       *tmpString;
-  
-  // Create the symbol.
-  propName[propNameLength] = '\0';
-  tmpSymbol = OSSymbol::withCString((const char *)propName);
-  propName[propNameLength] = '=';
-  if (tmpSymbol == 0) {
-    return false;
-  }
-  
-  propType = getOFVariableType(tmpSymbol);
-  
-  // Create the object.
-  tmpObject = 0;
-  switch (propType) {
-  case kOFVariableTypeBoolean :
-    if (!strncmp("true", (const char *)propData, propDataLength)) {
-      tmpObject = kOSBooleanTrue;
-    } else if (!strncmp("false", (const char *)propData, propDataLength)) {
-      tmpObject = kOSBooleanFalse;
-    }
-    break;
-    
-  case kOFVariableTypeNumber :
-    tmpNumber = OSNumber::withNumber(strtol((const char *)propData, 0, 0), 32);
-    if (tmpNumber != 0) tmpObject = tmpNumber;
-    break;
-    
-  case kOFVariableTypeString :
-    tmpString = OSString::withCString((const char *)propData);
-    if (tmpString != 0) tmpObject = tmpString;
-    break;
-    
-  case kOFVariableTypeData :
-    tmpObject = unescapeBytesToData(propData, propDataLength);
-    break;
-  }
-  
-  if (tmpObject == 0) {
-    tmpSymbol->release();
-    return false;
-  }
-  
-  *propSymbol = tmpSymbol;
-  *propObject = tmpObject;
-  
-  return true;
-}
-
-bool IODTNVRAM::convertObjectToProp(UInt8 *buffer, UInt32 *length,
-				    const OSSymbol *propSymbol, OSObject *propObject)
-{
-  const UInt8    *propName;
-  UInt32         propNameLength, propDataLength;
-  UInt32         propType, tmpValue;
-  OSBoolean      *tmpBoolean = 0;
-  OSNumber       *tmpNumber = 0;
-  OSString       *tmpString = 0;
-  OSData         *tmpData = 0;
-  
-  propName = (const UInt8 *)propSymbol->getCStringNoCopy();
-  propNameLength = propSymbol->getLength();
-  propType = getOFVariableType(propSymbol);
-  
-  // Get the size of the data.
-  propDataLength = 0xFFFFFFFF;
-  switch (propType) {
-  case kOFVariableTypeBoolean :
-    tmpBoolean = OSDynamicCast(OSBoolean, propObject);
-    if (tmpBoolean != 0) propDataLength = 5;
-    break;
-    
-  case kOFVariableTypeNumber :
-    tmpNumber = OSDynamicCast(OSNumber, propObject);
-    if (tmpNumber != 0) propDataLength = 10;
-    break;
-    
-  case kOFVariableTypeString :
-    tmpString = OSDynamicCast(OSString, propObject);
-    if (tmpString != 0) propDataLength = tmpString->getLength();
-    break;
-    
-  case kOFVariableTypeData :
-    tmpData = OSDynamicCast(OSData, propObject); 
-    if (tmpData != 0) {
-      tmpData = escapeDataToData(tmpData);
-      propDataLength = tmpData->getLength();
-    }
-    break;
-  }
-  
-  // Make sure the propertySize is known and will fit.
-  if (propDataLength == 0xFFFFFFFF) return false;
-  if ((propNameLength + propDataLength + 2) > *length) return false;
-  
-  // Copy the property name equal sign.
-  buffer += snprintf((char *)buffer, *length, "%s=", propName);
-  
-  switch (propType) {
-  case kOFVariableTypeBoolean :
-    if (tmpBoolean->getValue()) {
-      strlcpy((char *)buffer, "true", *length - propNameLength);
-    } else {
-      strlcpy((char *)buffer, "false", *length - propNameLength);
-    }
-    break;
-    
-  case kOFVariableTypeNumber :
-    tmpValue = tmpNumber->unsigned32BitValue();
-    if (tmpValue == 0xFFFFFFFF) {
-      strlcpy((char *)buffer, "-1", *length - propNameLength);
-    } else if (tmpValue < 1000) {
-      snprintf((char *)buffer, *length - propNameLength, "%d", (uint32_t)tmpValue);
-    } else {
-      snprintf((char *)buffer, *length - propNameLength, "0x%x", (uint32_t)tmpValue);
-    }
-    break;
-    
-  case kOFVariableTypeString :
-    strlcpy((char *)buffer, tmpString->getCStringNoCopy(), *length - propNameLength);
-    break;
-    
-  case kOFVariableTypeData :
-    bcopy(tmpData->getBytesNoCopy(), buffer, propDataLength);
-    tmpData->release();
-    break;
-  }
-  
-  propDataLength = strlen((const char *)buffer);  
-  
-  *length = propNameLength + propDataLength + 2;
-  
-  return true;
-}
-
-
-UInt16 IODTNVRAM::generateOWChecksum(UInt8 *buffer)
-{
-  UInt32 cnt, checksum = 0;
-  UInt16 *tmpBuffer = (UInt16 *)buffer;
-  
-  for (cnt = 0; cnt < _ofPartitionSize / 2; cnt++)
-    checksum += tmpBuffer[cnt];
-  
-  return checksum % 0x0000FFFF;
-}
-
-bool IODTNVRAM::validateOWChecksum(UInt8 *buffer)
-{
-  UInt32 cnt, checksum, sum = 0;
-  UInt16 *tmpBuffer = (UInt16 *)buffer;
-  
-  for (cnt = 0; cnt < _ofPartitionSize / 2; cnt++)
-    sum += tmpBuffer[cnt];
-  
-  checksum = (sum >> 16) + (sum & 0x0000FFFF);
-  if (checksum == 0x10000) checksum--;
-  checksum = (checksum ^ 0x0000FFFF) & 0x0000FFFF;
-  
-  return checksum == 0;
-}
-
-void IODTNVRAM::updateOWBootArgs(const OSSymbol *key, OSObject *value)
-{
-  bool        wasBootArgs, bootr = false;
-  UInt32      cnt;
-  OSString    *tmpString, *bootCommand, *bootArgs = 0;
-  const UInt8 *bootCommandData, *bootArgsData;
-  UInt8       *tmpData;
-  UInt32      bootCommandDataLength, bootArgsDataLength, tmpDataLength;
-  
-  tmpString = OSDynamicCast(OSString, value);
-  if (tmpString == 0) return;
-  
-  if (key->isEqualTo("boot-command")) {
-    wasBootArgs = false;
-    bootCommand = tmpString;
-  } else if (key->isEqualTo("boot-args")) {
-    wasBootArgs = true;
-    bootArgs = tmpString;
-    bootCommand = OSDynamicCast(OSString, _ofDict->getObject("boot-command"));
-    if (bootCommand == 0) return;
-  } else return;
-  
-  bootCommandData = (const UInt8 *)bootCommand->getCStringNoCopy();
-  bootCommandDataLength = bootCommand->getLength();
-  
-  if (bootCommandData == 0) return;
-  
-  for (cnt = 0; cnt < bootCommandDataLength; cnt++) {
-    if ((bootCommandData[cnt] == 'b') &&
-	!strncmp("bootr", (const char *)bootCommandData + cnt, 5)) {
-      cnt += 5;
-      while (bootCommandData[cnt] == ' ') cnt++;
-      bootr = true;
-      break;
-    }
-  }
-  if (!bootr) {
-    _ofDict->removeObject("boot-args");
-    return;
-  }
-  
-  if (wasBootArgs) {
-    bootArgsData = (const UInt8 *)bootArgs->getCStringNoCopy();
-    bootArgsDataLength = bootArgs->getLength();
-    if (bootArgsData == 0) return;
-    
-    tmpDataLength = cnt + bootArgsDataLength;
-    tmpData = IONew(UInt8, tmpDataLength + 1);
-    if (tmpData == 0) return;
-    
-    cnt -= strlcpy((char *)tmpData, (const char *)bootCommandData, cnt);
-    strlcat((char *)tmpData, (const char *)bootArgsData, cnt);
-    
-    bootCommand = OSString::withCString((const char *)tmpData);
-    if (bootCommand != 0) {
-      _ofDict->setObject("boot-command", bootCommand);
-      bootCommand->release();
-    }
-    
-    IODelete(tmpData, UInt8, tmpDataLength + 1);
-  } else {
-    bootArgs = OSString::withCString((const char *)(bootCommandData + cnt));
-    if (bootArgs != 0) {
-      _ofDict->setObject("boot-args", bootArgs);
-      bootArgs->release();
-    }
-  }
-}
-
-
-// Private methods for Name Registry access.
-
-enum {
-  kMaxNVNameLength = 4,
-  kMaxNVDataLength = 8
-};
-
-struct NVRAMProperty
-{
-  IONVRAMDescriptor   header;
-  UInt8               nameLength;
-  UInt8               name[ kMaxNVNameLength ];
-  UInt8               dataLength;
-  UInt8               data[ kMaxNVDataLength ];
-};
-
-bool IODTNVRAM::searchNVRAMProperty(IONVRAMDescriptor *hdr, UInt32 *where)
-{
-  UInt32 offset;
-  SInt32 nvEnd;
-  
-  nvEnd = *((UInt16 *)_nrImage);
-  if(getPlatform()->getBootROMType()) {
-    // on NewWorld, offset to partition start
-    nvEnd -= 0x100;
-  } else {
-    // on old world, absolute
-    nvEnd -= _nrPartitionOffset;
-  }
-  if((nvEnd < 0) || (nvEnd >= kIODTNVRAMNameRegistrySize))
-    nvEnd = 2;
-  
-  offset = 2;
-  while ((offset + sizeof(NVRAMProperty)) <= (UInt32)nvEnd) {
-    if (bcmp(_nrImage + offset, hdr, sizeof(*hdr)) == 0) {
-      *where = offset;
-      return true;
-    }
-    offset += sizeof(NVRAMProperty);
-  }
-  
-  if ((nvEnd + sizeof(NVRAMProperty)) <= kIODTNVRAMNameRegistrySize)
-    *where = nvEnd;
-  else
-    *where = 0;
-  
-  return false;
-}
-
-IOReturn IODTNVRAM::readNVRAMPropertyType0(IORegistryEntry *entry,
-					   const OSSymbol **name,
-					   OSData **value)
-{
-  IONVRAMDescriptor hdr;
-  NVRAMProperty     *prop;
-  IOByteCount       length;
-  UInt32            offset;
-  IOReturn          err;
-  char              nameBuf[kMaxNVNameLength + 1];
-  
-  if (_nrImage == 0) return kIOReturnUnsupported;
-  if ((entry == 0) || (name == 0) || (value == 0)) return kIOReturnBadArgument;
-  
-  err = IODTMakeNVDescriptor(entry, &hdr);
-  if (err != kIOReturnSuccess) return err;
-  
-  if (searchNVRAMProperty(&hdr, &offset)) {
-    prop = (NVRAMProperty *)(_nrImage + offset);
-    
-    length = prop->nameLength;
-    if (length > kMaxNVNameLength) length = kMaxNVNameLength;
-    strncpy(nameBuf, (const char *)prop->name, length);
-    nameBuf[length] = 0;
-    *name = OSSymbol::withCString(nameBuf);
-    
-    length = prop->dataLength;
-    if (length > kMaxNVDataLength) length = kMaxNVDataLength;
-    *value = OSData::withBytes(prop->data, length);
-    
-    if ((*name != 0) && (*value != 0)) return kIOReturnSuccess;
-    else return kIOReturnNoMemory;
-  }
-  
-  return kIOReturnNoResources;
-}
-
-IOReturn IODTNVRAM::writeNVRAMPropertyType0(IORegistryEntry *entry,
-					    const OSSymbol *name,
-					    OSData *value)
-{
-  IONVRAMDescriptor hdr;
-  NVRAMProperty     *prop;
-  IOByteCount       nameLength;
-  IOByteCount       dataLength;
-  UInt32            offset;
-  IOReturn          err;
-  UInt16            nvLength;
-  bool              exists;
-  
-  if (_nrImage == 0) return kIOReturnUnsupported;
-  if ((entry == 0) || (name == 0) || (value == 0)) return kIOReturnBadArgument;
-  
-  nameLength = name->getLength();
-  dataLength = value->getLength();
-  if (nameLength > kMaxNVNameLength) return kIOReturnNoSpace;
-  if (dataLength > kMaxNVDataLength) return kIOReturnNoSpace;
-  
-  err = IODTMakeNVDescriptor(entry, &hdr);
-  if (err != kIOReturnSuccess) return err;
-  
-  exists = searchNVRAMProperty(&hdr, &offset);
-  if (offset == 0) return kIOReturnNoMemory;
-  
-  prop = (NVRAMProperty *)(_nrImage + offset);
-  if (!exists) bcopy(&hdr, &prop->header, sizeof(hdr));
-  
-  prop->nameLength = nameLength;
-  bcopy(name->getCStringNoCopy(), prop->name, nameLength);
-  prop->dataLength = dataLength;
-  bcopy(value->getBytesNoCopy(), prop->data, dataLength);
-  
-  if (!exists) {
-    nvLength = offset + sizeof(NVRAMProperty);
-    if (getPlatform()->getBootROMType())
-      nvLength += 0x100;
-    else
-      nvLength += _nrPartitionOffset;
-    *((UInt16 *)_nrImage) = nvLength;
-  }
-  
-  _nvramImageDirty = true;
-  
-  return err;
-}
-
-OSData *IODTNVRAM::unescapeBytesToData(const UInt8 *bytes, UInt32 length)
-{
-  OSData *data = 0;
-  UInt32 totalLength = 0;
-  UInt32 cnt, cnt2;
-  UInt8  byte;
-  bool   ok;
-
-  // Calculate the actual length of the data.
-  ok = true;
-  totalLength = 0;
-  for (cnt = 0; cnt < length;) {
-    byte = bytes[cnt++];
-    if (byte == 0xFF) {
-      byte = bytes[cnt++];
-      if (byte == 0x00) {
-        ok = false;
-        break;
-      }
-      cnt2 = byte & 0x7F;
-    } else
-      cnt2 = 1;
-    totalLength += cnt2;
-  }
-
-  if (ok) {
-    // Create an empty OSData of the correct size.
-    data = OSData::withCapacity(totalLength);
-    if (data != 0) {
-      for (cnt = 0; cnt < length;) {
-        byte = bytes[cnt++];
-        if (byte == 0xFF) {
-          byte = bytes[cnt++];
-          cnt2 = byte & 0x7F;
-          byte = (byte & 0x80) ? 0xFF : 0x00;
-        } else
-          cnt2 = 1;
-        data->appendByte(byte, cnt2);
-      }
-    }
-  }
-
-  return data;
-}
-
-OSData * IODTNVRAM::escapeDataToData(OSData * value)
-{
-  OSData *       result;
-  const UInt8 *  startPtr;
-  const UInt8 *  endPtr;
-  const UInt8 *  wherePtr;
-  UInt8          byte;
-  bool	         ok = true;
-
-  wherePtr = (const UInt8 *) value->getBytesNoCopy();
-  endPtr = wherePtr + value->getLength();
-
-  result = OSData::withCapacity(endPtr - wherePtr);
-  if (!result)
-    return result;
-
-  while (wherePtr < endPtr) {
-    startPtr = wherePtr;
-    byte = *wherePtr++;
-    if ((byte == 0x00) || (byte == 0xFF)) {
-      for (;
-            ((wherePtr - startPtr) < 0x80) && (wherePtr < endPtr) && (byte == *wherePtr);
-            wherePtr++)	{}
-      ok &= result->appendByte(0xff, 1);
-      byte = (byte & 0x80) | (wherePtr - startPtr);
-    }
-    ok &= result->appendByte(byte, 1);
-  }
-  ok &= result->appendByte(0, 1);
-
-  if (!ok) {
-    result->release();
-    result = 0;
-  }
-
-  return result;
-}
-
-static bool IsApplePropertyName(const char * propName)
-{
-  char c;
-  while ((c = *propName++)) {
-    if ((c >= 'A') && (c <= 'Z'))
-      break;
-  }
-
-  return (c == 0);
-}
-
-IOReturn IODTNVRAM::readNVRAMPropertyType1(IORegistryEntry *entry,
-					   const OSSymbol **name,
-					   OSData **value)
-{
-  IOReturn    err = kIOReturnNoResources;
-  OSData      *data;
-  const UInt8 *startPtr;
-  const UInt8 *endPtr;
-  const UInt8 *wherePtr;
-  const UInt8 *nvPath = 0;
-  const char  *nvName = 0;
-  const char  *resultName = 0;
-  const UInt8 *resultValue = 0;
-  UInt32       resultValueLen = 0;
-  UInt8       byte;
-
-  if (_ofDict == 0) return err;
-  data = OSDynamicCast(OSData, _ofDict->getObject(_registryPropertiesKey));
-  if (data == 0) return err;
-  
-  startPtr = (const UInt8 *) data->getBytesNoCopy();
-  endPtr = startPtr + data->getLength();
-
-  wherePtr = startPtr;
-  while (wherePtr < endPtr) {
-    byte = *(wherePtr++);
-    if (byte)
-      continue;
-    
-    if (nvPath == 0)
-      nvPath = startPtr;
-    else if (nvName == 0)
-      nvName = (const char *) startPtr;
-    else {
-      IORegistryEntry * compareEntry = IORegistryEntry::fromPath((const char *) nvPath, gIODTPlane);
-      if (compareEntry)
-        compareEntry->release();
-      if (entry == compareEntry) {
-        bool appleProp = IsApplePropertyName(nvName);
-        if (!appleProp || !resultName) {
-          resultName     = nvName;
-          resultValue    = startPtr;
-          resultValueLen = wherePtr - startPtr - 1;
-        }
-        if (!appleProp)
-          break;
-      }
-      nvPath = 0;
-      nvName = 0;
-    }
-    startPtr = wherePtr;
-  }
-  if (resultName) {
-    *name = OSSymbol::withCString(resultName);
-    *value = unescapeBytesToData(resultValue, resultValueLen);
-    if ((*name != 0) && (*value != 0))
-      err = kIOReturnSuccess;
-    else
-      err = kIOReturnNoMemory;
-  }
-  return err;
-}
-
-IOReturn IODTNVRAM::writeNVRAMPropertyType1(IORegistryEntry *entry,
-					    const OSSymbol *propName,
-					    OSData *value)
-{
-  OSData       *oldData;
-  OSData       *data = 0;
-  const UInt8  *startPtr;
-  const UInt8  *propStart;
-  const UInt8  *endPtr;
-  const UInt8  *wherePtr;
-  const UInt8  *nvPath = 0;
-  const char   *nvName = 0;
-  const char * comp;
-  const char * name;
-  UInt8        byte;
-  bool         ok = true;
-  bool         settingAppleProp;
-
-  if (_ofDict == 0) return kIOReturnNoResources;
-
-  settingAppleProp = IsApplePropertyName(propName->getCStringNoCopy());
-
-  // copy over existing properties for other entries
-
-  oldData = OSDynamicCast(OSData, _ofDict->getObject(_registryPropertiesKey));
-  if (oldData) {
-    startPtr = (const UInt8 *) oldData->getBytesNoCopy();
-    endPtr = startPtr + oldData->getLength();
-    
-    propStart = startPtr;
-    wherePtr = startPtr;
-    while (wherePtr < endPtr) {
-      byte = *(wherePtr++);
-      if (byte)
-        continue;
-      if (nvPath == 0)
-        nvPath = startPtr;
-      else if (nvName == 0)
-        nvName = (const char *) startPtr;
-      else {
-        IORegistryEntry * compareEntry = IORegistryEntry::fromPath((const char *) nvPath, gIODTPlane);
-        if (compareEntry)
-          compareEntry->release();
-        if (entry == compareEntry) {
-          if ((settingAppleProp && propName->isEqualTo(nvName))
-           || (!settingAppleProp && !IsApplePropertyName(nvName))) {
-             // delete old property (nvPath -> wherePtr)
-             data = OSData::withBytes(propStart, nvPath - propStart);
-             if (data)
-               ok &= data->appendBytes(wherePtr, endPtr - wherePtr);
-             break;
-          }
-        }
-        nvPath = 0;
-        nvName = 0;
-      }
-        
-      startPtr = wherePtr;
-    }
-  }
-
-  // make the new property
-
-  if (!data) {
-    if (oldData)
-      data = OSData::withData(oldData);
-    else
-      data = OSData::withCapacity(16);
-    if (!data)
-      return kIOReturnNoMemory;
-  }
-
-  if (value && value->getLength()) {
-		// get entries in path
-		OSArray *array = OSArray::withCapacity(5);
-		if (!array) {
-			data->release();
-			return kIOReturnNoMemory;
+	switch (op) {
+	case kIONVRAMOperationRead:
+		if (systemGuid && perm.Bits.SystemReadHidden) {
+			ok = systemReadHiddenAllow;
+		} else if (kernel || admin || readEntitled || perm.Bits.FullAccess || varEntitled) {
+			ok = true;
 		}
-		do
-			array->setObject(entry);
-		while ((entry = entry->getParentEntry(gIODTPlane)));
+		break;
 
-		// append path
-		for (int i = array->getCount() - 3;
-					(entry = (IORegistryEntry *) array->getObject(i));
-					i--) {
-
-			name = entry->getName(gIODTPlane);
-			comp = entry->getLocation(gIODTPlane);
-			if( comp && (0 == strncmp("pci", name, sizeof("pci")))
-			 && (0 == strncmp("80000000", comp, sizeof("80000000")))) {
-				// yosemite hack
-				comp = "/pci@80000000";
-			} else {
-				if (comp)
-					ok &= data->appendBytes("/@", 2);
-				else {
-					if (!name)
-						continue;
-					ok &= data->appendByte('/', 1);
-					comp = name;
+	case kIONVRAMOperationWrite:
+		if (kernel || perm.Bits.UserWrite || admin || writeEntitled || varEntitled) {
+			if (systemGuid) {
+				if (allowList) {
+					if (!systemAllow) {
+						DEBUG_ERROR("Allowed write to system region when NOT entitled for %s\n", varName);
+					}
+				} else if (varEntitled) {
+					DEBUG_INFO("Allowed write to system region using variable specific entitlement for %s\n", varName);
+				} else if (!systemAllow) {
+					DEBUG_ERROR("Not entitled for system region writes for %s\n", varName);
+					break;
 				}
 			}
-			ok &= data->appendBytes(comp, strlen(comp));
+			ok = true;
 		}
-		ok &= data->appendByte(0, 1);
-		array->release();
+		break;
 
-		// append prop name
-		ok &= data->appendBytes(propName->getCStringNoCopy(), propName->getLength() + 1);
-		
-		// append escaped data
-		oldData = escapeDataToData(value);
-		ok &= (oldData != 0);
-		if (ok)
-			ok &= data->appendBytes(oldData);
+	case kIONVRAMOperationDelete:
+	case kIONVRAMOperationObliterate:
+	case kIONVRAMOperationReset:
+		if (perm.Bits.NeverAllowedToDelete) {
+			DEBUG_INFO("Never allowed to delete %s\n", varName);
+			break;
+		} else if ((op == kIONVRAMOperationObliterate) && perm.Bits.ResetNVRAMOnlyDelete) {
+			DEBUG_INFO("Not allowed to obliterate %s\n", varName);
+			break;
+		} else if ((op == kIONVRAMOperationDelete) && perm.Bits.ResetNVRAMOnlyDelete) {
+			DEBUG_INFO("Only allowed to delete %s via NVRAM reset\n", varName);
+			break;
+		}
+
+		if (kernel || perm.Bits.UserWrite || admin || writeEntitled || varEntitled) {
+			if (systemGuid) {
+				if (allowList) {
+					if (!systemAllow) {
+						DEBUG_ERROR("Allowed delete to system region when NOT entitled for %s\n", varName);
+					}
+				} else if (varEntitled) {
+					DEBUG_INFO("Allowed delete to system region using variable specific entitlement for %s\n", varName);
+				} else if (!systemAllow) {
+					DEBUG_ERROR("Not entitled for system region deletes for %s\n", varName);
+					break;
+				}
+			}
+			ok = true;
+		}
+		break;
+
+	case kIONVRAMOperationInit:
+		break;
 	}
-  if (ok) {
-    ok = _ofDict->setObject(_registryPropertiesKey, data);
-    if (ok)
-      _ofImageDirty = true;
-  }
-  data->release();
 
-  return ok ? kIOReturnSuccess : kIOReturnNoMemory;
+exit:
+	DEBUG_INFO("Permission for %s of %s %s: I=%d kern=%d, adm=%d, wE=%d, rE=%d, sG=%d, sEd=%d, sIEd=%d, sRHA=%d, UW=%d, vE=%d\n", getNVRAMOpString(op), varName, ok ? "granted" : "denied",
+	    gInternalBuild, kernel, admin, writeEntitled, readEntitled, systemGuid, systemEntitled, systemInternalEntitled, systemReadHiddenAllow, perm.Bits.UserWrite, varEntitled);
+
+	return ok;
 }
 
-bool IODTNVRAM::safeToSync(void)
+static bool
+verifyPermission(IONVRAMOperation op, const OSSymbol *canonicalKey, const bool systemActive)
 {
-    AbsoluteTime delta;
-    UInt64       delta_ns;
-    SInt32       delta_secs;
-	
-	// delta interval went by
-	clock_get_uptime(&delta);
-	
-    // Figure it in seconds.
-    absolutetime_to_nanoseconds(delta, &delta_ns);
-    delta_secs = (SInt32)(delta_ns / NSEC_PER_SEC);
+	const char *varName;
+	uuid_t varGuid;
 
-	if ((delta_secs > (_lastDeviceSync + MIN_SYNC_NOW_INTERVAL)) || _freshInterval)
-	{
-		_lastDeviceSync = delta_secs;
-		_freshInterval = FALSE;
-		return TRUE;
+	parseVariableName(canonicalKey->getCStringNoCopy(), &varGuid, &varName);
+
+	return verifyPermission(op, varGuid, varName, systemActive);
+}
+
+static bool
+skipKey(const OSSymbol *aKey)
+{
+	return aKey->isEqualTo(kIORegistryEntryAllowableSetPropertiesKey) ||
+	       aKey->isEqualTo(kIORegistryEntryDefaultLockingSetPropertiesKey) ||
+	       aKey->isEqualTo(kIOClassNameOverrideKey) ||
+	       aKey->isEqualTo(kIOBSDNameKey) ||
+	       aKey->isEqualTo(kIOBSDNamesKey) ||
+	       aKey->isEqualTo(kIOBSDMajorKey) ||
+	       aKey->isEqualTo(kIOBSDMinorKey) ||
+	       aKey->isEqualTo(kIOBSDUnitKey) ||
+	       aKey->isEqualTo(kIOUserServicePropertiesKey) ||
+	       aKey->isEqualTo(kIOExclaveAssignedKey) ||
+	       aKey->isEqualTo(kIOMatchCategoryKey) ||
+	       aKey->isEqualTo(kIOBusyInterest);
+}
+
+static OSSharedPtr<const OSSymbol>
+keyWithGuidAndCString(const uuid_t guid, const char * cstring)
+{
+	size_t                      length;
+	OSSharedPtr<const OSSymbol> symbolObj;
+	char                        *canonicalString;
+
+	length = sizeof(uuid_string_t) - 1 + sizeof(':') + strlen(cstring) + 1;
+
+	canonicalString = (char *) IOMallocData(length);
+	if (canonicalString == nullptr) {
+		return NULL;
 	}
 
-	return FALSE;
+	uuid_unparse(guid, *((uuid_string_t*)canonicalString));
+	canonicalString[sizeof(uuid_string_t) - 1] = ':';
+
+	strlcpy(&canonicalString[sizeof(uuid_string_t)], cstring, length - sizeof(uuid_string_t));
+
+	symbolObj = OSSymbol::withCString(canonicalString);
+	IOFreeData(canonicalString, length);
+
+	return symbolObj;
+}
+
+static void
+dumpDict(OSSharedPtr<OSDictionary> dict)
+{
+	const OSSymbol                    *key;
+	OSSharedPtr<OSCollectionIterator> iter;
+	unsigned int                      count = 0;
+
+	iter = OSCollectionIterator::withCollection(dict.get());
+	require_action(iter, exit, DEBUG_ERROR("Failed to create iterator\n"));
+
+	DEBUG_INFO("Dumping dict...\n");
+	while ((key = OSDynamicCast(OSSymbol, iter->getNextObject()))) {
+		count++;
+		DEBUG_INFO("%u: %s\n", count, key->getCStringNoCopy());
+	}
+exit:
+	return;
+}
+
+// ************************** IODTNVRAMPlatformNotifier ****************************
+// private IOService based class for passing notifications to IODTNVRAM
+
+class IODTNVRAMPlatformNotifier : public IOService
+{
+	OSDeclareDefaultStructors(IODTNVRAMPlatformNotifier)
+private:
+	IODTNVRAM *_provider;
+
+public:
+	bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
+
+	virtual IOReturn callPlatformFunction( const OSSymbol * functionName,
+	    bool waitForFunction,
+	    void *param1, void *param2,
+	    void *param3, void *param4 ) APPLE_KEXT_OVERRIDE;
+};
+
+OSDefineMetaClassAndStructors(IODTNVRAMPlatformNotifier, IOService)
+
+bool
+IODTNVRAMPlatformNotifier::start(IOService * provider)
+{
+	OSSharedPtr<OSSerializer> serializer;
+	OSSharedPtr<OSNumber> value = OSNumber::withNumber(1000, 32);
+
+	_provider = OSDynamicCast(IODTNVRAM, provider);
+	require(_provider != nullptr, error);
+
+	setProperty(gIOPlatformWakeActionKey, value.get());
+
+	require(super::start(provider), error);
+
+	registerService();
+
+	return true;
+
+error:
+	stop(provider);
+
+	return false;
+}
+
+#include <IOKit/IOHibernatePrivate.h>
+#include <IOKit/pwr_mgt/RootDomain.h>
+static const OSSharedPtr<const OSSymbol> gIOHibernateStateKey = OSSymbol::withCString(kIOHibernateStateKey);
+
+static uint32_t
+hibernateState(void)
+{
+	OSSharedPtr<OSData> data = OSDynamicPtrCast<OSData>(IOService::getPMRootDomain()->copyProperty(gIOHibernateStateKey.get()->getCStringNoCopy()));
+	uint32_t hibernateState = 0;
+	if ((data != NULL) && (data->getLength() == sizeof(hibernateState))) {
+		memcpy(&hibernateState, data->getBytesNoCopy(), sizeof(hibernateState));
+	}
+	return hibernateState;
+}
+
+IOReturn
+IODTNVRAMPlatformNotifier::callPlatformFunction( const OSSymbol * functionName,
+    bool waitForFunction,
+    void *param1, void *param2,
+    void *param3, void *param4 )
+{
+	if ((functionName == gIOPlatformWakeActionKey) &&
+	    (hibernateState() == kIOHibernateStateWakingFromHibernate)) {
+		DEBUG_INFO("waking from hibernate\n");
+		_provider->reload();
+		return kIOReturnSuccess;
+	}
+
+	return super::callPlatformFunction(functionName, waitForFunction, param1, param2, param3, param4);
+}
+
+
+// ************************** IODTNVRAMDiags ****************************
+// private IOService based class for passing notifications to IODTNVRAM
+#define kIODTNVRAMDiagsStatsKey   "Stats"
+#define kIODTNVRAMDiagsInitKey    "Init"
+#define kIODTNVRAMDiagsReadKey    "Read"
+#define kIODTNVRAMDiagsWriteKey   "Write"
+#define kIODTNVRAMDiagsDeleteKey  "Delete"
+#define kIODTNVRAMDiagsNameKey    "Name"
+#define kIODTNVRAMDiagsSizeKey    "Size"
+#define kIODTNVRAMDiagsPresentKey "Present"
+
+// private IOService based class for publishing diagnostic info for IODTNVRAM
+class IODTNVRAMDiags : public IOService
+{
+	OSDeclareDefaultStructors(IODTNVRAMDiags)
+private:
+	IODTNVRAM                 *_provider;
+	IORWLock                  *_diagLock;
+	OSSharedPtr<OSDictionary> _stats;
+
+	bool serializeStats(void *, OSSerialize * serializer);
+
+public:
+	bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
+	void logVariable(NVRAMPartitionType region, IONVRAMOperation op, const char *name, void *data);
+};
+
+OSDefineMetaClassAndStructors(IODTNVRAMDiags, IOService)
+
+bool
+IODTNVRAMDiags::start(IOService * provider)
+{
+	OSSharedPtr<OSSerializer> serializer;
+
+	_provider = OSDynamicCast(IODTNVRAM, provider);
+	require(_provider != nullptr, error);
+
+	require(super::start(provider), error);
+
+	_diagLock = IORWLockAlloc();
+	require(_diagLock != nullptr, error);
+
+	_stats = OSDictionary::withCapacity(1);
+	require(_stats != nullptr, error);
+
+	serializer = OSSerializer::forTarget(this, OSMemberFunctionCast(OSSerializerCallback, this, &IODTNVRAMDiags::serializeStats));
+	require(serializer != nullptr, error);
+
+	setProperty(kIODTNVRAMDiagsStatsKey, serializer.get());
+
+	registerService();
+
+	return true;
+
+error:
+	stop(provider);
+
+	return false;
+}
+
+void
+IODTNVRAMDiags::logVariable(NVRAMPartitionType region, IONVRAMOperation op, const char *name, void *data)
+{
+	// "Stats"        : OSDictionary
+	// - "XX:varName" : OSDictionary, XX is the region value prefix to distinguish which dictionary the variable is in
+	//   - "Init"     : OSBoolean True/present if variable present at initialization
+	//   - "Read"     : OSNumber count
+	//   - "Write"    : OSNumber count
+	//   - "Delete"   : OSNumber count
+	//   - "Size"     : OSNumber size, latest size from either init or write
+	//   - "Present"  : OSBoolean True/False if variable is present or not
+	char                      *entryKey;
+	size_t                    entryKeySize;
+	OSSharedPtr<OSDictionary> existingEntry;
+	OSSharedPtr<OSNumber>     currentCount;
+	OSSharedPtr<OSNumber>     varSize;
+	const char                *opCountKey = nullptr;
+
+	entryKeySize = strlen("XX:") + strlen(name) +  1;
+	entryKey = IONewData(char, entryKeySize);
+	require(entryKey, exit);
+
+	snprintf(entryKey, entryKeySize, "%02X:%s", region, name);
+
+	NVRAMWRITELOCK(_diagLock);
+	existingEntry.reset(OSDynamicCast(OSDictionary, _stats->getObject(entryKey)), OSRetain);
+
+	if (existingEntry == nullptr) {
+		existingEntry = OSDictionary::withCapacity(4);
+	}
+
+	switch (op) {
+	case kIONVRAMOperationRead:
+		opCountKey = kIODTNVRAMDiagsReadKey;
+		if (existingEntry->getObject(kIODTNVRAMDiagsPresentKey) == nullptr) {
+			existingEntry->setObject(kIODTNVRAMDiagsPresentKey, kOSBooleanFalse);
+		}
+		break;
+	case kIONVRAMOperationWrite:
+		opCountKey = kIODTNVRAMDiagsWriteKey;
+		varSize = OSNumber::withNumber((size_t)data, 64);
+		existingEntry->setObject(kIODTNVRAMDiagsSizeKey, varSize);
+		existingEntry->setObject(kIODTNVRAMDiagsPresentKey, kOSBooleanTrue);
+		break;
+	case kIONVRAMOperationDelete:
+	case kIONVRAMOperationObliterate:
+	case kIONVRAMOperationReset:
+		opCountKey = kIODTNVRAMDiagsDeleteKey;
+		existingEntry->setObject(kIODTNVRAMDiagsPresentKey, kOSBooleanFalse);
+		break;
+	case kIONVRAMOperationInit:
+		varSize = OSNumber::withNumber((size_t)data, 64);
+		existingEntry->setObject(kIODTNVRAMDiagsInitKey, varSize);
+		existingEntry->setObject(kIODTNVRAMDiagsSizeKey, varSize);
+		existingEntry->setObject(kIODTNVRAMDiagsPresentKey, kOSBooleanTrue);
+		break;
+	default:
+		goto unlock;
+	}
+
+	if (opCountKey) {
+		currentCount.reset(OSDynamicCast(OSNumber, existingEntry->getObject(opCountKey)), OSRetain);
+
+		if (currentCount == nullptr) {
+			currentCount = OSNumber::withNumber(1, 64);
+		} else {
+			currentCount->addValue(1);
+		}
+
+		existingEntry->setObject(opCountKey, currentCount);
+	}
+
+	_stats->setObject(entryKey, existingEntry);
+
+unlock:
+	NVRAMRWUNLOCK(_diagLock);
+
+exit:
+	IODeleteData(entryKey, char, entryKeySize);
+
+	return;
+}
+
+bool
+IODTNVRAMDiags::serializeStats(void *, OSSerialize * serializer)
+{
+	bool ok;
+
+	NVRAMREADLOCK(_diagLock);
+	ok = _stats->serialize(serializer);
+	NVRAMRWUNLOCK(_diagLock);
+
+	return ok;
+}
+
+// ************************** IODTNVRAMVariables ****************************
+
+// private IOService based class for publishing distinct dictionary properties on
+// for easy ioreg access since the serializeProperties call is overloaded and is used
+// as variable access
+class IODTNVRAMVariables : public IOService
+{
+	OSDeclareDefaultStructors(IODTNVRAMVariables)
+private:
+	IODTNVRAM        *_provider;
+	uuid_t           _guid;
+	bool             _systemActive;
+
+public:
+	bool                    init(const uuid_t guid, const bool systemActive);
+	virtual bool            start(IOService * provider) APPLE_KEXT_OVERRIDE;
+
+	virtual bool            serializeProperties(OSSerialize *s) const APPLE_KEXT_OVERRIDE;
+	virtual OSPtr<OSObject> copyProperty(const OSSymbol *aKey) const APPLE_KEXT_OVERRIDE;
+	virtual OSObject        *getProperty(const OSSymbol *aKey) const APPLE_KEXT_OVERRIDE;
+	virtual bool            setProperty(const OSSymbol *aKey, OSObject *anObject) APPLE_KEXT_OVERRIDE;
+	virtual IOReturn        setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+	virtual void            removeProperty(const OSSymbol *aKey) APPLE_KEXT_OVERRIDE;
+};
+
+OSDefineMetaClassAndStructors(IODTNVRAMVariables, IOService)
+
+bool
+IODTNVRAMVariables::init(const uuid_t guid, const bool systemActive)
+{
+	require(super::init(), fail);
+
+	uuid_copy(_guid, guid);
+	_systemActive = systemActive;
+
+	return true;
+
+fail:
+	return false;
+}
+
+bool
+IODTNVRAMVariables::start(IOService * provider)
+{
+	_provider = OSDynamicCast(IODTNVRAM, provider);
+	if (_provider == nullptr) {
+		goto error;
+	}
+
+	if (!super::start(provider)) {
+		goto error;
+	}
+
+	registerService();
+
+	return true;
+
+error:
+	stop(provider);
+
+	return false;
+}
+
+bool
+IODTNVRAMVariables::serializeProperties(OSSerialize *s) const
+{
+	const OSSymbol                    *key;
+	OSSharedPtr<OSDictionary>         dict;
+	OSSharedPtr<OSCollectionIterator> iter;
+	OSSharedPtr<OSDictionary>         localVariables;
+	bool                              ok = false;
+	IOReturn                          status;
+
+	status = _provider->getVarDict(localVariables);
+	require_noerr_action(status, exit, DEBUG_ERROR("Failed to get variable dictionary\n"));
+
+	dict = OSDictionary::withCapacity(localVariables->getCount());
+	require_action(dict, exit, DEBUG_ERROR("Failed to create dict\n"));
+
+	iter = OSCollectionIterator::withCollection(localVariables.get());
+	require_action(iter, exit, DEBUG_ERROR("Failed to create iterator\n"));
+
+	while ((key = OSDynamicCast(OSSymbol, iter->getNextObject()))) {
+		if (verifyPermission(kIONVRAMOperationRead, key, _systemActive)) {
+			uuid_t guid;
+			const char *name;
+
+			parseVariableName(key, &guid, &name);
+
+			if (uuid_compare(_guid, guid) == 0) {
+				OSSharedPtr<const OSSymbol> sym = OSSymbol::withCString(name);
+				dict->setObject(sym.get(), localVariables->getObject(key));
+			}
+		}
+	}
+
+	ok = dict->serialize(s);
+
+exit:
+	DEBUG_INFO("ok=%d\n", ok);
+	return ok;
+}
+
+OSPtr<OSObject>
+IODTNVRAMVariables::copyProperty(const OSSymbol *aKey) const
+{
+	if (_provider && !skipKey(aKey)) {
+		DEBUG_INFO("aKey=%s\n", aKey->getCStringNoCopy());
+
+		return _provider->copyPropertyWithGUIDAndName(_guid, aKey->getCStringNoCopy());
+	} else {
+		return nullptr;
+	}
+}
+
+OSObject *
+IODTNVRAMVariables::getProperty(const OSSymbol *aKey) const
+{
+	OSSharedPtr<OSObject> theObject = copyProperty(aKey);
+
+	return theObject.get();
+}
+
+bool
+IODTNVRAMVariables::setProperty(const OSSymbol *aKey, OSObject *anObject)
+{
+	if (_provider) {
+		return _provider->setPropertyWithGUIDAndName(_guid, aKey->getCStringNoCopy(), anObject) == kIOReturnSuccess;
+	} else {
+		return false;
+	}
+}
+
+IOReturn
+IODTNVRAMVariables::setProperties(OSObject *properties)
+{
+	IOReturn                          ret = kIOReturnSuccess;
+	OSObject                          *object;
+	const OSSymbol                    *key;
+	OSDictionary                      *dict;
+	OSSharedPtr<OSCollectionIterator> iter;
+
+	dict = OSDynamicCast(OSDictionary, properties);
+	if (dict == nullptr) {
+		DEBUG_ERROR("Not a dictionary\n");
+		return kIOReturnBadArgument;
+	}
+
+	iter = OSCollectionIterator::withCollection(dict);
+	if (iter == nullptr) {
+		DEBUG_ERROR("Couldn't create iterator\n");
+		return kIOReturnBadArgument;
+	}
+
+	while (ret == kIOReturnSuccess) {
+		key = OSDynamicCast(OSSymbol, iter->getNextObject());
+		if (key == nullptr) {
+			break;
+		}
+
+		object = dict->getObject(key);
+		if (object == nullptr) {
+			continue;
+		}
+
+		ret = _provider->setPropertyWithGUIDAndName(_guid, key->getCStringNoCopy(), object);
+	}
+
+	DEBUG_INFO("ret=%#08x\n", ret);
+
+	return ret;
+}
+
+void
+IODTNVRAMVariables::removeProperty(const OSSymbol *aKey)
+{
+	_provider->removePropertyWithGUIDAndName(_guid, aKey->getCStringNoCopy());
+}
+
+// ************************** Format Handlers ***************************
+class IODTNVRAMFormatHandler
+{
+protected:
+	uint32_t _bankSize;
+	uint32_t _bankCount;
+	uint32_t _currentBank;
+
+public:
+	virtual
+	~IODTNVRAMFormatHandler();
+	virtual bool     getNVRAMProperties(void);
+	virtual IOReturn unserializeVariables(void) = 0;
+	virtual IOReturn setVariable(const uuid_t varGuid, const char *variableName, OSObject *object) = 0;
+	virtual bool     setController(IONVRAMController *_nvramController) = 0;
+	virtual IOReturn sync(void) = 0;
+	virtual IOReturn flush(const uuid_t guid, IONVRAMOperation op) = 0;
+	virtual void     reload(void) = 0;
+	virtual uint32_t getGeneration(void) const = 0;
+	virtual uint32_t getVersion(void) const = 0;
+	virtual uint32_t getSystemUsed(void) const = 0;
+	virtual uint32_t getCommonUsed(void) const = 0;
+	virtual bool     getSystemPartitionActive(void) const = 0;
+	virtual IOReturn getVarDict(OSSharedPtr<OSDictionary> &varDictCopy) = 0;
+};
+
+IODTNVRAMFormatHandler::~IODTNVRAMFormatHandler()
+{
+}
+
+bool
+IODTNVRAMFormatHandler::getNVRAMProperties()
+{
+	bool                         ok    = false;
+	OSSharedPtr<IORegistryEntry> entry;
+	OSSharedPtr<OSObject>        prop;
+	OSData *                     data;
+
+	entry = IORegistryEntry::fromPath("/chosen", gIODTPlane);
+	require_action(entry, exit, DEBUG_ERROR("Unable to find chosen node\n"));
+
+	prop = entry->copyProperty(kNVRAMBankSizeKey);
+	require_action(prop, exit, DEBUG_ERROR("Unable to find %s property\n", kNVRAMBankSizeKey));
+
+	data = OSDynamicCast(OSData, prop.get());
+	require(data, exit);
+
+	_bankSize = *((uint32_t *)data->getBytesNoCopy());
+
+	prop = entry->copyProperty(kNVRAMBankCountKey);
+	require_action(prop, exit, DEBUG_ERROR("Unable to find %s property\n", kNVRAMBankCountKey));
+
+	data = OSDynamicCast(OSData, prop.get());
+	require(data, exit);
+
+	_bankCount = *((uint32_t *)data->getBytesNoCopy());
+
+	prop = entry->copyProperty(kNVRAMCurrentBankKey);
+	require_action(prop, exit, DEBUG_ERROR("Unable to find %s property\n", kNVRAMCurrentBankKey));
+
+	data = OSDynamicCast(OSData, prop.get());
+	require(data, exit);
+
+	_currentBank = *((uint32_t *)data->getBytesNoCopy());
+
+	ok = true;
+
+	DEBUG_ALWAYS("_bankSize=%#X, _bankCount=%#X, _currentBank=%#X\n", _bankSize, _bankCount, _currentBank);
+
+exit:
+	return ok;
+}
+
+#include "IONVRAMCHRPHandler.cpp"
+
+#include "IONVRAMV3Handler.cpp"
+
+// **************************** IODTNVRAM *********************************
+
+bool
+IODTNVRAM::init(IORegistryEntry *old, const IORegistryPlane *plane)
+{
+	OSSharedPtr<OSDictionary> dict;
+
+	DEBUG_INFO("...\n");
+	require(super::init(old, plane), fail);
+	x86Device = false;
+
+#if CONFIG_CSR && XNU_TARGET_OS_OSX
+	gInternalBuild = (csr_check(CSR_ALLOW_APPLE_INTERNAL) == 0);
+#elif defined(DEBUG) || defined(DEVELOPMENT)
+	gInternalBuild = true;
+#endif
+	DEBUG_INFO("gInternalBuild = %d\n", gInternalBuild);
+
+	// Clear the IORegistryEntry property table
+	dict =  OSDictionary::withCapacity(1);
+	require(dict != nullptr, fail);
+
+	setPropertyTable(dict.get());
+	dict.reset();
+
+	return true;
+
+fail:
+	return false;
+}
+
+bool
+IODTNVRAM::start(IOService *provider)
+{
+	OSSharedPtr<OSNumber> version;
+
+	DEBUG_ALWAYS("...\n");
+
+	require(super::start(provider), fail);
+
+	// Check if our overridden init function was called
+	// If not, skip any additional initialization being done here.
+	// This is not an error we just need to successfully exit this function to allow
+	// AppleEFIRuntime to proceed and take over operation
+	require_action(x86Device == false, no_common, DEBUG_INFO("x86 init\n"));
+
+	_diags = new IODTNVRAMDiags;
+	if (!_diags || !_diags->init()) {
+		DEBUG_ERROR("Unable to create/init the diags service\n");
+		OSSafeReleaseNULL(_diags);
+		goto fail;
+	}
+
+	if (!_diags->attach(this)) {
+		DEBUG_ERROR("Unable to attach the diags service!\n");
+		OSSafeReleaseNULL(_diags);
+		goto fail;
+	}
+
+	if (!_diags->start(this)) {
+		DEBUG_ERROR("Unable to start the diags service!\n");
+		_diags->detach(this);
+		OSSafeReleaseNULL(_diags);
+		goto fail;
+	}
+
+	_notifier = new IODTNVRAMPlatformNotifier;
+	if (!_notifier || !_notifier->init()) {
+		DEBUG_ERROR("Unable to create/init the notifier service\n");
+		OSSafeReleaseNULL(_notifier);
+		goto fail;
+	}
+
+	if (!_notifier->attach(this)) {
+		DEBUG_ERROR("Unable to attach the notifier service!\n");
+		OSSafeReleaseNULL(_notifier);
+		goto fail;
+	}
+
+	if (!_notifier->start(this)) {
+		DEBUG_ERROR("Unable to start the notifier service!\n");
+		_notifier->detach(this);
+		OSSafeReleaseNULL(_notifier);
+		goto fail;
+	}
+
+	// This will load the proxied variable data which will call back into
+	// IODTNVRAM for the variable sets which will also update the system/common services
+	initImageFormat();
+
+	version = OSNumber::withNumber(_format->getVersion(), 32);
+	_diags->setProperty(kCurrentNVRAMVersionKey, version.get());
+
+	if (_format->getSystemUsed()) {
+		_systemService = new IODTNVRAMVariables;
+
+		if (!_systemService || !_systemService->init(gAppleSystemVariableGuid, _format->getSystemPartitionActive())) {
+			DEBUG_ERROR("Unable to start the system service!\n");
+			OSSafeReleaseNULL(_systemService);
+			goto no_system;
+		}
+
+		_systemService->setName("options-system");
+
+		if (!_systemService->attach(this)) {
+			DEBUG_ERROR("Unable to attach the system service!\n");
+			OSSafeReleaseNULL(_systemService);
+			goto no_system;
+		}
+
+		if (!_systemService->start(this)) {
+			DEBUG_ERROR("Unable to start the system service!\n");
+			_systemService->detach(this);
+			OSSafeReleaseNULL(_systemService);
+			goto no_system;
+		}
+	}
+
+no_system:
+	_commonService = new IODTNVRAMVariables;
+
+	if (!_commonService || !_commonService->init(gAppleNVRAMGuid, _format->getSystemPartitionActive())) {
+		DEBUG_ERROR("Unable to start the common service!\n");
+		OSSafeReleaseNULL(_commonService);
+		goto no_common;
+	}
+
+	_commonService->setName("options-common");
+
+	if (!_commonService->attach(this)) {
+		DEBUG_ERROR("Unable to attach the common service!\n");
+		OSSafeReleaseNULL(_commonService);
+		goto no_common;
+	}
+
+	if (!_commonService->start(this)) {
+		DEBUG_ERROR("Unable to start the common service!\n");
+		_commonService->detach(this);
+		OSSafeReleaseNULL(_commonService);
+		goto no_common;
+	}
+
+no_common:
+	return true;
+
+fail:
+	stop(provider);
+	return false;
+}
+
+void
+IODTNVRAM::initImageFormat(void)
+{
+	OSSharedPtr<IORegistryEntry> entry;
+	OSSharedPtr<OSObject>        prop;
+	const char                   *proxyDataKey = "nvram-proxy-data";
+	const char                   *bankSizeKey = "nvram-bank-size";
+	OSData                       *data = nullptr;
+	uint32_t                     size = 0;
+	const uint8_t                *image = nullptr;
+	OSSharedPtr<OSDictionary>    localVariables;
+	IOReturn                     status;
+
+	entry = IORegistryEntry::fromPath("/chosen", gIODTPlane);
+
+	require(entry != nullptr, skip);
+
+	prop = entry->copyProperty(bankSizeKey);
+	require(prop != nullptr, skip);
+
+	data = OSDynamicCast(OSData, prop.get());
+	require(data != nullptr, skip);
+
+	size = *((uint32_t*)data->getBytesNoCopy());
+	require_action(size != 0, skip, panic("NVRAM size is 0 bytes, possibly due to bad config with iBoot + xnu mismatch"));
+	DEBUG_ALWAYS("NVRAM size is %u bytes\n", size);
+
+	prop = entry->copyProperty(proxyDataKey);
+	require(prop != nullptr, skip);
+
+	data = OSDynamicCast(OSData, prop.get());
+	require_action(data != nullptr, skip, DEBUG_ERROR("No proxy data!\n"));
+
+	image = (const uint8_t *)data->getBytesNoCopy();
+
+skip:
+	if (IONVRAMV3Handler::isValidImage(image, size)) {
+		_format = IONVRAMV3Handler::init(this, image, size);
+		require_action(_format, skip, panic("IONVRAMV3Handler creation failed\n"));
+	} else {
+		_format = IONVRAMCHRPHandler::init(this, image, size);
+		require_action(_format, skip, panic("IONVRAMCHRPHandler creation failed\n"));
+	}
+
+	status = _format->unserializeVariables();
+	verify_noerr_action(status, DEBUG_ERROR("Failed to unserialize variables, status=%08x\n", status));
+
+	status = _format->getVarDict(localVariables);
+	verify_noerr_action(status, DEBUG_ERROR("Failed to get variable dictionary, status=%08x\n", status));
+
+	dumpDict(localVariables);
+
+#if defined(RELEASE)
+	if (entry != nullptr) {
+		entry->removeProperty(proxyDataKey);
+	}
+#endif
+
+	_lastDeviceSync = 0;
+	_freshInterval = true;
+}
+
+void
+IODTNVRAM::registerNVRAMController(IONVRAMController *controller)
+{
+	DEBUG_INFO("setting controller\n");
+
+	require_action(_format != nullptr, exit, DEBUG_ERROR("Handler not initialized yet\n"));
+	_format->setController(controller);
+
+exit:
+	return;
+}
+
+bool
+IODTNVRAM::safeToSync(void)
+{
+	AbsoluteTime delta;
+	UInt64       delta_ns;
+	SInt32       delta_secs;
+
+	// delta interval went by
+	clock_get_uptime(&delta);
+
+	// Figure it in seconds.
+	absolutetime_to_nanoseconds(delta, &delta_ns);
+	delta_secs = (SInt32)(delta_ns / NSEC_PER_SEC);
+
+	if ((delta_secs > (_lastDeviceSync + MIN_SYNC_NOW_INTERVAL)) || _freshInterval) {
+		_lastDeviceSync = delta_secs;
+		_freshInterval = false;
+		return true;
+	}
+
+	return false;
+}
+
+IOReturn
+IODTNVRAM::syncInternal(bool rateLimit)
+{
+	IOReturn ret = kIOReturnSuccess;
+
+	DEBUG_INFO("rateLimit=%d\n", rateLimit);
+
+	if (!SAFE_TO_LOCK()) {
+		DEBUG_INFO("cannot lock\n");
+		goto exit;
+	}
+
+	require_action(_format != nullptr, exit, (ret = kIOReturnNotReady, DEBUG_ERROR("Handler not initialized yet\n")));
+
+	// Rate limit requests to sync. Drivers that need this rate limiting will
+	// shadow the data and only write to flash when they get a sync call
+	if (rateLimit) {
+		if (safeToSync() == false) {
+			DEBUG_INFO("safeToSync()=false\n");
+			goto exit;
+		}
+	}
+
+	DEBUG_INFO("Calling sync()\n");
+	record_system_event(SYSTEM_EVENT_TYPE_INFO, SYSTEM_EVENT_SUBSYSTEM_NVRAM, "sync", "triggered");
+
+	ret = _format->sync();
+
+	record_system_event(SYSTEM_EVENT_TYPE_INFO, SYSTEM_EVENT_SUBSYSTEM_NVRAM, "sync", "completed with ret=%08x", ret);
+
+	if (_diags) {
+		OSSharedPtr<OSNumber> generation = OSNumber::withNumber(_format->getGeneration(), 32);
+		_diags->setProperty(kCurrentGenerationCountKey, generation.get());
+	}
+
+exit:
+	return ret;
+}
+
+IOReturn
+IODTNVRAM::sync(void)
+{
+	return syncInternal(false);
+}
+
+void
+IODTNVRAM::reload(void)
+{
+	_format->reload();
+}
+
+IOReturn
+IODTNVRAM::getVarDict(OSSharedPtr<OSDictionary> &varDictCopy)
+{
+	return _format->getVarDict(varDictCopy);
+}
+
+OSPtr<OSDictionary>
+IODTNVRAM::dictionaryWithProperties(void) const
+{
+	const OSSymbol                    *canonicalKey;
+	OSSharedPtr<OSDictionary>         localVarDict, returnDict;
+	OSSharedPtr<OSCollectionIterator> iter;
+	uuid_t                            varGuid;
+	const char *                      varName;
+	IOReturn                          status;
+
+	require_action(_format, exit, DEBUG_ERROR("Handler not initialized yet\n"));
+
+	status = _format->getVarDict(localVarDict);
+	require_noerr_action(status, exit, DEBUG_ERROR("Failed to get variable dictionary\n"));
+
+	returnDict = OSDictionary::withCapacity(localVarDict->getCapacity());
+	require_action(returnDict, exit, DEBUG_ERROR("Failed to create return dict\n"));
+
+	// Copy system entries first if present then copy unique other entries
+	iter = OSCollectionIterator::withCollection(localVarDict.get());
+	require_action(iter, exit, DEBUG_ERROR("Failed to create iterator\n"));
+
+	while ((canonicalKey = OSDynamicCast(OSSymbol, iter->getNextObject()))) {
+		parseVariableName(canonicalKey, &varGuid, &varName);
+
+		if ((uuid_compare(varGuid, gAppleSystemVariableGuid) == 0) &&
+		    verifyPermission(kIONVRAMOperationRead, varGuid, varName, _format->getSystemPartitionActive())) {
+			OSSharedPtr<const OSSymbol> returnKey = OSSymbol::withCString(varName);
+			returnDict->setObject(returnKey.get(), localVarDict->getObject(canonicalKey));
+		}
+	}
+
+	iter.reset();
+
+	iter = OSCollectionIterator::withCollection(localVarDict.get());
+	require_action(iter, exit, DEBUG_ERROR("Failed to create iterator\n"));
+
+	while ((canonicalKey = OSDynamicCast(OSSymbol, iter->getNextObject()))) {
+		parseVariableName(canonicalKey, &varGuid, &varName);
+
+		if (uuid_compare(varGuid, gAppleNVRAMGuid) == 0) {
+			if (returnDict->getObject(varName) != nullptr) {
+				// Skip non uniques
+				continue;
+			}
+
+			if (verifyPermission(kIONVRAMOperationRead, varGuid, varName, _format->getSystemPartitionActive())) {
+				OSSharedPtr<const OSSymbol> returnKey = OSSymbol::withCString(varName);
+				returnDict->setObject(returnKey.get(), localVarDict->getObject(canonicalKey));
+			}
+		}
+	}
+exit:
+	return returnDict;
+}
+
+bool
+IODTNVRAM::serializeProperties(OSSerialize *s) const
+{
+	bool ok = false;
+	OSSharedPtr<OSDictionary> dict;
+
+	dict = dictionaryWithProperties();
+	if (dict) {
+		ok = dict->serialize(s);
+	}
+
+	DEBUG_INFO("ok=%d\n", ok);
+	return ok;
+}
+
+IOReturn
+IODTNVRAM::flushGUID(const uuid_t guid, IONVRAMOperation op)
+{
+	IOReturn ret = kIOReturnSuccess;
+
+	require_action(_format != nullptr, exit, (ret = kIOReturnNotReady, DEBUG_ERROR("Handler not initialized yet\n")));
+
+	if (_format->getSystemPartitionActive() && (uuid_compare(guid, gAppleSystemVariableGuid) == 0)) {
+		ret = _format->flush(guid, op);
+
+		DEBUG_INFO("system variables flushed, ret=%08x\n", ret);
+	} else if (uuid_compare(guid, gAppleNVRAMGuid) == 0) {
+		ret = _format->flush(guid, op);
+
+		DEBUG_INFO("common variables flushed, ret=%08x\n", ret);
+	}
+
+exit:
+	return ret;
+}
+
+bool
+IODTNVRAM::handleSpecialVariables(const char *name, const uuid_t guid, const OSObject *obj, IOReturn *error)
+{
+	IOReturn ret = kIOReturnSuccess;
+	bool special = false;
+
+	// ResetNVRam flushes both regions in one call
+	// Obliterate can flush either separately
+	if (strcmp(name, "ObliterateNVRam") == 0) {
+		special = true;
+		ret = flushGUID(guid, kIONVRAMOperationObliterate);
+	} else if (strcmp(name, "ResetNVRam") == 0) {
+		special = true;
+		ret = flushGUID(gAppleSystemVariableGuid, kIONVRAMOperationReset);
+
+		if (ret != kIOReturnSuccess) {
+			goto exit;
+		}
+
+		ret = flushGUID(gAppleNVRAMGuid, kIONVRAMOperationReset);
+	}
+
+exit:
+	if (error) {
+		*error = ret;
+	}
+
+	return special;
+}
+
+OSSharedPtr<OSObject>
+IODTNVRAM::copyPropertyWithGUIDAndName(const uuid_t guid, const char *name) const
+{
+	OSSharedPtr<const OSSymbol> canonicalKey;
+	OSSharedPtr<OSObject>       theObject;
+	uuid_t                      newGuid;
+	OSSharedPtr<OSDictionary>   localVarDict;
+	IOReturn                    status;
+
+	require_action(_format, exit, DEBUG_ERROR("Handler not initialized yet\n"));
+
+	status = _format->getVarDict(localVarDict);
+	require_noerr_action(status, exit, DEBUG_ERROR("Failed to get variable dictionary\n"));
+
+	if (!verifyPermission(kIONVRAMOperationRead, guid, name, _format->getSystemPartitionActive())) {
+		DEBUG_INFO("Not privileged\n");
+		goto exit;
+	}
+
+	translateGUID(guid, name, newGuid, _format->getSystemPartitionActive());
+
+	canonicalKey = keyWithGuidAndCString(newGuid, name);
+
+	theObject.reset(localVarDict->getObject(canonicalKey.get()), OSRetain);
+
+	if (_diags) {
+		_diags->logVariable(getPartitionTypeForGUID(newGuid), kIONVRAMOperationRead, name, NULL);
+	}
+
+	if (theObject != nullptr) {
+		DEBUG_INFO("%s has object\n", canonicalKey.get()->getCStringNoCopy());
+	} else {
+		DEBUG_INFO("%s no entry\n", canonicalKey.get()->getCStringNoCopy());
+	}
+
+exit:
+	return theObject;
+}
+
+OSSharedPtr<OSObject>
+IODTNVRAM::copyProperty(const OSSymbol *aKey) const
+{
+	const char            *variableName;
+	uuid_t                varGuid;
+
+	if (skipKey(aKey)) {
+		return nullptr;
+	}
+	DEBUG_INFO("aKey=%s\n", aKey->getCStringNoCopy());
+
+	parseVariableName(aKey->getCStringNoCopy(), &varGuid, &variableName);
+
+	return copyPropertyWithGUIDAndName(varGuid, variableName);
+}
+
+OSSharedPtr<OSObject>
+IODTNVRAM::copyProperty(const char *aKey) const
+{
+	OSSharedPtr<const OSSymbol> keySymbol;
+	OSSharedPtr<OSObject>       theObject;
+
+	keySymbol = OSSymbol::withCString(aKey);
+	if (keySymbol != nullptr) {
+		theObject = copyProperty(keySymbol.get());
+	}
+
+	return theObject;
+}
+
+OSObject *
+IODTNVRAM::getProperty(const OSSymbol *aKey) const
+{
+	// The shared pointer gets released at the end of the function,
+	// and returns a view into theObject.
+	OSSharedPtr<OSObject> theObject = copyProperty(aKey);
+
+	return theObject.get();
+}
+
+OSObject *
+IODTNVRAM::getProperty(const char *aKey) const
+{
+	// The shared pointer gets released at the end of the function,
+	// and returns a view into theObject.
+	OSSharedPtr<OSObject> theObject = copyProperty(aKey);
+
+	return theObject.get();
+}
+
+IOReturn
+IODTNVRAM::setPropertyWithGUIDAndName(const uuid_t guid, const char *name, OSObject *anObject)
+{
+	IOReturn              ret = kIOReturnSuccess;
+	bool                  remove = false;
+	OSString              *tmpString = nullptr;
+	OSSharedPtr<OSObject> propObject;
+	OSSharedPtr<OSObject> sharedObject(anObject, OSRetain);
+	bool                  deletePropertyKey, syncNowPropertyKey, forceSyncNowPropertyKey, deletePropertyKeyWRet;
+	bool                  ok;
+	size_t                propDataSize = 0;
+	uuid_t                newGuid;
+
+	require_action(_format != nullptr, exit, (ret = kIOReturnNotReady, DEBUG_ERROR("Handler not initialized yet\n")));
+
+	deletePropertyKey = strncmp(name, kIONVRAMDeletePropertyKey, sizeof(kIONVRAMDeletePropertyKey)) == 0;
+	deletePropertyKeyWRet = strncmp(name, kIONVRAMDeletePropertyKeyWRet, sizeof(kIONVRAMDeletePropertyKeyWRet)) == 0;
+	syncNowPropertyKey = strncmp(name, kIONVRAMSyncNowPropertyKey, sizeof(kIONVRAMSyncNowPropertyKey)) == 0;
+	forceSyncNowPropertyKey = strncmp(name, kIONVRAMForceSyncNowPropertyKey, sizeof(kIONVRAMForceSyncNowPropertyKey)) == 0;
+
+	if (deletePropertyKey || deletePropertyKeyWRet) {
+		tmpString = OSDynamicCast(OSString, anObject);
+		if (tmpString != nullptr) {
+			const char *variableName;
+			uuid_t     valueVarGuid;
+			bool       guidProvided;
+			IOReturn   removeRet;
+
+			guidProvided = parseVariableName(tmpString->getCStringNoCopy(), &valueVarGuid, &variableName);
+
+			// nvram tool will provide a "nvram -d var" or "nvram -d guid:var" as
+			// kIONVRAMDeletePropertyKey=var or kIONVRAMDeletePropertyKey=guid:var
+			// that will come into this function as (gAppleNVRAMGuid, varname, nullptr)
+			// if we provide the "-z" flag to the nvram tool this function will come in as
+			// (gAppleSystemVariableGuid, varname, nullptr). We are reparsing the value string,
+			// if there is a GUID provided with the value then use that GUID otherwise use the
+			// guid that was provided via the node selection or default.
+			if (guidProvided == false) {
+				DEBUG_INFO("Removing with API provided GUID\n");
+				removeRet = removePropertyWithGUIDAndName(guid, variableName);
+			} else {
+				DEBUG_INFO("Removing with value provided GUID\n");
+				removeRet = removePropertyWithGUIDAndName(valueVarGuid, variableName);
+			}
+			if (deletePropertyKeyWRet) {
+				ret = removeRet;
+			}
+			DEBUG_INFO("%s found, removeRet=%#08x\n", deletePropertyKeyWRet ? "deletePropertyKeyWRet" : "deletePropertyKey", removeRet);
+		} else {
+			DEBUG_INFO("%s value needs to be an OSString\n", deletePropertyKeyWRet ? "deletePropertyKeyWRet" : "deletePropertyKey");
+			ret = kIOReturnError;
+		}
+		goto exit;
+	} else if (syncNowPropertyKey || forceSyncNowPropertyKey) {
+		tmpString = OSDynamicCast(OSString, anObject);
+		DEBUG_INFO("NVRAM sync key %s found\n", name);
+		if (tmpString != nullptr) {
+			// We still want to throttle NVRAM commit rate for SyncNow. ForceSyncNow is provided as a really big hammer.
+			ret = syncInternal(syncNowPropertyKey);
+		} else {
+			DEBUG_INFO("%s value needs to be an OSString\n", name);
+			ret = kIOReturnError;
+		}
+		goto exit;
+	}
+
+	if (!verifyPermission(kIONVRAMOperationWrite, guid, name, _format->getSystemPartitionActive())) {
+		DEBUG_INFO("Not privileged\n");
+		ret = kIOReturnNotPrivileged;
+		goto exit;
+	}
+
+	// Make sure the object is of the correct type.
+	switch (getVariableType(name)) {
+	case kOFVariableTypeBoolean:
+		propObject = OSDynamicPtrCast<OSBoolean>(sharedObject);
+		if (propObject) {
+			record_system_event(SYSTEM_EVENT_TYPE_INFO, SYSTEM_EVENT_SUBSYSTEM_NVRAM, "write", "%s as bool to %d", name, ((OSBoolean *)propObject.get())->getValue());
+		}
+		break;
+
+	case kOFVariableTypeNumber:
+		propObject = OSDynamicPtrCast<OSNumber>(sharedObject);
+		if (propObject) {
+			record_system_event(SYSTEM_EVENT_TYPE_INFO, SYSTEM_EVENT_SUBSYSTEM_NVRAM, "write", "%s as number to %#llx", name, ((OSNumber *)propObject.get())->unsigned64BitValue());
+		}
+		break;
+
+	case kOFVariableTypeString:
+		propObject = OSDynamicPtrCast<OSString>(sharedObject);
+		if (propObject != nullptr) {
+			record_system_event(SYSTEM_EVENT_TYPE_INFO, SYSTEM_EVENT_SUBSYSTEM_NVRAM, "write", "%s as string to %s", name, ((OSString *)propObject.get())->getCStringNoCopy());
+
+			propDataSize = (OSDynamicPtrCast<OSString>(propObject))->getLength();
+
+			if ((strncmp(name, kIONVRAMBootArgsKey, sizeof(kIONVRAMBootArgsKey)) == 0) && (propDataSize >= BOOT_LINE_LENGTH)) {
+				DEBUG_ERROR("boot-args size too large for BOOT_LINE_LENGTH, propDataSize=%zu\n", propDataSize);
+				ret = kIOReturnNoSpace;
+				goto exit;
+			}
+		}
+		break;
+
+	case kOFVariableTypeData:
+		propObject = OSDynamicPtrCast<OSData>(sharedObject);
+		if (propObject == nullptr) {
+			tmpString = OSDynamicCast(OSString, sharedObject.get());
+			if (tmpString != nullptr) {
+				propObject = OSData::withBytes(tmpString->getCStringNoCopy(),
+				    tmpString->getLength());
+			}
+		}
+
+		if (propObject != nullptr) {
+			propDataSize = (OSDynamicPtrCast<OSData>(propObject))->getLength();
+			record_system_event(SYSTEM_EVENT_TYPE_INFO, SYSTEM_EVENT_SUBSYSTEM_NVRAM, "write", "%s as data with size %#x", name, ((OSData *)propObject.get())->getLength());
+		}
+
+#if defined(XNU_TARGET_OS_OSX)
+		if ((propObject != nullptr) && ((OSDynamicPtrCast<OSData>(propObject))->getLength() == 0)) {
+			remove = true;
+		}
+#endif /* defined(XNU_TARGET_OS_OSX) */
+		break;
+	default:
+		break;
+	}
+
+	if (propObject == nullptr) {
+		DEBUG_ERROR("No property object\n");
+		ret = kIOReturnBadArgument;
+		goto exit;
+	}
+
+	if (!verifyWriteSizeLimit(guid, name, propDataSize)) {
+		DEBUG_ERROR("Property data size of %zu too long for %s\n", propDataSize, name);
+		ret = kIOReturnNoSpace;
+		goto exit;
+	}
+
+	ok = handleSpecialVariables(name, guid, propObject.get(), &ret);
+
+	if (ok) {
+		goto exit;
+	}
+
+	if (remove == false) {
+		DEBUG_INFO("Adding object\n");
+
+		translateGUID(guid, name, newGuid, _format->getSystemPartitionActive());
+		ret = _format->setVariable(newGuid, name, propObject.get());
+	} else {
+		DEBUG_INFO("Removing object\n");
+		ret = removePropertyWithGUIDAndName(guid, name);
+	}
+
+	if (tmpString) {
+		propObject.reset();
+	}
+
+exit:
+	DEBUG_INFO("ret=%#08x\n", ret);
+
+	return ret;
+}
+
+IOReturn
+IODTNVRAM::setPropertyInternal(const OSSymbol *aKey, OSObject *anObject)
+{
+	const char *variableName;
+	uuid_t     varGuid;
+
+	DEBUG_INFO("aKey=%s\n", aKey->getCStringNoCopy());
+
+	parseVariableName(aKey->getCStringNoCopy(), &varGuid, &variableName);
+
+	return setPropertyWithGUIDAndName(varGuid, variableName, anObject);
+}
+
+bool
+IODTNVRAM::setProperty(const OSSymbol *aKey, OSObject *anObject)
+{
+	return setPropertyInternal(aKey, anObject) == kIOReturnSuccess;
+}
+
+void
+IODTNVRAM::removeProperty(const OSSymbol *aKey)
+{
+	IOReturn ret;
+
+	ret = removePropertyInternal(aKey);
+
+	if (ret != kIOReturnSuccess) {
+		DEBUG_INFO("removePropertyInternal failed, ret=%#08x\n", ret);
+	}
+}
+
+IOReturn
+IODTNVRAM::removePropertyWithGUIDAndName(const uuid_t guid, const char *name)
+{
+	IOReturn ret;
+	uuid_t   newGuid;
+
+	DEBUG_INFO("name=%s\n", name);
+	require_action(_format != nullptr, exit, (ret = kIOReturnNotReady, DEBUG_ERROR("Handler not initialized yet\n")));
+
+	if (!verifyPermission(kIONVRAMOperationDelete, guid, name, _format->getSystemPartitionActive())) {
+		DEBUG_INFO("Not privileged\n");
+		ret = kIOReturnNotPrivileged;
+		goto exit;
+	}
+
+	translateGUID(guid, name, newGuid, _format->getSystemPartitionActive());
+	ret = _format->setVariable(newGuid, name, nullptr);
+
+	if (ret != kIOReturnSuccess) {
+		DEBUG_INFO("%s not found\n", name);
+		ret = kIOReturnNotFound;
+	}
+
+	record_system_event(SYSTEM_EVENT_TYPE_INFO, SYSTEM_EVENT_SUBSYSTEM_NVRAM, "delete", "%s", name);
+
+exit:
+	return ret;
+}
+
+IOReturn
+IODTNVRAM::removePropertyInternal(const OSSymbol *aKey)
+{
+	IOReturn   ret;
+	const char *variableName;
+	uuid_t     varGuid;
+
+	DEBUG_INFO("aKey=%s\n", aKey->getCStringNoCopy());
+
+	parseVariableName(aKey->getCStringNoCopy(), &varGuid, &variableName);
+
+	ret = removePropertyWithGUIDAndName(varGuid, variableName);
+
+	return ret;
+}
+
+IOReturn
+IODTNVRAM::setProperties(OSObject *properties)
+{
+	IOReturn                          ret = kIOReturnSuccess;
+	OSObject                          *object;
+	const OSSymbol                    *key;
+	OSDictionary                      *dict;
+	OSSharedPtr<OSCollectionIterator> iter;
+
+	dict = OSDynamicCast(OSDictionary, properties);
+	if (dict == nullptr) {
+		DEBUG_ERROR("Not a dictionary\n");
+		return kIOReturnBadArgument;
+	}
+
+	iter = OSCollectionIterator::withCollection(dict);
+	if (iter == nullptr) {
+		DEBUG_ERROR("Couldn't create iterator\n");
+		return kIOReturnBadArgument;
+	}
+
+	while (ret == kIOReturnSuccess) {
+		key = OSDynamicCast(OSSymbol, iter->getNextObject());
+		if (key == nullptr) {
+			break;
+		}
+
+		object = dict->getObject(key);
+		if (object == nullptr) {
+			continue;
+		}
+
+		ret = setPropertyInternal(key, object);
+	}
+
+	DEBUG_INFO("ret=%#08x\n", ret);
+
+	return ret;
+}
+
+// ********************** Deprecated ********************
+
+IOReturn
+IODTNVRAM::readXPRAM(IOByteCount offset, uint8_t *buffer,
+    IOByteCount length)
+{
+	return kIOReturnUnsupported;
+}
+
+IOReturn
+IODTNVRAM::writeXPRAM(IOByteCount offset, uint8_t *buffer,
+    IOByteCount length)
+{
+	return kIOReturnUnsupported;
+}
+
+IOReturn
+IODTNVRAM::readNVRAMProperty(IORegistryEntry *entry,
+    const OSSymbol **name,
+    OSData **value)
+{
+	return kIOReturnUnsupported;
+}
+
+IOReturn
+IODTNVRAM::writeNVRAMProperty(IORegistryEntry *entry,
+    const OSSymbol *name,
+    OSData *value)
+{
+	return kIOReturnUnsupported;
+}
+
+OSDictionary *
+IODTNVRAM::getNVRAMPartitions(void)
+{
+	return NULL;
+}
+
+IOReturn
+IODTNVRAM::readNVRAMPartition(const OSSymbol *partitionID,
+    IOByteCount offset, uint8_t *buffer,
+    IOByteCount length)
+{
+	return kIOReturnUnsupported;
+}
+
+IOReturn
+IODTNVRAM::writeNVRAMPartition(const OSSymbol *partitionID,
+    IOByteCount offset, uint8_t *buffer,
+    IOByteCount length)
+{
+	return kIOReturnUnsupported;
+}
+
+IOByteCount
+IODTNVRAM::savePanicInfo(uint8_t *buffer, IOByteCount length)
+{
+	return 0;
 }

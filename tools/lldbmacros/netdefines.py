@@ -1,3 +1,9 @@
+
+dlil_if_flags_strings = ["DLIF_INUSE",
+                         "DLIF_REUSE",
+                         "DLIF_DEBUG"
+                        ]
+
 if_capenable_strings = ["RXCSUM",
                         "TXCSUM", 
                         "VLAN_MTU", 
@@ -7,7 +13,12 @@ if_capenable_strings = ["RXCSUM",
                         "TSO6",
                         "LRO",
                         "AV",
-                        "TXSTATUS"
+                        "TXSTATUS",
+                        "CHANNEL_IO",
+                        "HW_TIMESTAMP",
+                        "SW_TIMESTAMP",
+                        "CSUM_PARTIAL",
+                        "CSUM_ZERO_INVERT"
                        ]
 
 if_flags_strings = ["UP",
@@ -28,21 +39,26 @@ if_flags_strings = ["UP",
                     "MULTICAST"
                     ]
 
+if_refflags_strings = ["IFRF_EMBRYONIC",
+                       "IFRF_ATTACHED",
+                       "IFRF_DETACHING"
+                      ]
+
 if_eflags_strings = ["AUTOCONFIGURING",
-                     "unused",
-                     "unused",
-                     "unused",
-                     "unused",
-                     "DVR_REENTRY_OK (deprecated)",
+                     "ENQUEUE_MULTI",
+                     "DELAY_START",
+                     "PROBE_CONNECTIVITY",
+                     "ADV_REPORT ",
+                     "IPV6_DISABLED",
                      "ACCEPT_RTADV",
                      "TXSTART",
                      "RXPOLL",
                      "VLAN",
                      "BOND",
                      "ARPLL",
-                     "NOWINDOWSCALE",
+                     "CLAT46",
                      "NOAUTOIPV6LL",
-                     "unused",
+                     "EXPENSIVE",
                      "IPV4_ROUTER",
                      "IPV6_ROUTER",
                      "LOCALNET_PRIVATE",
@@ -50,16 +66,44 @@ if_eflags_strings = ["AUTOCONFIGURING",
                      "RESTRICTED_RECV",
                      "AWDL",
                      "NOACKPRI",
-                     "unused",
-                     "unused",
-                     "unused",
-                     "unused",
-                     "unused",
-                     "unused",
+                     "AWDL_RESTRICTED",
+                     "2KCL",
+                     "ECN_ENABLE",
+                     "ECN_DISABLE",
+                     "SKYWALK_NATIVE",
+                     "3CA",
                      "SENDLIST",
                      "REUSE (deprecated)",
                      "INUSE (deprecated)",
                      "UPDOWNCHANGE"
+                     ]
+
+if_xflags_strings = ["WAKE_ON_MAGIC_PACKET",
+                     "TIMESTAMP_ENABLED",
+                     "NX_NOAUTO",
+                     "LEGACY",
+                     "LOW_INTERNET_UL",
+                     "LOW_INTERNET_DL",
+                     "ALLOC_KPI",
+                     "LOW_POWER",
+                     "MPK_LOG",
+                     "CONSTRAINED",
+                     "LOW_LATENCY",
+                     "MARK_WAKE_PKT",
+                     "FAST_PACKET_DELIVERY",
+                     "NO_TRAFFIC_SHAPING",
+                     "MANAGEMENT"
+                     "ULTRA_CONSTRAINED",
+                     "IS_VPN",
+                     "DELAYWAKEPKTEVENT",
+                     "DISABLE_INPUT",
+                     "CONGESTED_LINK",
+                     "UNUSED_0x00100000",
+                     "UNUSED_0x00200000",
+                     "UNUSED_0x00400000",
+                     "LINK_HEURISTICS",
+                     "LINK_HEUR_OFF_PENDING",
+                     "POINTOPOINT_MDNS",
                      ]
 
 AF_INET = 2
@@ -120,6 +164,6 @@ INPCB_STATE_DEAD   =       0x3
 
 INP2_TIMEWAIT      =       0x00000001
 INP2_IN_FCTREE     =       0x00000002
-INP2_WANT_FLOW_DIVERT =    0x00000004
+INP2_WANT_APP_POLICY =    0x00000004
 
 N_TIME_WAIT_SLOTS = 128

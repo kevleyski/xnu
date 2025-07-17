@@ -1,8 +1,8 @@
 /*
- * Copyright (c) 1998-2008 Apple Inc. All rights reserved.
+ * Copyright (c) 1998-2016 Apple Inc. All rights reserved.
  *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
- * 
+ *
  * This file contains Original Code and/or Modifications of Original Code
  * as defined in and that are subject to the Apple Public Source License
  * Version 2.0 (the 'License'). You may not use this file except in
@@ -11,10 +11,10 @@
  * unlawful or unlicensed copies of an Apple operating system, or to
  * circumvent, violate, or enable the circumvention or violation of, any
  * terms of an Apple operating system software license agreement.
- * 
+ *
  * Please obtain a copy of the License at
  * http://www.opensource.apple.com/apsl/ and read it before using this file.
- * 
+ *
  * The Original Code and all software distributed under the License are
  * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
@@ -22,11 +22,11 @@
  * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
  * Please see the License for the specific language governing rights and
  * limitations under the License.
- * 
+ *
  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
  */
 
-/*      
+/*
  *      Copyright (c) 1995 NeXT Computer, Inc.  All rights reserved.
  *
  * strol.c - The functions strtol() & strtoul() are exported as public API
@@ -74,10 +74,10 @@
  */
 
 /*
-#include <string.h>
-#include <stdlib.h>
-#include <limits.h>
-*/
+ #include <string.h>
+ #include <stdlib.h>
+ #include <limits.h>
+ */
 #include <sys/types.h>
 #include <machine/limits.h>
 
@@ -86,8 +86,6 @@ long strtol(const char *nptr, char **endptr, int base);
 unsigned long strtoul(const char *nptr, char **endptr, int base);
 quad_t strtoq(const char *nptr, char **endptr, int base);
 u_quad_t strtouq(const char *nptr, char **endptr, int base);
-char *strchr(const char *str, int ch);
-char *strncat(char *s1, const char *s2, unsigned long n);
 
 
 typedef int BOOL;
@@ -95,26 +93,26 @@ typedef int BOOL;
 static inline BOOL
 isupper(char c)
 {
-    return (c >= 'A' && c <= 'Z');
+	return c >= 'A' && c <= 'Z';
 }
 
 static inline BOOL
 isalpha(char c)
 {
-    return ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'));
+	return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
 }
 
 
 static inline BOOL
 isspace(char c)
 {
-    return (c == ' ' || c == '\t' || c == '\n' || c == '\12');
+	return c == ' ' || c == '\t' || c == '\n' || c == '\12';
 }
 
 static inline BOOL
 isdigit(char c)
 {
-    return (c >= '0' && c <= '9');
+	return c >= '0' && c <= '9';
 }
 
 /*
@@ -126,11 +124,11 @@ isdigit(char c)
 long
 strtol(const char *nptr, char **endptr, int base)
 {
-	register const char *s = nptr;
-	register unsigned long acc;
-	register int c;
-	register unsigned long cutoff;
-	register int neg = 0, any, cutlim;
+	const char *s = nptr;
+	unsigned long acc;
+	char c;
+	unsigned long cutoff;
+	int neg = 0, any, cutlim;
 
 	/*
 	 * Skip white space and pick up leading +/- sign if any.
@@ -143,8 +141,9 @@ strtol(const char *nptr, char **endptr, int base)
 	if (c == '-') {
 		neg = 1;
 		c = *s++;
-	} else if (c == '+')
+	} else if (c == '+') {
 		c = *s++;
+	}
 	if ((base == 0 || base == 16) &&
 	    c == '0' && (*s == 'x' || *s == 'X')) {
 		c = s[1];
@@ -156,8 +155,9 @@ strtol(const char *nptr, char **endptr, int base)
 		s += 2;
 		base = 2;
 	}
-	if (base == 0)
+	if (base == 0) {
 		base = c == '0' ? 8 : 10;
+	}
 
 	/*
 	 * Compute the cutoff value between legal numbers and illegal
@@ -177,20 +177,22 @@ strtol(const char *nptr, char **endptr, int base)
 	 * overflow.
 	 */
 	cutoff = neg ? -(unsigned long)LONG_MIN : LONG_MAX;
-	cutlim = cutoff % (unsigned long)base;
+	cutlim = ((int)(cutoff % (unsigned long)base));
 	cutoff /= (unsigned long)base;
 	for (acc = 0, any = 0;; c = *s++) {
-		if (isdigit(c))
+		if (isdigit(c)) {
 			c -= '0';
-		else if (isalpha(c))
+		} else if (isalpha(c)) {
 			c -= isupper(c) ? 'A' - 10 : 'a' - 10;
-		else
+		} else {
 			break;
-		if (c >= base)
+		}
+		if (c >= base) {
 			break;
-		if (any < 0 || acc > cutoff || (acc == cutoff && c > cutlim) )
+		}
+		if (any < 0 || acc > cutoff || (acc == cutoff && c > cutlim)) {
 			any = -1;
-		else {
+		} else {
 			any = 1;
 			acc *= base;
 			acc += c;
@@ -199,30 +201,27 @@ strtol(const char *nptr, char **endptr, int base)
 	if (any < 0) {
 		acc = neg ? LONG_MIN : LONG_MAX;
 //		errno = ERANGE;
-	} else if (neg)
+	} else if (neg) {
 		acc = -acc;
-	if (endptr != 0)
-	{
-		if(any)
-		{
+	}
+	if (endptr != 0) {
+		if (any) {
 			*endptr = __CAST_AWAY_QUALIFIER(s - 1, const, char *);
-		}
-		else
-		{
+		} else {
 			*endptr = __CAST_AWAY_QUALIFIER(nptr, const, char *);
 		}
 	}
-	return (acc);
+	return acc;
 }
 
 unsigned long
 strtoul(const char *nptr, char **endptr, int base)
 {
-	register const char *s = nptr;
-	register unsigned long acc;
-	register int c;
-	register unsigned long cutoff;
-	register int neg = 0, any, cutlim;
+	const char *s = nptr;
+	unsigned long acc;
+	char c;
+	unsigned long cutoff;
+	int neg = 0, any, cutlim;
 
 	/*
 	 * See strtol for comments as to the logic used.
@@ -233,8 +232,9 @@ strtoul(const char *nptr, char **endptr, int base)
 	if (c == '-') {
 		neg = 1;
 		c = *s++;
-	} else if (c == '+')
+	} else if (c == '+') {
 		c = *s++;
+	}
 	if ((base == 0 || base == 16) &&
 	    c == '0' && (*s == 'x' || *s == 'X')) {
 		c = s[1];
@@ -246,22 +246,25 @@ strtoul(const char *nptr, char **endptr, int base)
 		s += 2;
 		base = 2;
 	}
-	if (base == 0)
+	if (base == 0) {
 		base = c == '0' ? 8 : 10;
+	}
 	cutoff = (unsigned long)ULONG_MAX / (unsigned long)base;
-	cutlim = (unsigned long)ULONG_MAX % (unsigned long)base;
+	cutlim = ((int)((unsigned long)ULONG_MAX % (unsigned long)base));
 	for (acc = 0, any = 0;; c = *s++) {
-		if (isdigit(c))
+		if (isdigit(c)) {
 			c -= '0';
-		else if (isalpha(c))
+		} else if (isalpha(c)) {
 			c -= isupper(c) ? 'A' - 10 : 'a' - 10;
-		else
+		} else {
 			break;
-		if (c >= base)
+		}
+		if (c >= base) {
 			break;
-		if (any < 0 || acc > cutoff || (acc == cutoff && c > cutlim) )
+		}
+		if (any < 0 || acc > cutoff || (acc == cutoff && c > cutlim)) {
 			any = -1;
-		else {
+		} else {
 			any = 1;
 			acc *= base;
 			acc += c;
@@ -270,21 +273,18 @@ strtoul(const char *nptr, char **endptr, int base)
 	if (any < 0) {
 		acc = ULONG_MAX;
 //		errno = ERANGE;
-	} else if (neg)
+	} else if (neg) {
 		acc = -acc;
-	if (endptr != 0)
-	{
-		if(any)
-		{
+	}
+	if (endptr != 0) {
+		if (any) {
 			*endptr = __CAST_AWAY_QUALIFIER(s - 1, const, char *);
-		}
-		else
-		{
+		} else {
 			*endptr = __CAST_AWAY_QUALIFIER(nptr, const, char *);
 		}
 	}
 
-	return (acc);
+	return acc;
 }
 
 /*
@@ -296,11 +296,11 @@ strtoul(const char *nptr, char **endptr, int base)
 quad_t
 strtoq(const char *nptr, char **endptr, int base)
 {
-	register const char *s;
-	register u_quad_t acc;
-	register int c;
-	register u_quad_t qbase, cutoff;
-	register int neg, any, cutlim;
+	const char *s;
+	u_quad_t acc;
+	char c;
+	u_quad_t qbase, cutoff;
+	int neg, any, cutlim;
 
 	/*
 	 * Skip white space and pick up leading +/- sign if any.
@@ -316,8 +316,9 @@ strtoq(const char *nptr, char **endptr, int base)
 		c = *s++;
 	} else {
 		neg = 0;
-		if (c == '+')
+		if (c == '+') {
 			c = *s++;
+		}
 	}
 	if ((base == 0 || base == 16) &&
 	    c == '0' && (*s == 'x' || *s == 'X')) {
@@ -325,8 +326,9 @@ strtoq(const char *nptr, char **endptr, int base)
 		s += 2;
 		base = 16;
 	}
-	if (base == 0)
+	if (base == 0) {
 		base = c == '0' ? 8 : 10;
+	}
 
 	/*
 	 * Compute the cutoff value between legal numbers and illegal
@@ -348,20 +350,22 @@ strtoq(const char *nptr, char **endptr, int base)
 	 */
 	qbase = (unsigned)base;
 	cutoff = neg ? -(u_quad_t)QUAD_MIN : QUAD_MAX;
-	cutlim = cutoff % qbase;
+	cutlim = ((int)(cutoff % qbase));
 	cutoff /= qbase;
 	for (acc = 0, any = 0;; c = *s++) {
-		if (isdigit(c))
+		if (isdigit(c)) {
 			c -= '0';
-		else if (isalpha(c))
+		} else if (isalpha(c)) {
 			c -= isupper(c) ? 'A' - 10 : 'a' - 10;
-		else
+		} else {
 			break;
-		if (c >= base)
+		}
+		if (c >= base) {
 			break;
-		if (any < 0 || acc > cutoff || (acc == cutoff && c > cutlim))
+		}
+		if (any < 0 || acc > cutoff || (acc == cutoff && c > cutlim)) {
 			any = -1;
-		else {
+		} else {
 			any = 1;
 			acc *= qbase;
 			acc += c;
@@ -370,21 +374,18 @@ strtoq(const char *nptr, char **endptr, int base)
 	if (any < 0) {
 		acc = neg ? QUAD_MIN : QUAD_MAX;
 //		errno = ERANGE;
-	} else if (neg)
+	} else if (neg) {
 		acc = -acc;
-	if (endptr != 0)
-	{
-		if(any)
-		{
+	}
+	if (endptr != 0) {
+		if (any) {
 			*endptr = __CAST_AWAY_QUALIFIER(s - 1, const, char *);
-		}
-		else
-		{
+		} else {
 			*endptr = __CAST_AWAY_QUALIFIER(nptr, const, char *);
 		}
 	}
 
-	return (acc);
+	return acc;
 }
 
 
@@ -396,14 +397,14 @@ strtoq(const char *nptr, char **endptr, int base)
  */
 u_quad_t
 strtouq(const char *nptr,
-	char **endptr,
-	register int base)
+    char **endptr,
+    int base)
 {
-	register const char *s = nptr;
-	register u_quad_t acc;
-	register int c;
-	register u_quad_t qbase, cutoff;
-	register int neg, any, cutlim;
+	const char *s = nptr;
+	u_quad_t acc;
+	char c;
+	u_quad_t qbase, cutoff;
+	int neg, any, cutlim;
 
 	/*
 	 * See strtoq for comments as to the logic used.
@@ -415,10 +416,11 @@ strtouq(const char *nptr,
 	if (c == '-') {
 		neg = 1;
 		c = *s++;
-	} else { 
+	} else {
 		neg = 0;
-		if (c == '+')
+		if (c == '+') {
 			c = *s++;
+		}
 	}
 	if ((base == 0 || base == 16) &&
 	    c == '0' && (*s == 'x' || *s == 'X')) {
@@ -426,23 +428,26 @@ strtouq(const char *nptr,
 		s += 2;
 		base = 16;
 	}
-	if (base == 0)
+	if (base == 0) {
 		base = c == '0' ? 8 : 10;
+	}
 	qbase = (unsigned)base;
 	cutoff = (u_quad_t)UQUAD_MAX / qbase;
-	cutlim = (u_quad_t)UQUAD_MAX % qbase;
+	cutlim = ((int)((u_quad_t)UQUAD_MAX % qbase));
 	for (acc = 0, any = 0;; c = *s++) {
-		if (isdigit(c))
+		if (isdigit(c)) {
 			c -= '0';
-		else if (isalpha(c))
+		} else if (isalpha(c)) {
 			c -= isupper(c) ? 'A' - 10 : 'a' - 10;
-		else
+		} else {
 			break;
-		if (c >= base)
+		}
+		if (c >= base) {
 			break;
-		if (any < 0 || acc > cutoff || (acc == cutoff && c > cutlim))
+		}
+		if (any < 0 || acc > cutoff || (acc == cutoff && c > cutlim)) {
 			any = -1;
-		else {
+		} else {
 			any = 1;
 			acc *= qbase;
 			acc += c;
@@ -451,55 +456,16 @@ strtouq(const char *nptr,
 	if (any < 0) {
 		acc = UQUAD_MAX;
 //		errno = ERANGE;
-	} else if (neg)
+	} else if (neg) {
 		acc = -acc;
-	if (endptr != 0)
-	{
-		if(any)
-		{
+	}
+	if (endptr != 0) {
+		if (any) {
 			*endptr = __CAST_AWAY_QUALIFIER(s - 1, const, char *);
-		}
-		else
-		{
+		} else {
 			*endptr = __CAST_AWAY_QUALIFIER(nptr, const, char *);
 		}
 	}
 
-	return (acc);
-}
-
-
-/*
- *
- */
-
-char *strchr(const char *str, int ch)
-{
-    do {
-	if (*str == ch)
-	    return(__CAST_AWAY_QUALIFIER(str, const, char *));
-    } while (*str++);
-    return ((char *) 0);
-}
-
-/*
- *
- */
-
-char *
-strncat(char *s1, const char *s2, unsigned long n)
-{
-	char *os1;
-	int i = n;
-
-	os1 = s1;
-	while (*s1++)
-		;
-	--s1;
-	while ((*s1++ = *s2++))
-		if (--i < 0) {
-			*--s1 = '\0';
-			break;
-		}
-	return(os1);
+	return acc;
 }

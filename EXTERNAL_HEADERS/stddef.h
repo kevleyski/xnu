@@ -23,12 +23,34 @@
  *===-----------------------------------------------------------------------===
  */
 
+#if (defined(__has_include) && __has_include(<__xnu_libcxx_sentinel.h>) && !defined(XNU_LIBCXX_SDKROOT))
+
+#if !__has_include_next(<stddef.h>)
+#error Do not build with -nostdinc (use GCC_USE_STANDARD_INCLUDE_SEARCHING=NO)
+#endif /* __has_include_next */
+
+#include_next <stddef.h>
+
+#else /* (defined(__has_include) && __has_include(<__xnu_libcxx_sentinel.h>) && !defined(XNU_LIBCXX_SDKROOT)) */
+
 #ifndef __STDDEF_H
 #define __STDDEF_H
 
+#undef NULL
+#ifdef __cplusplus
+#if __cplusplus >= 201103L
+#define NULL nullptr
+#else
+#undef __null  // VC++ hack.
+#define NULL __null
+#endif
+#else
+#define NULL ((void*)0)
+#endif
+
 #ifndef _PTRDIFF_T
 #define _PTRDIFF_T
-typedef __typeof__(((int*)0)-((int*)0)) ptrdiff_t;
+typedef __typeof__(((int*)NULL) - ((int*)NULL)) ptrdiff_t;
 #endif
 #ifndef _SIZE_T
 #define _SIZE_T
@@ -41,20 +63,15 @@ typedef __WCHAR_TYPE__ wchar_t;
 #endif
 #endif
 
-#undef NULL
-#ifdef __cplusplus
-#undef __null  // VC++ hack.
-#define NULL __null
-#else
-#define NULL ((void*)0)
-#endif
-
+#ifndef offsetof
 #define offsetof(t, d) __builtin_offsetof(t, d)
+#endif
 
 #endif /* __STDDEF_H */
 
-/* Some C libraries expect to see a wint_t here. Others (notably MinGW) will use
-__WINT_TYPE__ directly; accommodate both by requiring __need_wint_t */
+/* Some C libraries expect to see a wint_t here. Others (notably MinGW) will
+ * use __WINT_TYPE__ directly; accommodate both by requiring __need_wint_t
+ */
 #if defined(__need_wint_t)
 #if !defined(_WINT_T)
 #define _WINT_T
@@ -62,3 +79,5 @@ typedef __WINT_TYPE__ wint_t;
 #endif /* _WINT_T */
 #undef __need_wint_t
 #endif /* __need_wint_t */
+
+#endif

@@ -8,18 +8,18 @@ include $(MakeInc_def)
 
 MIG_DEFS = gssd_mach.defs
 
-DATAFILES = gssd_mach_types.h ${MIG_DEFS}
+PRIVATE_DATAFILES = gssd_mach_types.h ${MIG_DEFS}
 
 INSTALL_MI_LIST =
 
-INSTALL_MI_LCL_LIST	= ${DATAFILES} 
+INSTALL_SF_MI_LCL_LIST = ${PRIVATE_DATAFILES}
 
-INSTALL_MI_GEN_LIST = 
+INSTALL_MI_GEN_LIST =
 
 INSTALL_MI_DIR = gssd
 
 EXPORT_MI_LIST	= \
-	${DATAFILES}
+	${PRIVATE_DATAFILES}
 
 EXPORT_MI_GEN_LIST = gssd_mach.h
 
@@ -27,7 +27,7 @@ EXPORT_MI_DIR = gssd
 
 #
 # Build path
-#       
+#
 INCFLAGS_MAKEFILE= -I..
 
 MIGKUFLAGS	= -DMACH_KERNEL_PRIVATE -DKERNEL_USER=1 -maxonstack 1024
@@ -41,12 +41,12 @@ COMP_FILES = ${MIG_KUSRC}
 do_build_all:: $(COMP_FILES)
 
 ${MIG_KUSRC} : gssd_mach.defs
-	@echo MIG $@
-	$(_v)${MIG} ${MIGFLAGS} ${MIGKUFLAGS}	\
-		-user    gssd_mach.c		\
-		-header  gssd_mach.h		\
-		-server  /dev/null		\
-		-sheader /dev/null		\
+	@$(LOG_MIG) "$@"
+	$(_v)${MIG} ${MIGFLAGS} ${MIGKUFLAGS} \
+		-user    gssd_mach.c              \
+		-header  gssd_mach.h              \
+		-server  /dev/null                \
+		-sheader /dev/null                \
 		$<
 
 include $(MakeInc_rule)
